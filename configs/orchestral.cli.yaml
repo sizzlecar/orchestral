@@ -19,6 +19,8 @@ agent:
     max_retries: 3
     base_delay_ms: 500
     max_delay_ms: 8000
+  context_recovery:
+    max_retries: 1
   compaction:
     enabled: true
     minimum_source_records: 32
@@ -76,8 +78,12 @@ providers:
 tools:
   max_timeout_ms: 130000
   max_output_bytes: 1048576
+  # null derives a per-result byte budget from one quarter of the model input window.
+  # Larger complete results are stored as Artifacts and can be read in pages.
+  max_inline_output_bytes: null
   exec:
     enabled: true
+    pipeline_exit_status: auto
     allow_host_execution: true
     network_targets: []
 

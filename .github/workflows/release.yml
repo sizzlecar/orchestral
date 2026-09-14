@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-tools
+      - name: Check release version and notes
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          args=(prepare --output target/release-plan)
+          if [ "$REF_TYPE" = tag ]; then args+=(--tag "$REF_NAME"); fi
+          version=$(cargo run --locked --quiet -p orchestral-release -- "${args[@]}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-plan
+          path: target/release-plan/
+          if-no-files-found: error
+
+  checks:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [version, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Replace embedded assets with the tested PWA
+        shell: bash
+        run: rm -rf web/orchestral-web/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/orchestral-web/dist
+      - name: Build, smoke test, and package CLI
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: bash scripts/package_release.sh "$RELEASE_TARGET"
+      - name: Build, smoke test, and package Windows CLI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package_release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: target/release-artifacts/*
+          if-no-files-found: error
+
+  draft:
+    if: github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-distribution
+          path: release
+      - name: Generate Homebrew formula from verified native archives
+        run: cargo run --locked -p orchestral-release -- formula --assets release --output release/orchestral.rb
+      - name: Create release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release/*.tar.gz release/*.zip release/*.sha256 \
+            release/*.crate release/orchestral.rb release/version.txt release/release.json \
+            --verify-tag --draft --title "Orchestral $RELEASE_TAG" \
+            --notes-file release/release-notes.md

@@ -42,12 +42,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
+        run: rustup show active-toolchain
 
       - name: Run OpenAI-compatible live smoke
-        run: cargo test -p orchestral-model-openai --test live_smoke -- --ignored --nocapture
+        run: cargo test --locked -p orchestral-model-openai --test live_smoke -- --ignored --nocapture
 
   gemini-native:
     runs-on: ubuntu-latest
@@ -63,9 +61,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
+        run: rustup show active-toolchain
 
       - name: Run Gemini Native live smoke
-        run: cargo test -p orchestral-model-gemini --test live_smoke -- --ignored --nocapture
+        run: cargo test --locked -p orchestral-model-gemini --test live_smoke -- --ignored --nocapture

@@ -24,6 +24,27 @@ pub(super) async fn activate_recovery(
             restore_initial_input: true
         }
     );
+    // Validate the old Started projection before any current-head compaction
+    // or recovered Tool preparation. Its old anchor is part of that identity.
+    let replayed_attempt = match &continuation {
+        GenericRecoveryContinuation::ModelLoop { .. } => None,
+        GenericRecoveryContinuation::Input { round, .. }
+        | GenericRecoveryContinuation::Approval { round, .. }
+        | GenericRecoveryContinuation::Skill { round, .. }
+        | GenericRecoveryContinuation::Workflow { round, .. }
+        | GenericRecoveryContinuation::WorkflowOutput { round, .. }
+        | GenericRecoveryContinuation::Tool { round, .. } => Some(
+            replay_started_context(
+                &inner,
+                &request,
+                &model_definitions,
+                run_skills.as_deref(),
+                *round,
+            )
+            .await
+            .map_err(session_context_recovery_error)?,
+        ),
+    };
     let initial_input = restore_initial_input.then(|| user_message.clone());
     let model_messages = project_model_messages(
         &inner,
@@ -68,7 +89,7 @@ pub(super) async fn activate_recovery(
         )
         .await?;
         session_exchange_committed = session_exchange_seq.is_some();
-        let prior_model_messages = if let Some(exchange_seq) = session_exchange_seq {
+        if session_exchange_seq.is_some() {
             let (assistant, tool) = expected_exchange
                 .as_ref()
                 .expect("a committed input exchange has a private resolved response");
@@ -78,25 +99,10 @@ pub(super) async fn activate_recovery(
                     "recovered Session input exchange is not the final projected context",
                 ));
             }
-            Some(
-                project_model_messages(
-                    &inner,
-                    &request,
-                    &model_definitions,
-                    run_skills.as_deref(),
-                    None,
-                    Some(exchange_seq.saturating_sub(1)),
-                    recovered_attempt_input_budget,
-                )
-                .await
-                .map_err(session_context_recovery_error)?,
-            )
-        } else {
-            None
-        };
-        let request_messages = prior_model_messages
+        }
+        let request_messages = replayed_attempt
             .as_deref()
-            .unwrap_or(model_messages.as_slice());
+            .expect("observed recovery has a verified Started projection");
         let rebuilt = model_request_for_round(
             &request,
             *round,
@@ -146,6 +152,8 @@ pub(super) async fn activate_recovery(
         .await?;
         let expected_exchange = match resolved_response.as_ref() {
             Some(resolution) => recovered_approval_exchange_messages(
+                &inner,
+                &run_id,
                 observation,
                 call,
                 arguments,
@@ -170,7 +178,7 @@ pub(super) async fn activate_recovery(
         )
         .await?;
         session_exchange_committed = session_exchange_seq.is_some();
-        let prior_model_messages = if let Some(exchange_seq) = session_exchange_seq {
+        if session_exchange_seq.is_some() {
             let (assistant, tool) = expected_exchange
                 .as_ref()
                 .expect("a committed approval exchange has a recoverable durable result");
@@ -180,25 +188,10 @@ pub(super) async fn activate_recovery(
                     "recovered Session approval exchange is not the final projected context",
                 ));
             }
-            Some(
-                project_model_messages(
-                    &inner,
-                    &request,
-                    &model_definitions,
-                    run_skills.as_deref(),
-                    None,
-                    Some(exchange_seq.saturating_sub(1)),
-                    recovered_attempt_input_budget,
-                )
-                .await
-                .map_err(session_context_recovery_error)?,
-            )
-        } else {
-            None
-        };
-        let request_messages = prior_model_messages
+        }
+        let request_messages = replayed_attempt
             .as_deref()
-            .unwrap_or(model_messages.as_slice());
+            .expect("observed recovery has a verified Started projection");
         let rebuilt = model_request_for_round(
             &request,
             *round,
@@ -307,26 +300,9 @@ pub(super) async fn activate_recovery(
                 ));
             }
         }
-        let prior_model_messages = if let Some(prior_seq) = prepared.prior_session_seq {
-            Some(
-                project_model_messages(
-                    &inner,
-                    &request,
-                    &model_definitions,
-                    run_skills.as_deref(),
-                    None,
-                    Some(prior_seq),
-                    recovered_attempt_input_budget,
-                )
-                .await
-                .map_err(session_context_recovery_error)?,
-            )
-        } else {
-            None
-        };
-        let request_messages = prior_model_messages
+        let request_messages = replayed_attempt
             .as_deref()
-            .unwrap_or(model_messages.as_slice());
+            .expect("observed recovery has a verified Started projection");
         let rebuilt = model_request_for_round(
             &request,
             *round,
@@ -381,7 +357,9 @@ pub(super) async fn activate_recovery(
         let rebuilt = model_request_for_round(
             &request,
             *round,
-            &model_messages,
+            replayed_attempt
+                .as_deref()
+                .expect("observed Workflow has a verified Started projection"),
             &model_definitions,
             recovered_model_output_tokens(&model_output_budgets, *round)?,
         );
@@ -423,7 +401,7 @@ pub(super) async fn activate_recovery(
         )
         .await?;
         session_exchange_committed = session_exchange_seq.is_some();
-        let prior_model_messages = if let Some(exchange_seq) = session_exchange_seq {
+        if session_exchange_seq.is_some() {
             let (assistant, tool) = &expected_exchange;
             if !model_messages.ends_with(&[assistant.clone(), tool.clone()]) {
                 return Err(AgentProtocolError::new(
@@ -431,25 +409,10 @@ pub(super) async fn activate_recovery(
                     "recovered Workflow exchange is not the final projected Session context",
                 ));
             }
-            Some(
-                project_model_messages(
-                    &inner,
-                    &request,
-                    &model_definitions,
-                    run_skills.as_deref(),
-                    None,
-                    Some(exchange_seq.saturating_sub(1)),
-                    recovered_attempt_input_budget,
-                )
-                .await
-                .map_err(session_context_recovery_error)?,
-            )
-        } else {
-            None
-        };
-        let request_messages = prior_model_messages
+        }
+        let request_messages = replayed_attempt
             .as_deref()
-            .unwrap_or(model_messages.as_slice());
+            .expect("observed recovery has a verified Started projection");
         let rebuilt = model_request_for_round(
             &request,
             *round,
@@ -478,7 +441,7 @@ pub(super) async fn activate_recovery(
     {
         let recovered_exchange =
             recovered_tool_exchange_record(&inner, &request, *round, request_id).await?;
-        let prior_model_messages = if let Some(record) = &recovered_exchange {
+        if let Some(record) = &recovered_exchange {
             let AgentSessionEvent::ToolExchangeCommitted {
                 assistant, tool, ..
             } = &record.payload
@@ -491,25 +454,10 @@ pub(super) async fn activate_recovery(
                     "recovered direct Tool exchange is not the final projected context",
                 ));
             }
-            Some(
-                project_model_messages(
-                    &inner,
-                    &request,
-                    &model_definitions,
-                    run_skills.as_deref(),
-                    None,
-                    Some(record.session_seq.saturating_sub(1)),
-                    recovered_attempt_input_budget,
-                )
-                .await
-                .map_err(session_context_recovery_error)?,
-            )
-        } else {
-            None
-        };
-        let request_messages = prior_model_messages
+        }
+        let request_messages = replayed_attempt
             .as_deref()
-            .unwrap_or(model_messages.as_slice());
+            .expect("observed recovery has a verified Started projection");
         let rebuilt = model_request_for_round(
             &request,
             *round,
@@ -534,7 +482,8 @@ pub(super) async fn activate_recovery(
                 ));
             }
             let retained_artifacts = retained_artifacts_for_outcome(&outcome);
-            let (result, is_error) = model_tool_result(outcome);
+            let (result, is_error) =
+                recovered_model_tool_result(&inner, &run_id, call, arguments, outcome)?;
             let (assistant, tool) =
                 observed_tool_exchange_messages(observation, call, arguments, &result, is_error);
             let expected_payload = AgentSessionEvent::ToolExchangeCommitted {

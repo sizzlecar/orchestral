@@ -87,3 +87,7 @@ fn restore_process_terminal() {
     let _ = stdout.flush();
     let _ = disable_raw_mode();
 }
+
+#[cfg(all(test, windows))]
+#[path = "terminal_windows_tests.rs"]
+mod tests;

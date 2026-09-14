@@ -84,16 +84,15 @@ impl SseParser {
 }
 
 fn find_record_end(bytes: &[u8]) -> Option<(usize, usize)> {
-    bytes
+    let crlf = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4))
-        .or_else(|| {
-            bytes
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|index| (index, 2))
-        })
+        .map(|index| (index, 4));
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    crlf.into_iter().chain(lf).min_by_key(|(index, _)| *index)
 }
 
 fn parse_record(bytes: &[u8]) -> Option<StreamEvent> {
@@ -171,6 +170,88 @@ mod tests {
                 data: "{}".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn parses_mixed_record_endings_in_wire_order() {
+        for (first, second) in [("\n", "\r\n"), ("\r\n", "\n")] {
+            let wire = format!(
+                "event: durable{first}id: 4{first}data: alpha{first}{first}\
+                 event: error{second}data: beta{second}{second}"
+            );
+            let mut parser = SseParser::default();
+            assert_eq!(
+                parser.push(wire.as_bytes()),
+                vec![
+                    StreamEvent::Durable {
+                        id: Some("4".to_owned()),
+                        data: "alpha".to_owned(),
+                    },
+                    StreamEvent::Error {
+                        data: "beta".to_owned(),
+                    },
+                ],
+                "first delimiter {first:?}"
+            );
+            assert_eq!(parser.finish(), None);
+        }
+    }
+
+    #[test]
+    fn mixed_record_framing_is_independent_of_chunk_boundaries() {
+        let wire = "event: durable\nid: 5\ndata: 你好\ndata: next\n\n\
+                    event: telemetry\r\ndata: progress\r\n\r\n"
+            .as_bytes();
+        let expected = vec![
+            StreamEvent::Durable {
+                id: Some("5".to_owned()),
+                data: "你好\nnext".to_owned(),
+            },
+            StreamEvent::Telemetry {
+                data: "progress".to_owned(),
+            },
+        ];
+        for split in 0..=wire.len() {
+            let mut parser = SseParser::default();
+            let mut events = parser.push(&wire[..split]);
+            events.extend(parser.push(&wire[split..]));
+            assert_eq!(events, expected, "network split at byte {split}");
+            assert_eq!(parser.finish(), None);
+        }
+        let mut parser = SseParser::default();
+        let events: Vec<_> = wire
+            .chunks(1)
+            .flat_map(|chunk| parser.push(chunk))
+            .collect();
+        assert_eq!(events, expected);
+        assert_eq!(parser.finish(), None);
+    }
+
+    #[test]
+    fn finish_flushes_pending_record_once_after_mixed_endings() {
+        let mut parser = SseParser::default();
+        assert_eq!(parser.finish(), None);
+        let events = parser.push(
+            b": heartbeat\n\nevent: error\r\ndata: ready\r\n\r\n\
+              event: durable\nid: 6\n: comment\ndata: pending\ndata:  indented",
+        );
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::KeepAlive,
+                StreamEvent::Error {
+                    data: "ready".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            parser.finish(),
+            Some(StreamEvent::Durable {
+                id: Some("6".to_owned()),
+                data: "pending\n indented".to_owned(),
+            })
+        );
+        assert_eq!(parser.finish(), None);
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub(super) async fn resume_observed_tool(
         &run_id,
         &call,
         &arguments,
+        &model_messages,
         cancellation.clone(),
     )
     .await
@@ -266,7 +267,23 @@ pub(super) async fn continue_observed_tool(
         }
         GuardedToolResult::Outcome { outcome, .. } => {
             let retained_artifacts = retained_artifacts_for_outcome(&outcome);
-            let (result, is_error) = model_tool_result(outcome);
+            let (result, is_error) =
+                match recovered_model_tool_result(&inner, &run_id, &call, &arguments, outcome) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            agent_failure(
+                                "tool_result_projection_failed",
+                                error.to_string(),
+                                false,
+                            ),
+                        );
+                        return;
+                    }
+                };
             (result, is_error, retained_artifacts)
         }
     };
@@ -440,7 +457,6 @@ pub(super) struct RecoveredSkillPreparation {
     pub(super) observation: SkillCallObservation,
     pub(super) load_committed: bool,
     pub(super) exchange_record: Option<AgentSessionRecord>,
-    pub(super) prior_session_seq: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,7 +584,6 @@ pub(super) async fn prepare_recovered_skill(
         observation: evaluation.observation,
         load_committed: load_record.is_some(),
         exchange_record,
-        prior_session_seq: first_outcome_seq.map(|sequence| sequence.saturating_sub(1)),
     })
 }
 

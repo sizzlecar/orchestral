@@ -52,6 +52,13 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
     if config.agent.reserved_output_tokens >= config.agent.max_context_tokens {
         return invalid("agent.reserved_output_tokens must be below max_context_tokens");
     }
+    if config
+        .agent
+        .minimum_output_reserve_tokens
+        .is_some_and(|minimum| minimum == 0 || minimum > config.agent.reserved_output_tokens)
+    {
+        return invalid("agent.minimum_output_reserve_tokens must be positive and no greater than reserved_output_tokens");
+    }
     if config.agent.compaction.enabled
         && (config.agent.compaction.minimum_source_records == 0
             || config.agent.compaction.keep_recent_records == 0
@@ -247,6 +254,26 @@ mod tests {
     }
 
     #[test]
+    fn output_headroom_is_optional_and_bounded_by_the_preferred_reserve() {
+        let mut config = OrchestralConfig::default();
+        assert_eq!(config.agent.minimum_output_reserve_tokens, None);
+        for minimum in [1, config.agent.reserved_output_tokens] {
+            config.agent.minimum_output_reserve_tokens = Some(minimum);
+            assert!(validate_config(&config).is_ok());
+        }
+        for minimum in [0, config.agent.reserved_output_tokens + 1] {
+            config.agent.minimum_output_reserve_tokens = Some(minimum);
+            assert!(validate_config(&config).is_err());
+        }
+        let configured: OrchestralConfig = serde_yaml::from_str(
+            "agent:\n  reserved_output_tokens: 2048\n  minimum_output_reserve_tokens: 512\n",
+        )
+        .unwrap();
+        assert_eq!(configured.agent.minimum_output_reserve_tokens, Some(512));
+        assert!(validate_config(&configured).is_ok());
+    }
+
+    #[test]
     fn continuation_ceilings_are_optional_and_positive_when_configured() {
         let config = serde_yaml::from_str::<OrchestralConfig>(
             r#"
@@ -292,6 +319,31 @@ agent:
         let mut config = OrchestralConfig::default();
         config.tools.exec.enabled = true;
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn exec_pipeline_status_has_a_typed_compatible_default_and_explicit_overrides() {
+        use crate::config::{ExecToolConfig, ShellPipelineExitStatus};
+
+        let default: ExecToolConfig =
+            serde_yaml::from_str("enabled: true\nshell: /bin/sh").unwrap();
+        assert_eq!(default.pipeline_exit_status, ShellPipelineExitStatus::Auto);
+        assert_eq!(
+            ExecToolConfig::default().pipeline_exit_status,
+            ShellPipelineExitStatus::Auto
+        );
+        for (value, expected) in [
+            ("auto", ShellPipelineExitStatus::Auto),
+            ("pipefail", ShellPipelineExitStatus::Pipefail),
+            ("native", ShellPipelineExitStatus::Native),
+        ] {
+            let config: ExecToolConfig =
+                serde_yaml::from_str(&format!("pipeline_exit_status: {value}")).unwrap();
+            assert_eq!(config.pipeline_exit_status, expected);
+        }
+        assert!(
+            serde_yaml::from_str::<ExecToolConfig>("pipeline_exit_status: ignore_errors").is_err()
+        );
     }
 
     #[test]

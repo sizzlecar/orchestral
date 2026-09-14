@@ -118,7 +118,7 @@ impl Host {
                 ToolInvocation {
                     run_id: RunId::new(run),
                     call_id: ToolCallId::new(call),
-                    tool_id: ToolId::new("orchestral/exec_command/v1"),
+                    tool_id: ToolId::new("orchestral/exec_command/v2"),
                     arguments: json!({"cmd": command, "yield_time_ms": 100}),
                 },
                 RunToolGrant {

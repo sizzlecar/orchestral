@@ -1,6 +1,6 @@
 [package]
 name = "orchestral"
-description = "Workflow orchestration for grounded agents — stateful multi-step pipelines with agent loop, MCP tools, and skills"
+description = "The Orchestral SDK for reliable, interactive AI agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

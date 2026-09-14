@@ -39,14 +39,36 @@ Host 可通过 `agent.model_retry` 配置有限退避，默认最多重试 3 次
 Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重试次数或 Run 状态。
 
 - 仅 `retryable = true` 的 `RateLimited` / `Unavailable` 可以重试；首次事件之前的空流
-  按临时不可用处理。任何已观察事件（包括 Usage 或 ToolCallStart）都会关闭自动重试窗口。
+  按临时不可用处理。文字、ToolCallStart 或 Finish 会关闭自动重试窗口。只报告 Usage
+  的失败尝试可以重试，最后一份用量快照持久化并计入 Run 一次。
 - 取消、Steer 和 Run deadline 可以打断请求或退避等待；被丢弃的尝试会取消底层 stream。
-- Run 设置累计 token/cost 上限时，只自动重试明确的限流拒绝。其他未观察到用量的失败
-  请求可能已消耗额度，不能通过自动重试绕过累计预算。
+- Run 设置累计 token/cost 上限时，只自动重试未报告用量的明确限流拒绝。其他失败请求
+  可能已消耗额度或超出最后一份快照的用量，不能通过自动重试绕过累计预算。
 - 每次退避前持久化 `GenericCheckpointEvent::ModelRetryScheduled`。它必须关联当前
   `ModelAttemptOpen`，重试序号从 1 连续递增，不产生第二个顶层终态。
 - 该 checkpoint 只记录调度事实，不授权进程重启后重发请求。恢复仍将未闭合模型尝试
   收束为 `RunIncomplete(Interrupted)`；重试策略和项目指令快照均进入恢复配置摘要。
+
+## 上下文容量拒绝的恢复
+
+`ModelErrorCode::ContextLengthExceeded` 表示后端在生成之前明确拒绝了输入与输出的容量
+预留，不是普通参数错误，也不允许原样重发。OpenAI 适配器仅将 HTTP 400 且
+`error.code = context_length_exceeded` 的响应归入此类，不解析错误消息中的关键词。
+Ferrum 的上下文容量拒绝提供该结构化 code。
+
+Host 可配置 `agent.context_recovery.max_retries`，默认 1，0 禁用。仅在没有收到任何
+Usage、文本、工具调用或 Finish 时恢复。每次持久化一个严格小于被拒绝输入规划量的
+预算上限，以原规划量的一半作为优先压缩目标。用已有上下文投影和压缩机制保留任务、
+权限、技能和完整工具交换的边界；目标无法容纳必须保留的事实时，可在该上限内再尝试
+压缩一次，不扩大 Run 累计预算。不可压缩内容仍超限时明确结束，不删除约束来制造空间。
+它占用新的模型步骤，仍受 Run 的步骤、token、cost
+和 deadline 限制；成功观察一轮生成后，仅重置连续容量拒绝计数和优先压缩目标，更小的
+输入规划上限继续约束同一 Run 的后续请求与重启恢复。它不是服务端物理容量的精确测量，
+不能扩大累计预算；新 Run 使用自己的模型配置，不继承其他 Run 的经验值。
+
+在重新投影前持久化 `ModelContextRejected`，记录请求身份、连续次数和更小的输入预算。
+该事件把明确被拒绝的尝试关闭为稳定边界，重启可从新边界继续，不能重复之前的工具。
+没有此记录的开放请求仍属于结果未知；收到 Usage/内容后发生的错误也不能走这条恢复路径。
 
 ## 最小 Adapter
 

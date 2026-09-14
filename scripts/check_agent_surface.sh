@@ -5,6 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 forbidden_paths=(
+  ".claude/skills/xlsx"
+  ".mcp.json"
+  "codex_prompt.txt"
+  "examples/extensions"
+  "apps/orchestral-cli/examples/verify_no_fake_execution_toml.rs"
+  "core/orchestral-runtime/src/action"
   "REFACTOR_PLAN.md"
   "apps/orchestral-cli/src/scenario.rs"
   # The TUI remains a supported product surface. Only its retired,
@@ -27,11 +33,12 @@ forbidden_paths=(
 
 for path in "${forbidden_paths[@]}"; do
   tracked="$(git ls-files -- "${path}" "${path}/**")"
-  if [[ -n "${tracked}" ]]; then
-    echo "retired production surface is tracked: ${path}" >&2
-    printf '%s\n' "${tracked}" >&2
-    exit 1
-  fi
+  while IFS= read -r file; do
+    if [[ -n "${file}" && ( -e "${file}" || -L "${file}" ) ]]; then
+      echo "retired production surface is tracked: ${file}" >&2
+      exit 1
+    fi
+  done <<< "${tracked}"
 done
 
 if matches="$(git grep -n -E '\b(OrchestralApp|RuntimeApi|ScenarioRunner)\b' -- \

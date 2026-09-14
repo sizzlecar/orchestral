@@ -275,6 +275,15 @@ impl InternalGenericAgentProvider {
         if let Some(policy) = &config.model_cost_policy {
             policy.validate()?;
         }
+        if config
+            .minimum_output_reserve_tokens
+            .is_some_and(|minimum| minimum == 0 || minimum > config.reserved_output_tokens)
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidSpec,
+                "minimum_output_reserve_tokens must be positive and no greater than reserved_output_tokens",
+            ));
+        }
         let has_tools = tools.is_some();
         let has_input_requests =
             config.input_requests_enabled && model_descriptor.capabilities.tool_calls;

@@ -91,6 +91,3 @@ features = [
     "VisualViewport",
     "Window",
 ]
-
-[dev-dependencies]
-pretty_assertions = "1"

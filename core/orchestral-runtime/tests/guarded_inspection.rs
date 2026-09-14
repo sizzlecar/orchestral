@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use orchestral_core::agent_protocol::wire::RunId;
+use orchestral_core::agent_protocol::wire::{Digest, RunId};
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, EffectScope, EnvironmentPolicy, FilesystemPolicy, HostApprovalVerifier,
     HostToolPolicy, InMemoryApprovalCapabilityStore, NetworkPolicy, ProcessPolicy, RunToolGrant,
@@ -19,6 +19,9 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 const SIGNING_KEY: &[u8] = b"guarded-inspection-test-signing-key";
+
+#[path = "guarded_inspection/file_write_precondition.rs"]
+mod file_write_precondition;
 
 fn temp_workspace(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("orchestral-{label}-{}", uuid::Uuid::new_v4()));
@@ -197,6 +200,120 @@ async fn file_read_pages_lines_and_reports_long_line_truncation_without_looping(
             ..
         } if code == "file_read_offset_out_of_range"
     ));
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn file_read_truncates_long_utf8_final_lines_at_scalar_boundaries() {
+    let workspace = temp_workspace("read-utf8-final-line");
+    // Each prefix reaches the 64 KiB line cap inside a 2-, 3-, or 4-byte scalar.
+    let sources = [
+        format!("a{}", "é".repeat(40_000)),
+        "界".repeat(30_000),
+        format!("a{}", "🦀".repeat(20_000)),
+    ];
+    for output_limit in [8 * 1024, 128 * 1024] {
+        let policy = bounds(&workspace, output_limit);
+        let runtime = new_runtime(policy.clone());
+        runtime
+            .register(
+                guarded_file_read_descriptor(ToolRestriction {
+                    bounds: policy.clone(),
+                }),
+                Arc::new(GuardedFileReadExecutor::new(&workspace).unwrap()),
+            )
+            .unwrap();
+        for (source_index, source) in sources.iter().enumerate() {
+            for (ending_index, ending) in ["", "\n", "\r\n"].into_iter().enumerate() {
+                let original = format!("{source}{ending}");
+                let path = format!("source-{source_index}-{ending_index}.rs");
+                fs::write(workspace.join(&path), &original).unwrap();
+                let output = completed(
+                    invoke(
+                        &runtime,
+                        policy.clone(),
+                        &format!("read-{source_index}-{ending_index}"),
+                        "orchestral/file_read/v3",
+                        json!({"path": path, "limit": 1}),
+                    )
+                    .await,
+                );
+                let content = output["content"].as_str().unwrap();
+                let byte_limited = output_limit == 8 * 1024;
+                let marker = if byte_limited {
+                    "… [output truncated]\n"
+                } else {
+                    "… [line truncated]\n"
+                };
+                let prefix = content.strip_suffix(marker).unwrap();
+                assert!(!prefix.is_empty());
+                assert!(original.starts_with(prefix));
+                assert!(content.len() < output_limit as usize);
+                assert_eq!(output["start_line"], 1);
+                assert_eq!(output["end_line"], 1);
+                assert_eq!(output["next_offset"], 2);
+                assert_eq!(output["eof"], true);
+                assert_eq!(output["truncated"], true);
+                assert_eq!(output["truncated_line_numbers"], json!([1]));
+                assert_eq!(output["file_size_bytes"], original.len());
+                assert_eq!(output["scanned_bytes"], original.len());
+                let reasons = output["truncation_reasons"].as_array().unwrap();
+                assert!(reasons.contains(&json!("line_too_long")));
+                assert_eq!(reasons.contains(&json!("byte_limit")), byte_limited);
+                assert!(!reasons.contains(&json!("line_limit")));
+                assert_eq!(
+                    output["content_digest"],
+                    json!(Digest::sha256(content.as_bytes()))
+                );
+                assert_ne!(
+                    output["content_digest"],
+                    json!(Digest::sha256(original.as_bytes()))
+                );
+                assert!(output["revision"].as_str().is_some());
+                assert_eq!(output["path"], path);
+                assert_eq!(output["workspace"], workspace.to_string_lossy().as_ref());
+            }
+        }
+    }
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn file_read_rejects_invalid_utf8_even_beyond_the_retained_prefix() {
+    let workspace = temp_workspace("read-invalid-utf8-tail");
+    let policy = bounds(&workspace, 8 * 1024);
+    let runtime = new_runtime(policy.clone());
+    runtime
+        .register(
+            guarded_file_read_descriptor(ToolRestriction {
+                bounds: policy.clone(),
+            }),
+            Arc::new(GuardedFileReadExecutor::new(&workspace).unwrap()),
+        )
+        .unwrap();
+    for (tail_index, tail) in [&[0xff][..], &[0xf0, 0x9f][..]].into_iter().enumerate() {
+        for (ending_index, ending) in ["", "\n"].into_iter().enumerate() {
+            let mut source = "界".repeat(30_000).into_bytes();
+            source.extend_from_slice(tail);
+            source.extend_from_slice(ending.as_bytes());
+            let path = format!("invalid-{tail_index}-{ending_index}.rs");
+            fs::write(workspace.join(&path), source).unwrap();
+            let result = invoke(
+                &runtime,
+                policy.clone(),
+                &format!("read-invalid-{tail_index}-{ending_index}"),
+                "orchestral/file_read/v3",
+                json!({"path": path}),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::Failed { ref code, .. }, ..
+                } if code == "file_not_utf8"
+            ));
+        }
+    }
     fs::remove_dir_all(workspace).unwrap();
 }
 

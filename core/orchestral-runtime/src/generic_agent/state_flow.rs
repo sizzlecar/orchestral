@@ -1,22 +1,35 @@
 use super::*;
 
-pub(super) fn model_tool_result(outcome: ToolOutcome) -> (serde_json::Value, bool) {
+pub(super) fn model_tool_result(
+    runtime: &dyn AgentToolRuntime,
+    invocation: &ToolInvocation,
+    outcome: ToolOutcome,
+) -> Result<(serde_json::Value, bool), ToolRuntimeError> {
+    let project = matches!(
+        &outcome,
+        ToolOutcome::Completed {
+            output: ToolOutput::Inline(_)
+        }
+    );
+    let (result, is_error) = model_tool_result_envelope(outcome);
+    Ok((
+        if project {
+            runtime.project_model_output(invocation, &result)?
+        } else {
+            result
+        },
+        is_error,
+    ))
+}
+
+fn model_tool_result_envelope(outcome: ToolOutcome) -> (serde_json::Value, bool) {
     match outcome {
         ToolOutcome::Completed {
             output: ToolOutput::Inline(output),
         } => (output, false),
         ToolOutcome::Completed {
             output: ToolOutput::Artifact(artifact),
-        } => (
-            serde_json::json!({
-                "kind": "artifact",
-                "artifact": artifact.artifact,
-                "media_type": artifact.media_type,
-                "byte_size": artifact.byte_size,
-                "summary": artifact.summary,
-            }),
-            false,
-        ),
+        } => (crate::tool_runtime::artifact_model_output(&artifact), false),
         other => (
             serde_json::to_value(other).unwrap_or_else(|error| {
                 serde_json::json!({
@@ -28,6 +41,56 @@ pub(super) fn model_tool_result(outcome: ToolOutcome) -> (serde_json::Value, boo
             true,
         ),
     }
+}
+
+pub(super) fn recovered_model_tool_result(
+    inner: &GenericInner,
+    run_id: &RunId,
+    call: &GenericObservedToolCall,
+    arguments: &serde_json::Value,
+    outcome: ToolOutcome,
+) -> Result<(serde_json::Value, bool), AgentProtocolError> {
+    if !matches!(
+        &outcome,
+        ToolOutcome::Completed {
+            output: ToolOutput::Inline(_)
+        }
+    ) {
+        return Ok(model_tool_result_envelope(outcome));
+    }
+    let tools = inner.tools.as_ref().ok_or_else(|| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            "recovered Tool result has no bound Tool Runtime",
+        )
+    })?;
+    let projection_error = |error: ToolRuntimeError| {
+        AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidDigest,
+            format!("recovered Tool model result cannot be projected: {error}"),
+        )
+    };
+    let tool_id = tools
+        .runtime
+        .resolve_tool_id(&call.name)
+        .map_err(projection_error)?
+        .ok_or_else(|| {
+            AgentProtocolError::new(
+                AgentProtocolErrorCode::InvalidDigest,
+                "recovered Tool result producer is no longer registered",
+            )
+        })?;
+    model_tool_result(
+        tools.runtime.as_ref(),
+        &ToolInvocation {
+            run_id: run_id.clone(),
+            call_id: ToolCallId::new(call.call_id.as_str()),
+            tool_id,
+            arguments: arguments.clone(),
+        },
+        outcome,
+    )
+    .map_err(projection_error)
 }
 
 pub(super) fn retained_artifacts_for_outcome(outcome: &ToolOutcome) -> Vec<ArtifactRefWithDigest> {
@@ -132,7 +195,11 @@ pub(super) fn model_dispatch_budget(
     }
 
     let mut output_cap = output_reserve_tokens;
-    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some();
+    // Elastic context planning must set the wire cap explicitly. Otherwise
+    // the backend's configured default could consume the room just reclaimed
+    // from the preferred output reservation.
+    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some()
+        || config.minimum_output_reserve_tokens.is_some();
     if let Some(ceiling) = &request.run.spec.limits.max_cost {
         let policy = config
             .model_cost_policy
@@ -420,6 +487,8 @@ pub(super) fn model_context_trace(
         config_digest: projection.config_digest.clone(),
         history_limit,
         used_input_tokens: projection.used_input_tokens,
+        context_estimate: projection.context_estimate.clone(),
+        planning: projection.planning.clone(),
         input_budget_tokens: projection.input_budget_tokens,
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "orchestral-release"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = "3.27"

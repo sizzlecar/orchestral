@@ -89,7 +89,7 @@ fn terminate_group(id: u32) {
 #[cfg(not(unix))]
 fn terminate_group(_id: u32) {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

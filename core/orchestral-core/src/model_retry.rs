@@ -4,6 +4,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::model_protocol::{ModelError, ModelErrorCode};
 
+/// Recovery after a definite context-capacity rejection, separate from
+/// transport retries. Each recovery targets half the rejected input's planning
+/// size while allowing required context within a strictly smaller retry ceiling.
+/// It reprojects/compacts whole exchanges. Zero disables recovery.
+/// Rejections consume model steps; successful generation resets this count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextRecoveryPolicy {
+    pub max_retries: u32,
+}
+
+impl Default for ContextRecoveryPolicy {
+    fn default() -> Self {
+        Self { max_retries: 1 }
+    }
+}
+
 /// Host-owned retries within one logical model step. A zero retry count disables
 /// retries. Once an attempt has produced text, a Tool call, or Finish, it cannot
 /// be retried by this policy. Usage-only failures retain their reported usage;
@@ -82,6 +99,7 @@ mod tests {
         for code in [
             ModelErrorCode::Authentication,
             ModelErrorCode::InvalidRequest,
+            ModelErrorCode::ContextLengthExceeded,
             ModelErrorCode::Protocol,
             ModelErrorCode::Cancelled,
             ModelErrorCode::Internal,

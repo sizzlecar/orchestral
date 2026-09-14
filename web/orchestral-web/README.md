@@ -17,14 +17,16 @@ model-provider code.
 ## Development
 
 ```sh
-cargo test -p orchestral-web
-cargo check -p orchestral-web --target wasm32-unknown-unknown --features web
+cargo test --locked -p orchestral-web
+cargo check --locked -p orchestral-web --target wasm32-unknown-unknown --features web
 cd web/orchestral-web && dx serve --web
 ```
 
 Refresh the release bundle after changing Rust, CSS, or public assets:
 
 ```sh
+cargo install dioxus-cli --version 0.7.9 --locked
+rustup target add wasm32-unknown-unknown
 scripts/build_web.sh
 ```
 
@@ -33,8 +35,16 @@ and replaces stale hashed assets in `dist/`.
 
 ## Browser regression smoke
 
-After rebuilding, run from the repository root with Node.js, Chrome, and
-`playwright` installed in a local or external Node module directory:
+After rebuilding, install the pinned browser test dependencies with Node.js 22+:
+
+```sh
+npm ci --prefix scripts --ignore-scripts
+(cd scripts && npx playwright install chromium)
+export NODE_PATH="$PWD/scripts/node_modules"
+export PWA_SMOKE_CHANNEL=chromium
+```
+
+Run from the repository root:
 
 ```sh
 node scripts/pwa_browser_smoke.cjs

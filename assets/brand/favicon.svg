@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>Orchestral</title>
+  <path fill="#83ff6b" d="M0 0h32v32H0z"/>
+  <g transform="scale(.3333333)" fill="#15171d">
+    <path d="M10 64h21v8H10z"/>
+    <path d="m43 24-6 6 22 18-22 18 6 6 29-24z"/>
+    <circle cx="83" cy="68" r="4"/>
+  </g>
+</svg>

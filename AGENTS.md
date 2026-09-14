@@ -12,7 +12,7 @@
 - `testing/` — Agent/Model protocol conformance and property-test harnesses.
 - `examples/agent_session.rs` — minimal model/provider/controller/client composition.
 - `configs/` — runtime configuration; `docs/agent-foundation/` — versioned protocol contracts.
-- `deploy/` and `DEPLOYMENT.md` — deployment assets and instructions.
+- `deploy/` — optional deployment assets; see `deploy/README.md`.
 - `target/` is generated; `web/orchestral-web/dist/` is the generated release bundle embedded by the CLI.
 
 ## Architecture Overview
@@ -52,6 +52,7 @@
 - For protocol changes, cover the public contract and relevant conformance tests under `testing/`; for recovery changes, cover replay, restart, and duplicate-effect boundaries.
 - Keep regression tests focused on general behavior. Frontend projection and SSE parsing can be tested with `cargo test -p orchestral-web` without a browser.
 - Some live-provider and native Codex compatibility tests are opt-in (`#[ignore]`) and require credentials or installed tools. Report which checks ran and which were skipped.
+- Keep routine CI, protocol, installation, and onboarding checks on local fixtures without paid model calls. When a live model check is needed, prefer an existing local service or a low-cost model; bound input/output, turns, and retries, and record available request/token usage. Do not launch large paid evaluations or provision compute as part of routine validation.
 
 ## Commit & Pull Request Guidelines
 

@@ -291,8 +291,11 @@ async fn tool_stream_case(fixture: &dyn ModelFixtureFactory) -> Result<(), Strin
             _ => {}
         }
     }
-    let Some((name, arguments, true)) = calls.get("call-1") else {
-        return Err("canonical call-1 was not completed".to_owned());
+    // Canonical IDs are opaque: an adapter may scope the native ID to its
+    // request. The trace above still requires every fragment and end to match
+    // the exact identity emitted at the start.
+    let Some((name, arguments, true)) = calls.values().next() else {
+        return Err("canonical Tool call was not completed".to_owned());
     };
     if calls.len() != 1 || name != "echo" {
         return Err("Tool identity changed during adaptation".to_owned());

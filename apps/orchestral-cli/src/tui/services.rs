@@ -114,7 +114,7 @@ impl Tasks {
                 let mut menu = Menu::new(
                     MenuKind::Theme,
                     "Appearance · choose terminal colors",
-                    ["terminal", "dark", "light"]
+                    ["dark", "terminal", "light"]
                         .into_iter()
                         .map(|name| {
                             Choice::action(

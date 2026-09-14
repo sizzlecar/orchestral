@@ -1,0 +1,2 @@
+# Staged from the tested PWA only when preparing a crates.io package.
+/web-dist/

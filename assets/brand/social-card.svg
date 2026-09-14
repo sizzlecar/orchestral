@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestral — A runtime for reliable, interactive AI agents.</title>
+  <desc id="desc">A runtime for reliable, interactive AI agents. Agents are the new processes. Orchestral is the runtime.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#363b48"/></pattern>
+    <pattern id="scan" width="4" height="6" patternUnits="userSpaceOnUse"><path d="M0 0h4" stroke="#f5f0cf" stroke-opacity=".025"/></pattern>
+  </defs>
+  <path fill="#20242d" d="M0 0h1280v640H0z"/><path fill="url(#grid)" d="M0 0h1280v640H0z"/>
+  <path fill="#090b0e" d="M54 54h1190v546H54z"/>
+  <path fill="#1d2027" stroke="#555b6b" stroke-width="4" d="M40 40h1190v546H40z"/>
+  <path fill="url(#scan)" d="M42 42h1186v542H42z"/>
+  <g font-family="'DejaVu Sans Mono',Menlo,Consolas,monospace">
+    <path fill="#090b0e" d="M84 82h76v76H84z"/>
+    <path fill="#83ff6b" stroke="#090b0e" stroke-width="4" d="M76 74h76v76H76z"/>
+    <g transform="translate(76 74) scale(.7916667)" fill="#15171d"><path d="M10 64h21v8H10z"/><path d="m43 24-6 6 22 18-22 18 6 6 29-24z"/><circle cx="83" cy="68" r="4"/></g>
+    <text x="182" y="120" fill="#63dbea" font-size="19" letter-spacing="2">BUILT IN RUST</text>
+    <path fill="#272b35" stroke="#555b6b" stroke-width="2" d="M977 88h210v44H977z"/>
+    <path fill="#83ff6b" d="M995 103h12v12h-12z"/>
+    <text x="1020" y="117" fill="#f5f0cf" font-size="17">OPEN SOURCE</text>
+    <text x="84" y="302" fill="#090b0e" font-size="122" font-weight="700" letter-spacing="-6">ORCHESTRAL</text>
+    <text x="76" y="294" fill="#f5f0cf" font-size="122" font-weight="700" letter-spacing="-6">ORCHESTRAL</text>
+    <text x="80" y="367" fill="#b0b4c0" font-size="26">A runtime for reliable,</text>
+    <text x="80" y="409" fill="#b0b4c0" font-size="26">interactive AI agents.</text>
+    <path fill="#121419" stroke="#555b6b" stroke-width="3" d="M80 463h1106v74H80z"/>
+    <text x="108" y="509" fill="#83ff6b" font-size="22">$ orchestral</text>
+    <text x="1156" y="507" fill="#a3a8b5" text-anchor="end" font-size="18">orch.pandaailabs.com</text>
+  </g>
+</svg>

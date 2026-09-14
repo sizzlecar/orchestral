@@ -2,7 +2,7 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 100, 24)"
 ---
-  Orchestral  workspace / session-running                                                ● running
+  _>. ORCHESTRAL  // workspace / session-running                                         ● running
   › 阅读核心代码，说明执行链路并给出证据。
 
     ✓ Read 1 file
@@ -22,7 +22,7 @@ expression: "render_to_string(&state, 100, 24)"
 
 
   ⠸ Working (1m 12s · ctrl+c to interrupt) · 1 background terminal running
-────────────────────────────────────────────────────────────────────────────────────────────────────
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   › Add guidance while Orchestral works…
 
-  gemini-2.5-flash · context: —    enter steer · ctrl+c stop
+  gemini-2.5-flash · context: —                                          enter steer · ctrl+c stop

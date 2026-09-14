@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,12 +28,15 @@ use orchestral_core::tool_protocol::{
     ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan, ToolOperationRisk, ToolOutcome,
     ToolOutput, ToolPolicyBounds, ToolRestriction, TransportLaunchPolicy,
 };
+#[cfg(unix)]
+use orchestral_runtime::tools::{
+    guarded_shell_descriptor, GuardedShellExecutor, GUARDED_SHELL_SANDBOX_PROFILE,
+};
 use orchestral_runtime::{
     tool_permission_decision_digest,
     tools::{
-        guarded_artifact_read_descriptor, guarded_file_read_descriptor, guarded_shell_descriptor,
-        GuardedArtifactReadExecutor, GuardedFileReadExecutor, GuardedShellExecutor,
-        GUARDED_SHELL_SANDBOX_PROFILE,
+        guarded_artifact_read_descriptor, guarded_file_read_descriptor,
+        GuardedArtifactReadExecutor, GuardedFileReadExecutor,
     },
     DescriptorPermissionPolicy, GuardedToolExecution, GuardedToolExecutor, GuardedToolResult,
     GuardedToolRuntime, HookDispatchMode, HookError, HookExecutionPolicy, HookFailurePolicy,
@@ -56,6 +60,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+#[path = "tool_runtime/context_output.rs"]
+mod context_output;
 
 fn strings(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -508,6 +515,7 @@ async fn seed_effect_trace(
         .plan_operation(&invocation, &descriptor, &effective)
         .unwrap();
     let prepared = PreparedToolEffect {
+        argument_resolution: None,
         args_digest: invocation.args_digest().unwrap(),
         invocation,
         operation_digest: operation.digest().unwrap(),

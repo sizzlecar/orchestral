@@ -1,0 +1,5 @@
+# These snapshots are compared byte for byte with deterministic LF output.
+testing/**/snapshots/*.json text eol=lf
+*.snap text eol=lf
+# Executable distribution scripts must also work from Windows checkouts.
+*.sh text eol=lf

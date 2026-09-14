@@ -993,12 +993,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3067,7 +3061,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orchestral"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "orchestral-core",
  "orchestral-runtime",
@@ -3075,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-agent-acp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3089,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-agent-codex"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3111,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-agent-journal-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fs2",
@@ -3139,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-artifact-r2"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3157,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-blob-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3171,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3211,7 +3205,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "toml",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -3224,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-coding-eval"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3238,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3253,7 +3246,6 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
- "tokio-test",
  "tokio-util",
  "tracing",
  "uuid",
@@ -3267,16 +3259,13 @@ dependencies = [
  "futures-util",
  "orchestral-core",
  "orchestral-runtime",
- "serde_json",
  "tokio",
  "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "orchestral-mcp-streamable-http"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3292,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-model-gemini"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3308,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-model-openai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3316,7 +3305,9 @@ dependencies = [
  "orchestral-core",
  "orchestral-model-protocol-testkit",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tokio-util",
 ]
@@ -3335,15 +3326,30 @@ dependencies = [
 
 [[package]]
 name = "orchestral-project-instructions-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cap-std",
  "orchestral-core",
 ]
 
 [[package]]
+name = "orchestral-release"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "orchestral-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3369,15 +3375,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-test",
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "orchestral-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dioxus",
  "futures-util",
@@ -3385,7 +3391,6 @@ dependencies = [
  "gloo-timers",
  "hex",
  "js-sys",
- "pretty_assertions",
  "pulldown-cmark",
  "rexie",
  "serde",
@@ -3557,16 +3562,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
 ]
 
 [[package]]
@@ -3899,6 +3894,7 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -4897,17 +4893,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "tokio-tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5843,12 +5828,6 @@ name = "xxhash-rust"
 version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

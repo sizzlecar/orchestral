@@ -368,6 +368,8 @@ fn persist_state(path: &Path, state: &RemoteStateFile) -> anyhow::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
+        // Windows does not support opening a directory through File::open.
+        #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;
         Ok::<(), std::io::Error>(())
     })();
@@ -379,12 +381,12 @@ fn persist_state(path: &Path, state: &RemoteStateFile) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_private_directory_permissions(path: &Path) -> anyhow::Result<()> {
+fn set_private_directory_permissions(_path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("secure remote-control directory '{}'", path.display()))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("secure remote-control directory '{}'", _path.display()))?;
     }
     Ok(())
 }

@@ -114,10 +114,13 @@ fn cli_loads_ancestor_rules_and_claude_fallback_with_directory_scopes() {
         );
         assert!(!text.contains("IGNORED_"));
         assert!(!text.contains("UNRELATED_SIBLING_RULES"));
-        assert!(text.contains(&format!("\"scope\":\"{}\"", root.display())));
         assert!(text.contains(&format!(
-            "\"scope\":\"{}\"",
-            root.join("packages/service").display()
+            "\"scope\":{}",
+            serde_json::to_string(&root).unwrap()
+        )));
+        assert!(text.contains(&format!(
+            "\"scope\":{}",
+            serde_json::to_string(&root.join("packages/service")).unwrap()
         )));
         assert!(text.contains("CLAUDE.md"));
         openai_text_response("project context received")
@@ -202,7 +205,10 @@ fn cli_keeps_added_workspace_rules_scoped_and_deduplicates_ancestors() {
         let text = model_request_text(&request.body);
         assert_eq!(text.matches("COMMON_REPOSITORY_RULE").count(), 1);
         assert_eq!(text.matches("LIBRARY_ONLY_RULE").count(), 1);
-        assert!(text.contains(&format!("\"scope\":\"{}\"", library.display())));
+        assert!(text.contains(&format!(
+            "\"scope\":{}",
+            serde_json::to_string(&library).unwrap()
+        )));
         openai_text_response("both workspaces loaded")
     })]);
     workspace.configure_local_openai(&endpoint);

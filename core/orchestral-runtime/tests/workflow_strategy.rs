@@ -652,6 +652,7 @@ async fn recovery_preflight_blocks_all_siblings_when_one_effect_is_unresolved() 
         .plan_operation(&invocation, &descriptor, &effective_policy)
         .expect("operation plan is valid");
     let prepared = PreparedToolEffect {
+        argument_resolution: None,
         args_digest: invocation.args_digest().expect("arguments digest"),
         operation_digest: operation.digest().expect("operation digest"),
         permission_digest: tool_permission_decision_digest(

@@ -17,6 +17,8 @@ pub mod session_history;
 pub mod skill;
 pub mod tool_runtime;
 pub mod tools;
+#[cfg(windows)]
+mod windows_process_job;
 pub mod workflow_strategy;
 
 pub use agent_control::{AgentControlError, AgentControlEvent, AgentController};
@@ -28,8 +30,8 @@ pub use exec_process::{
     ExecSessionStatus, ExecSpawnSpec, ExecWaitMode, ExecWaitOptions, ProcessSupervisor,
 };
 pub use generic_agent::{
-    ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy,
-    ModelRetryPolicy,
+    ContextRecoveryPolicy, ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider,
+    ModelCostPolicy, ModelRetryPolicy,
 };
 pub use generic_agent_checkpoint::{
     replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,

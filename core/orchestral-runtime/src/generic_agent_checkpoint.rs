@@ -8,13 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::RwLock;
 
+use crate::session_context::observed_prefix::{ContextPlanningTrace, ObservedPrefixAnchor};
 use orchestral_core::agent_protocol::wire::{
     AgentAdmission, AgentCommandEnvelope, AgentEvent, AgentEventDraft, AgentEventId,
     AgentExecutionRef, AgentStartRequest, CommandId, Digest, ProviderCommandOutcome, RunId,
 };
 use orchestral_core::agent_session::SessionSourceRange;
 use orchestral_core::model_protocol::{
-    ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
+    ModelContent, ModelFinishReason, ModelRequestId, ModelToolCallId, ModelUsage,
 };
 use orchestral_core::tool_protocol::ApprovalCapability;
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,9 @@ pub struct GenericModelObservation {
     pub finish_reason: ModelFinishReason,
     #[serde(default)]
     pub response: String,
+    /// Provider-owned message state, separate from visible text and Tool data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub continuation: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub usage: Option<ModelUsage>,
     #[serde(default)]
@@ -104,15 +108,46 @@ pub struct GenericModelContextTrace {
     pub config_digest: Digest,
     pub history_limit: usize,
     pub used_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<orchestral_core::model_protocol::ModelContextEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<ContextPlanningTrace>,
     pub input_budget_tokens: u64,
 }
 
 impl GenericModelContextTrace {
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        if self.planning.as_ref().is_some_and(|planning| {
+            !planning.input.validate()
+                || planning.input.raw_estimate_tokens > self.used_input_tokens
+                || self.context_estimate.is_none()
+                || planning
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| !anchor.validate())
+        }) {
+            return Err(GenericCheckpointError::InvalidData(
+                "invalid context planning provenance".to_owned(),
+            ));
+        }
+        if let Some(estimate) = &self.context_estimate {
+            if estimate.accounting
+                != orchestral_core::model_protocol::ModelTokenAccounting::Estimated
+                || estimate.tokens > self.used_input_tokens
+            {
+                return Err(GenericCheckpointError::InvalidData(
+                    "model Context planning estimate must be marked estimated and within its input bound".to_owned(),
+                ));
+            }
+        }
         if !self.config_digest.is_sha256()
             || self.history_limit == 0
             || self.input_budget_tokens == 0
-            || self.used_input_tokens > self.input_budget_tokens
+            || self
+                .context_estimate
+                .as_ref()
+                .map_or(self.used_input_tokens, |estimate| estimate.tokens)
+                > self.input_budget_tokens
         {
             return Err(GenericCheckpointError::InvalidData(
                 "model Context trace requires a config digest and valid Host limits".to_owned(),
@@ -143,10 +178,66 @@ impl GenericModelContextTrace {
         }
         Ok(())
     }
+
+    pub(crate) fn observed_prefix(
+        &self,
+        run_id: &RunId,
+        request_id: &ModelRequestId,
+        observation: &GenericModelObservation,
+        max_output_tokens: Option<u64>,
+    ) -> Option<ObservedPrefixAnchor> {
+        let planning = self.planning.as_ref()?;
+        let input_tokens = observation.usage.as_ref()?.input_tokens?;
+        if input_tokens == 0
+            || input_tokens > self.used_input_tokens
+            || observation
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens)
+                .zip(max_output_tokens)
+                .is_some_and(|(used, cap)| used > cap)
+            || !matches!(
+                observation.finish_reason,
+                ModelFinishReason::Stop | ModelFinishReason::ToolCalls
+            )
+            || (observation.response.is_empty() && observation.tool_calls.is_empty())
+            || observation.tool_calls.iter().any(|call| {
+                !call.ended || serde_json::from_str::<serde_json::Value>(&call.arguments).is_err()
+            })
+        {
+            return None;
+        }
+        Some(ObservedPrefixAnchor {
+            run_id: run_id.clone(),
+            config_digest: self.config_digest.clone(),
+            source_request_id: request_id.clone(),
+            input: planning.input.clone(),
+            observed_input_tokens: input_tokens,
+        })
+    }
 }
 
 impl GenericModelObservation {
+    pub(crate) fn assistant_content(&self) -> Vec<ModelContent> {
+        let mut content = Vec::new();
+        if !self.response.is_empty() {
+            content.push(ModelContent::Text {
+                text: self.response.clone(),
+            });
+        }
+        content.extend(self.continuation.iter().map(|(namespace, value)| {
+            ModelContent::Continuation {
+                namespace: namespace.clone(),
+                value: value.clone(),
+            }
+        }));
+        content
+    }
+
     fn validate(&self) -> Result<(), GenericCheckpointError> {
+        for content in self.assistant_content() {
+            content.validate().map_err(invalid_data)?;
+        }
         let mut call_ids = BTreeSet::new();
         if self.tool_calls.iter().any(|call| {
             call.call_id.is_empty()
@@ -221,6 +312,16 @@ pub enum GenericCheckpointEvent {
         request_id: ModelRequestId,
         observation: GenericModelObservation,
     },
+    /// A definite capacity rejection, before any model usage or content.
+    /// This closes the attempt without executing tools and durably reserves
+    /// a smaller input budget for a new model round, including after restart.
+    ModelContextRejected {
+        round: u64,
+        request_id: ModelRequestId,
+        retry_number: u32,
+        input_budget_tokens: u64,
+        error: orchestral_core::model_protocol::ModelError,
+    },
     /// A retry within an open logical attempt, before any non-usage event was
     /// observed. Recovery still treats an open attempt as interrupted; this
     /// fact does not authorize replaying a model request after process loss.
@@ -259,6 +360,26 @@ pub enum GenericCheckpointEvent {
 impl GenericCheckpointEvent {
     fn validate(&self, run_id: &RunId) -> Result<(), GenericCheckpointError> {
         match self {
+            Self::ModelContextRejected {
+                round,
+                request_id,
+                retry_number,
+                input_budget_tokens,
+                error,
+            } => {
+                if *round == 0
+                    || round.checked_add(1).is_none()
+                    || request_id.is_empty()
+                    || *retry_number == 0
+                    || *input_budget_tokens == 0
+                    || error.code
+                        != orchestral_core::model_protocol::ModelErrorCode::ContextLengthExceeded
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context recovery requires a definite capacity rejection and positive budget".to_owned(),
+                    ));
+                }
+            }
             Self::ModelRetryScheduled {
                 round,
                 request_id,
@@ -580,6 +701,29 @@ pub struct GenericAgentCheckpointProjection {
     pub provider_events: Vec<AgentEventDraft>,
     pub commands: BTreeMap<CommandId, CommandCheckpoint>,
     pub last_checkpoint_seq: u64,
+    /// Derived from the last completed request, never cumulative/output usage.
+    pub observed_prefix: Option<ObservedPrefixAnchor>,
+    pub context_recovery: Option<GenericContextRecovery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericContextRecovery {
+    /// Consecutive rejected attempts. Zero means generation succeeded while
+    /// the learned per-request ceiling remains in force for this Run.
+    pub retry_number: u32,
+    pub input_budget_tokens: u64,
+}
+
+impl GenericContextRecovery {
+    /// The ceiling is one token below the rejected input; rounding its half
+    /// upward recovers half the original rejected input without overflowing.
+    pub(crate) fn compaction_target_tokens(&self) -> Option<u64> {
+        (self.retry_number > 0).then(|| self.input_budget_tokens.div_ceil(2))
+    }
+
+    pub(crate) fn generation_observed(&mut self) {
+        self.retry_number = 0;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -600,6 +744,9 @@ pub fn replay_generic_agent_checkpoint(
     let mut commands = BTreeMap::<CommandId, CommandCheckpoint>::new();
     let mut checkpoint_ids = BTreeMap::<GenericCheckpointEventId, Digest>::new();
     let mut last_retry_number = 0_u32;
+    let mut observed_prefix = None;
+    let mut context_recovery: Option<GenericContextRecovery> = None;
+    let mut started_context: Option<(GenericModelContextTrace, Option<u64>)> = None;
 
     for (index, record) in run.records.iter().enumerate() {
         record.validate()?;
@@ -627,6 +774,61 @@ pub fn replay_generic_agent_checkpoint(
         }
 
         match &record.payload {
+            GenericCheckpointEvent::ModelContextRejected {
+                round,
+                request_id,
+                retry_number,
+                input_budget_tokens,
+                ..
+            } => {
+                let GenericCheckpointPhase::ModelAttemptOpen {
+                    boundary,
+                    round: open_round,
+                    request_id: open_request_id,
+                    ..
+                } = &phase
+                else {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context rejection must close an open model attempt".to_owned(),
+                    ));
+                };
+                let trace = &started_context
+                    .as_ref()
+                    .ok_or_else(|| {
+                        GenericCheckpointError::InvalidData(
+                            "missing rejected context trace".to_owned(),
+                        )
+                    })?
+                    .0;
+                let planned_input = trace
+                    .context_estimate
+                    .as_ref()
+                    .map_or(trace.used_input_tokens, |estimate| estimate.tokens);
+                if round != open_round
+                    || request_id != open_request_id
+                    || context_recovery
+                        .as_ref()
+                        .map_or(Some(1), |prior| prior.retry_number.checked_add(1))
+                        != Some(*retry_number)
+                    || *input_budget_tokens >= trace.input_budget_tokens
+                    || *input_budget_tokens >= planned_input
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context recovery must advance its rejection count and reduce the rejected input budget".to_owned(),
+                    ));
+                }
+                let mut next = boundary.clone();
+                next.next_model_round = round.checked_add(1).ok_or_else(|| {
+                    GenericCheckpointError::InvalidData(
+                        "context recovery round overflow".to_owned(),
+                    )
+                })?;
+                phase = GenericCheckpointPhase::Stable(next);
+                context_recovery = Some(GenericContextRecovery {
+                    retry_number: *retry_number,
+                    input_budget_tokens: *input_budget_tokens,
+                });
+            }
             GenericCheckpointEvent::ModelRetryScheduled {
                 round,
                 request_id,
@@ -689,8 +891,8 @@ pub fn replay_generic_agent_checkpoint(
                 round,
                 request_id,
                 request_digest,
-                max_output_tokens: _,
-                context: _,
+                max_output_tokens,
+                context,
             } => {
                 let GenericCheckpointPhase::Stable(boundary) = &phase else {
                     return Err(GenericCheckpointError::InvalidData(
@@ -702,6 +904,26 @@ pub fn replay_generic_agent_checkpoint(
                         "model attempt round does not match the stable boundary".to_owned(),
                     ));
                 }
+                if context_recovery.as_ref().is_some_and(|recovery| {
+                    context.input_budget_tokens > recovery.input_budget_tokens
+                }) {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model retry exceeded its durable recovery input budget".to_owned(),
+                    ));
+                }
+                if context.planning.as_ref().is_some_and(|planning| {
+                    context.config_digest != run.registration.config_digest
+                        || planning
+                            .anchor
+                            .as_ref()
+                            .is_some_and(|anchor| Some(anchor) != observed_prefix.as_ref())
+                }) {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context anchor does not match an earlier completed request in this Run"
+                            .to_owned(),
+                    ));
+                }
+                started_context = Some((context.clone(), *max_output_tokens));
                 phase = GenericCheckpointPhase::ModelAttemptOpen {
                     boundary: boundary.clone(),
                     round: *round,
@@ -730,6 +952,12 @@ pub fn replay_generic_agent_checkpoint(
                     return Err(GenericCheckpointError::InvalidData(
                         "model observation identity does not match its open attempt".to_owned(),
                     ));
+                }
+                observed_prefix = started_context.as_ref().and_then(|(context, cap)| {
+                    context.observed_prefix(run_id, request_id, observation, *cap)
+                });
+                if let Some(recovery) = &mut context_recovery {
+                    recovery.generation_observed();
                 }
                 phase = GenericCheckpointPhase::ModelAttemptObserved {
                     boundary: boundary.clone(),
@@ -840,6 +1068,8 @@ pub fn replay_generic_agent_checkpoint(
         provider_events,
         commands,
         last_checkpoint_seq: run.last_checkpoint_seq(),
+        observed_prefix,
+        context_recovery,
     })
 }
 
@@ -1079,6 +1309,8 @@ mod tests {
             config_digest: Digest::sha256("config-v1"),
             history_limit: 128,
             used_input_tokens: 10,
+            context_estimate: None,
+            planning: None,
             input_budget_tokens: 100,
         }
     }
@@ -1092,6 +1324,114 @@ mod tests {
         let mut trace = context_trace();
         trace.used_input_tokens = trace.input_budget_tokens + 1;
         assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn model_context_trace_keeps_legacy_bounds_and_explicit_estimates_distinct() {
+        use orchestral_core::model_protocol::{ModelContextEstimate, ModelTokenAccounting};
+        let legacy = context_trace();
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("context_estimate").is_none());
+        assert!(serialized.get("planning").is_none());
+        let restored: GenericModelContextTrace =
+            serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(
+            serde_jcs::to_vec(&restored).unwrap(),
+            serde_jcs::to_vec(&serialized).unwrap()
+        );
+        restored.validate().unwrap();
+        assert_eq!(restored, legacy);
+
+        let mut trace = legacy;
+        trace.used_input_tokens = 900;
+        trace.context_estimate = Some(ModelContextEstimate {
+            tokens: 80,
+            accounting: ModelTokenAccounting::Estimated,
+        });
+        trace.validate().unwrap();
+        let restored: GenericModelContextTrace =
+            serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
+        assert_eq!(restored, trace);
+        for (tokens, accounting) in [
+            (101, ModelTokenAccounting::Estimated),
+            (901, ModelTokenAccounting::Estimated),
+            (80, ModelTokenAccounting::Exact),
+            (80, ModelTokenAccounting::ConservativeUpperBound),
+        ] {
+            trace.context_estimate = Some(ModelContextEstimate { tokens, accounting });
+            assert!(trace.validate().is_err());
+        }
+        trace.context_estimate = None;
+        assert!(trace.validate().is_err());
+    }
+
+    #[test]
+    fn observed_prefix_requires_positive_complete_in_bound_input_usage() {
+        use crate::session_context::observed_prefix::ContextInputSignature;
+        use orchestral_core::model_protocol::{ModelContextEstimate, ModelTokenAccounting};
+        let mut trace = context_trace();
+        trace.context_estimate = Some(ModelContextEstimate {
+            tokens: 8,
+            accounting: ModelTokenAccounting::Estimated,
+        });
+        trace.planning = Some(ContextPlanningTrace {
+            input: ContextInputSignature {
+                messages_len: 2,
+                messages_digest: Digest::sha256("messages"),
+                tools_digest: Digest::sha256("tools"),
+                raw_estimate_tokens: 8,
+            },
+            anchor: None,
+        });
+        let observation = GenericModelObservation {
+            finish_reason: ModelFinishReason::Stop,
+            response: "complete".to_owned(),
+            continuation: Default::default(),
+            tool_calls: Vec::new(),
+            usage: Some(ModelUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(2),
+            }),
+        };
+        let derive = |observation: &GenericModelObservation| {
+            trace.observed_prefix(
+                &RunId::new("run"),
+                &ModelRequestId::new("request"),
+                observation,
+                Some(4),
+            )
+        };
+        assert_eq!(derive(&observation).unwrap().observed_input_tokens, 5);
+        for reason in [
+            ModelFinishReason::Length,
+            ModelFinishReason::Cancelled,
+            ModelFinishReason::ContentFilter,
+            ModelFinishReason::Other,
+        ] {
+            let mut rejected = observation.clone();
+            rejected.finish_reason = reason;
+            assert!(derive(&rejected).is_none());
+        }
+        for input in [None, Some(0), Some(11)] {
+            let mut rejected = observation.clone();
+            rejected.usage.as_mut().unwrap().input_tokens = input;
+            assert!(derive(&rejected).is_none());
+        }
+        let mut rejected = observation.clone();
+        rejected.usage = None;
+        assert!(derive(&rejected).is_none());
+        let mut rejected = observation.clone();
+        rejected.usage.as_mut().unwrap().output_tokens = Some(5);
+        assert!(derive(&rejected).is_none());
+        let mut rejected = observation;
+        rejected.tool_calls.push(GenericObservedToolCall {
+            call_id: ModelToolCallId::new("half-call"),
+            name: "inspect".to_owned(),
+            arguments: "{}".to_owned(),
+            extensions: Default::default(),
+            ended: false,
+        });
+        assert!(derive(&rejected).is_none());
     }
 
     #[test]
@@ -1177,6 +1517,7 @@ mod tests {
                         observation: GenericModelObservation {
                             finish_reason: ModelFinishReason::Stop,
                             response: "done".to_owned(),
+                            continuation: BTreeMap::new(),
                             usage: None,
                             tool_calls: vec![],
                         },
@@ -1233,6 +1574,10 @@ mod tests {
                         observation: GenericModelObservation {
                             finish_reason: ModelFinishReason::ToolCalls,
                             response: "calling a Tool".to_owned(),
+                            continuation: BTreeMap::from([(
+                                "fixture/native".to_owned(),
+                                serde_json::json!({"opaque": "Ω\n"}),
+                            )]),
                             usage: Some(ModelUsage {
                                 input_tokens: Some(10),
                                 output_tokens: Some(5),
@@ -1250,6 +1595,20 @@ mod tests {
             )
             .unwrap();
         let observed = store.load_run(&run_id).unwrap().unwrap();
+        let persisted = serde_json::to_vec(&observed).unwrap();
+        let restored: StoredGenericAgentRun = serde_json::from_slice(&persisted).unwrap();
+        let GenericCheckpointPhase::ModelAttemptObserved { observation, .. } =
+            restored.validate().unwrap().phase
+        else {
+            panic!("restored terminal model observation");
+        };
+        assert_eq!(
+            observation.continuation["fixture/native"],
+            serde_json::json!({"opaque": "Ω\n"})
+        );
+        assert!(
+            matches!(&observation.assistant_content()[1], ModelContent::Continuation { namespace, .. } if namespace == "fixture/native")
+        );
         assert!(matches!(
             observed.validate().unwrap().phase,
             GenericCheckpointPhase::ModelAttemptObserved {

@@ -42,7 +42,7 @@ use orchestral_core::model_protocol::{
     ModelMessage, ModelRequest, ModelRequestId, ModelRole, ModelToolCallId, ModelToolDefinition,
     ModelUsage,
 };
-pub use orchestral_core::model_retry::ModelRetryPolicy;
+pub use orchestral_core::model_retry::{ContextRecoveryPolicy, ModelRetryPolicy};
 use orchestral_core::project_instructions::ProjectInstruction;
 use orchestral_core::skill_protocol::SkillLoad;
 use orchestral_core::tool_protocol::{
@@ -174,11 +174,16 @@ pub struct GenericAgentConfig {
     pub project_instructions: Vec<ProjectInstruction>,
     /// Retries before model content or Finish; never replays tool execution.
     pub model_retry: ModelRetryPolicy,
+    pub context_recovery: ContextRecoveryPolicy,
     pub stream_buffer: usize,
     pub continuation: ContinuationPolicy,
     pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
+    /// Optional minimum response room before active context is compacted.
+    /// The preferred response budget remains reserved_output_tokens. None
+    /// preserves the fixed-reservation behavior.
+    pub minimum_output_reserve_tokens: Option<u64>,
     pub model_cost_policy: Option<ModelCostPolicy>,
 }
 
@@ -229,7 +234,7 @@ impl GenericAgentConfig {
             provider_id: AgentProviderId::new(provider_id),
             agent_id: AgentId::new(agent_id),
             system_prompt: concat!(
-                "You are Orchestral, a provider-neutral agent running in a local application. ",
+                "You are Orchestral, an agent running in a local application. ",
                 "You and the user share one or more Host-provided workspaces. Work toward the user's ",
                 "requested outcome using the supplied context and Tools. Tool definitions and ",
                 "Host policy are authoritative capability boundaries. Inspect available ",
@@ -239,29 +244,39 @@ impl GenericAgentConfig {
                 "as acceptance constraints: establish them before dependent work and verify ",
                 "them before delivery. Do not broaden completed work with unrequested ",
                 "integration, publication, cleanup, or reversal. ",
+                "Batch independent observations whose arguments are supported by current context ",
+                "in one tool-call response. This can include inspections and an already-established ",
+                "validation command when neither needs the other's result. Wait when a result can ",
+                "change another call's arguments, necessity, or safety; keep edits and their ",
+                "verification ordered. ",
                 "Prefer a dedicated Tool over a shell equivalent when one is available. For ",
                 "multiple workspaces, use the exact Host-provided workspace selector on file ",
                 "Tools and the matching workdir on exec_command; do not fall back to grep, cat, ",
                 "or shell-based edits merely because the target is not in the primary workspace. ",
-                "workspace text changes, use file_write to create a file or intentionally ",
-                "replace a complete file, and use apply_patch for targeted changes to existing ",
-                "files. Inspect existing content before changing it and run relevant ",
-                "verification. Permission is owned by the Host, not inferred by you. When an ",
-                "exec_command needed for the user's request cannot run in the default sandbox, ",
-                "request sandbox_permissions='require_escalated' with a concise justification ",
-                "so the Host can apply policy or ask the user; do not offload the command to the ",
-                "user merely because approval is needed. Treat every Tool failure as an observation to ",
-                "correct or safely work around; report completion only from successful evidence."
+                "For workspace text changes, prefer file_edit for one exact, unique text ",
+                "replacement; use apply_patch for structured changes across multiple locations. ",
+                "Use file_write to create or intentionally replace a complete file. Inspect ",
+                "existing content before changing it and run relevant ",
+                "verification. Keep user-facing responses concise unless the user requests a ",
+                "detailed explanation. For completed work, briefly state the outcome, verification ",
+                "results, and any remaining gaps. Include changed code or raw Tool logs only when ",
+                "requested or needed to explain an unresolved issue. Avoid repeating explanations ",
+                "or checks that add no new evidence. Permission is owned by the Host, not inferred ",
+                "by you. Treat every Tool ",
+                "failure as an observation to correct or safely work around; report completion ",
+                "only from successful evidence."
             )
             .to_owned(),
             stream_buffer: 128,
             input_requests_enabled: true,
             project_instructions: Vec::new(),
             model_retry: ModelRetryPolicy::default(),
+            context_recovery: ContextRecoveryPolicy::default(),
             continuation: ContinuationPolicy::default(),
             history_limit: 128,
             max_context_tokens: 128 * 1024,
             reserved_output_tokens: 4 * 1024,
+            minimum_output_reserve_tokens: None,
             model_cost_policy: None,
         }
     }
@@ -467,10 +482,12 @@ impl GenericExecutionSeed {
 }
 
 mod command;
+mod context_anchor;
 mod coordinator;
 mod provider;
 mod provider_spi;
 mod recovery_activate;
+use context_anchor::*;
 mod recovery_approval;
 mod recovery_dispatch;
 mod recovery_entry;
@@ -485,6 +502,7 @@ mod recovery_projection;
 use recovery_projection::*;
 mod context;
 use context::*;
+mod context_recovery;
 mod model_retry;
 mod model_step;
 use model_step::*;

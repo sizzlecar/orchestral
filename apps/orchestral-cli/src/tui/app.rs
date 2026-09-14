@@ -424,6 +424,8 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
         };
     }
     if state.phase == UiPhase::WaitingApproval {
+        let scroll_max = super::render::approval_scroll_max(state, state.terminal_size);
+        let scroll = state.approval_scroll.min(scroll_max);
         let session_available = matches!(
             &state.pending,
             Some(super::state::PendingOverlay::Approval {
@@ -449,9 +451,12 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
                 Some(UiMsg::Approval(state.approval_choice))
             }
             KeyCode::Esc => Some(UiMsg::Escape),
-            KeyCode::PageUp => Some(UiMsg::ScrollUp(5)),
-            KeyCode::PageDown => Some(UiMsg::ScrollDown(5)),
-            KeyCode::End => Some(UiMsg::FollowOutput),
+            KeyCode::PageUp => Some(UiMsg::ScrollApproval(scroll.saturating_sub(5))),
+            KeyCode::PageDown => Some(UiMsg::ScrollApproval(
+                scroll.saturating_add(5).min(scroll_max),
+            )),
+            KeyCode::Home => Some(UiMsg::ScrollApproval(0)),
+            KeyCode::End => Some(UiMsg::ScrollApproval(scroll_max)),
             _ => None,
         };
     }
@@ -1309,6 +1314,41 @@ mod tests {
             key_message(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state),
             Some(UiMsg::SelectApproval(ApprovalChoice::Deny))
         );
+    }
+
+    #[test]
+    fn approval_page_keys_scroll_details_without_selecting_or_resolving() {
+        let mut state = UiState::new("session", "model");
+        state.terminal_size = (40, 10);
+        crate::tui::update(
+            &mut state,
+            UiMsg::WaitingApproval {
+                run_id: "run".into(),
+                request_id: "approval".into(),
+                summary: format!(
+                    "{}Effects: process execution",
+                    "Operation detail\n".repeat(24)
+                ),
+                session_approval_available: true,
+            },
+        );
+        crate::tui::update(&mut state, UiMsg::SelectApproval(ApprovalChoice::Deny));
+        let max_scroll = super::super::render::approval_scroll_max(&state, state.terminal_size);
+        assert!(max_scroll > 5);
+        for (key, expected) in [
+            (KeyCode::PageDown, 5),
+            (KeyCode::End, max_scroll),
+            (KeyCode::PageDown, max_scroll),
+            (KeyCode::PageUp, max_scroll - 5),
+            (KeyCode::Home, 0),
+        ] {
+            let message = key_message(KeyEvent::new(key, KeyModifiers::NONE), &state).unwrap();
+            assert!(crate::tui::update(&mut state, message).is_empty());
+            assert_eq!(state.approval_scroll, expected);
+            assert_eq!(state.approval_choice, ApprovalChoice::Deny);
+            assert_eq!(state.phase, UiPhase::WaitingApproval);
+            assert_eq!(state.viewport.movement, 0);
+        }
     }
 
     #[test]

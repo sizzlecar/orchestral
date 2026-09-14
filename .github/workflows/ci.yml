@@ -7,14 +7,24 @@ on:
     branches:
       - "**"
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   harbor-adapter-checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -31,20 +41,23 @@ jobs:
           python -m unittest discover -s testing/orchestral-harbor/tests -v
 
   rust-checks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt,clippy
+        run: rustup show active-toolchain
 
       - name: Install Linux sandbox backend
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
@@ -55,12 +68,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Architecture guard - core must not depend on platform
-        run: |
-          if grep -r 'platform/' core/orchestral-core/Cargo.toml core/orchestral-runtime/Cargo.toml core/orchestral/Cargo.toml 2>/dev/null; then
-            echo "FAIL: core/ crates must not depend on platform/"
-            exit 1
-          fi
+      - name: Check core production dependency boundaries
+        run: bash scripts/check_workspace.sh
 
       - name: Agent surface hard-cut gate
         run: bash scripts/check_agent_surface.sh
@@ -68,8 +77,131 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Check workspace targets
+        run: cargo check --locked --workspace --all-targets
+
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Diagnose native Windows execution
+        id: windows_exec
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p orchestral-runtime --test windows_exec -- --nocapture --test-threads=1
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        # Preserve full-suite evidence even when the earlier native diagnostic fails.
+        # The failed diagnostic remains a job failure; it is never tolerated.
+        if: ${{ !cancelled() && (success() || steps.windows_exec.conclusion == 'failure') }}
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Check SDK documentation examples
+        run: cargo test --locked --workspace --doc
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test first connection without paid model calls
+        run: node scripts/onboarding_smoke.cjs
+      - name: Test installation and replacement
+        run: node scripts/installer_smoke.cjs
+
+
+  web-checks:
+    # Dioxus 0.7.9's prebuilt CLI requires glibc 2.39. Release binaries still
+    # build on Ubuntu 22.04 so their glibc 2.35 compatibility is preserved.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NODE_PATH: ${{ github.workspace }}/scripts/node_modules
+      PWA_SMOKE_CHANNEL: chromium
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain and WASM target
+        run: |
+          rustup show active-toolchain
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+      - name: Check browser target
+        run: cargo check --locked -p orchestral-web --target wasm32-unknown-unknown --features web
+      - name: Install pinned Dioxus CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dioxus"
+          gh release download v0.7.9 --repo DioxusLabs/dioxus \
+            --pattern dx-x86_64-unknown-linux-gnu.tar.gz --dir "$RUNNER_TEMP/dioxus"
+          tar -xzf "$RUNNER_TEMP/dioxus/dx-x86_64-unknown-linux-gnu.tar.gz" -C "$RUNNER_TEMP/dioxus"
+          echo "$RUNNER_TEMP/dioxus" >> "$GITHUB_PATH"
+      - name: Build embedded PWA
+        run: bash scripts/build_web.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: scripts/package-lock.json
+      - name: Install browser test dependencies
+        working-directory: scripts
+        run: |
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+      - name: Build and test public website
+        run: |
+          node scripts/build_site.cjs
+          node scripts/site_smoke.cjs
+      - name: Test PWA and image input
+        run: |
+          node scripts/pwa_browser_smoke.cjs
+          node scripts/pwa_image_message_smoke.cjs
+          PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
+          PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_image_message_smoke.cjs
+      - name: Save tested PWA for release packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/orchestral-web/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  package-checks:
+    name: Verify crates.io packages
+    needs: web-checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-packages
+      - name: Replace workspace PWA with this run's tested bundle
+        run: rm -rf web/orchestral-web/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/orchestral-web/dist
+      - name: Prepare self-contained package inputs
+        run: |
+          cargo run --locked -p orchestral-release -- prepare --output target/release-plan
+          cargo run --locked -p orchestral-release -- stage-web
+      - name: Build the actual crates.io packages without publishing
+        run: cargo publish --workspace --locked --allow-dirty --dry-run
+      - name: Retain verified crate bytes and their tested PWA
+        run: |
+          version=$(cat target/release-plan/version.txt)
+          mkdir -p target/cargo-distribution
+          cp target/release-plan/release.json target/cargo-distribution/
+          for name in $(jq -r '.packages[]' target/release-plan/release.json); do
+            cp "target/package/$name-$version.crate" target/cargo-distribution/
+          done
+          archive="orchestral-web-v$version.tar.gz"
+          tar -czf "target/cargo-distribution/$archive" -C web/orchestral-web/dist .
+          cd target/cargo-distribution
+          sha256sum "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-distribution
+          path: target/cargo-distribution/
+          if-no-files-found: error
+          retention-days: 14

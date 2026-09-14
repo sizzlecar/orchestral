@@ -95,6 +95,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub model_retry: crate::model_retry::ModelRetryPolicy,
     #[serde(default)]
+    pub context_recovery: crate::model_retry::ContextRecoveryPolicy,
+    #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]
     pub model_profile: Option<String>,
@@ -118,6 +120,10 @@ pub struct AgentConfig {
     pub max_context_tokens: u64,
     #[serde(default = "default_reserved_output_tokens")]
     pub reserved_output_tokens: u64,
+    /// Minimum response room before compacting active context. When omitted,
+    /// retain the full reserved_output_tokens budget on every turn.
+    #[serde(default)]
+    pub minimum_output_reserve_tokens: Option<u64>,
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
 }
@@ -128,6 +134,7 @@ impl Default for AgentConfig {
             input_requests_enabled: true,
             project_instructions: Default::default(),
             model_retry: Default::default(),
+            context_recovery: Default::default(),
             backend: None,
             model_profile: None,
             model: None,
@@ -139,6 +146,7 @@ impl Default for AgentConfig {
             history_limit: default_history_limit(),
             max_context_tokens: default_max_context_tokens(),
             reserved_output_tokens: default_reserved_output_tokens(),
+            minimum_output_reserve_tokens: None,
             compaction: AgentCompactionConfig::default(),
         }
     }
@@ -206,6 +214,10 @@ pub struct ToolsConfig {
     pub max_timeout_ms: u64,
     #[serde(default = "default_tool_output_bytes")]
     pub max_output_bytes: u64,
+    /// Separate model-inline ceiling; larger results are retained as Artifacts.
+    /// Omission lets the application derive a share of the model input window.
+    #[serde(default)]
+    pub max_inline_output_bytes: Option<std::num::NonZeroU64>,
 }
 
 impl Default for ToolsConfig {
@@ -214,6 +226,7 @@ impl Default for ToolsConfig {
             exec: ExecToolConfig::default(),
             max_timeout_ms: default_tool_timeout_ms(),
             max_output_bytes: default_tool_output_bytes(),
+            max_inline_output_bytes: None,
         }
     }
 }
@@ -236,6 +249,10 @@ pub struct ExecToolConfig {
     pub enabled: bool,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Pipeline status behavior; `auto` enables pipefail for Bash/Zsh and
+    /// preserves native behavior for other shells.
+    #[serde(default)]
+    pub pipeline_exit_status: ShellPipelineExitStatus,
     /// Allows an invocation to request exact user approval for execution
     /// outside the default OS sandbox. This is a hard Host ceiling and is
     /// disabled by default in the library configuration.
@@ -245,7 +262,7 @@ pub struct ExecToolConfig {
     /// isolation may disable this path and offer only explicitly requested,
     /// approved Host execution. This does not grant approval by itself and
     /// requires `allow_host_execution` when command execution is enabled.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_sandboxed_execution")]
     pub sandboxed_execution_enabled: bool,
     /// Exact `host:port` destinations available inside the default sandbox.
     /// Empty denies sandboxed network access. Approved Host execution, when
@@ -259,11 +276,31 @@ impl Default for ExecToolConfig {
         Self {
             enabled: false,
             shell: None,
+            pipeline_exit_status: ShellPipelineExitStatus::default(),
             allow_host_execution: false,
-            sandboxed_execution_enabled: true,
+            sandboxed_execution_enabled: default_sandboxed_execution(),
             network_targets: Vec::new(),
         }
     }
+}
+
+/// How the command executor initializes the configured shell's pipeline status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPipelineExitStatus {
+    /// Enable pipefail for supported Bash/Zsh shells; leave other shells native.
+    #[default]
+    Auto,
+    /// Require Bash/Zsh and report the rightmost nonzero pipeline exit status.
+    Pipefail,
+    /// Preserve the configured shell's native options and pipeline exit status.
+    Native,
+}
+
+fn default_sandboxed_execution() -> bool {
+    // Windows currently offers only explicitly approved Host execution.
+    // This does not enable the separate allow_host_execution ceiling.
+    !cfg!(windows)
 }
 
 #[derive(Debug, Clone, Deserialize)]

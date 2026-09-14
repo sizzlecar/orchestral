@@ -1,16 +1,13 @@
 //! Host-guarded Tool implementations and MCP-to-Tool adapter.
 //!
-//! Applications explicitly register capabilities with `GuardedToolRuntime`;
-//! there is no dynamic Action registry, factory, loader, or fallback path.
+//! Applications explicitly register capabilities with `GuardedToolRuntime`.
 
-#[path = "action/builtin.rs"]
 mod builtin;
-#[path = "action/mcp.rs"]
 mod mcp;
-#[path = "action/shell_sandbox.rs"]
 pub(crate) mod shell_sandbox;
-#[path = "action/windows_sandbox.rs"]
-pub(crate) mod windows_sandbox;
+mod toolchain;
+#[cfg(any(windows, test))]
+mod windows_sandbox;
 
 pub use builtin::*;
 pub use mcp::{
@@ -18,3 +15,4 @@ pub use mcp::{
     McpToolsAdapterRegistry, StdioMcpSandboxPolicy, StdioMcpTransportFactory,
     MCP_STDIO_SANDBOX_PROFILE,
 };
+pub use toolchain::host_toolchain_readable_files;

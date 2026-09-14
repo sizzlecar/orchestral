@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestral</title>
+  <desc id="desc">An underscore, a right-pointing chevron, and a period share a common baseline.</desc>
+  <g fill="#83ff6b">
+    <path d="M10 64h21v8H10z"/>
+    <path d="m43 24-6 6 22 18-22 18 6 6 29-24z"/>
+    <circle cx="83" cy="68" r="4"/>
+  </g>
+</svg>

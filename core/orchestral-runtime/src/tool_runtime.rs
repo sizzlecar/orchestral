@@ -3,6 +3,15 @@
 //! An executor must opt in to the Host-owned effective policy
 //! and cancellation contract by implementing [`GuardedToolExecutor`].
 
+mod artifact_observation;
+mod read_precondition;
+pub(crate) use artifact_observation::artifact_model_output;
+pub use artifact_observation::ArtifactReadObservation;
+use read_precondition::execution_invocation;
+pub use read_precondition::{
+    CompleteFileRead, FrozenToolObservations, ModelToolObservations, ObservedFileRead,
+};
+
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
@@ -18,7 +27,7 @@ use orchestral_core::agent_protocol::wire::{
 use orchestral_core::io::{BlobId, BlobIoError, BlobStore, BlobWriteRequest};
 use orchestral_core::spi::{HookRegistry, RuntimeHookContext, RuntimeHookEventEnvelope, SpiMeta};
 use orchestral_core::tool_effect::{
-    replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect,
+    replay_tool_effect, InMemoryToolEffectJournalStore, PreparedToolEffect, ToolArgumentResolution,
     ToolAuthorizationEvidence, ToolEffectAttemptId, ToolEffectError, ToolEffectEvent,
     ToolEffectEventDraft, ToolEffectEventId, ToolEffectJournalStore, ToolEffectKey,
     ToolEffectPhase, ToolEffectProjection,
@@ -145,6 +154,59 @@ pub struct GuardedToolExecution {
 /// Explicit opt-in SPI for implementations that enforce Host Tool policy.
 #[async_trait]
 pub trait GuardedToolExecutor: Send + Sync {
+    /// Deterministic model view of this producer's own successful output.
+    /// The canonical output remains in the Effect Journal. A complete file
+    /// read must retain its original content bytes in this view.
+    fn project_model_output(
+        &self,
+        _invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> serde_json::Value {
+        output.clone()
+    }
+
+    /// Version the model view separately from execution and output schemas.
+    fn model_output_contract(&self) -> serde_json::Value {
+        serde_json::json!({ "contract": "orchestral.model-output/identity/v1" })
+    }
+
+    /// Declares a complete read from this executor's own validated result
+    /// contract. Other executors' JSON fields are never guessed as evidence.
+    fn complete_file_read(
+        &self,
+        _invocation: &ToolInvocation,
+        _output: &serde_json::Value,
+    ) -> Option<CompleteFileRead> {
+        None
+    }
+
+    /// Declares Artifact bytes retained in this executor's model view. Opt-in
+    /// readers must version this behavior in their planning contract. The
+    /// runtime verifies committed visible pages and the original result digest
+    /// before recognizing a complete read; matching JSON field names alone is
+    /// never evidence.
+    fn artifact_read_observation(
+        &self,
+        _invocation: &ToolInvocation,
+        _output: &serde_json::Value,
+    ) -> Option<ArtifactReadObservation> {
+        None
+    }
+
+    fn requires_observed_arguments(&self, _invocation: &ToolInvocation) -> bool {
+        false
+    }
+
+    /// Resolve omitted arguments from committed observations already shown to
+    /// the model. The runtime journals this result before issuing authority.
+    fn resolve_arguments(
+        &self,
+        _invocation: &ToolInvocation,
+        _reads: &[ObservedFileRead],
+    ) -> Result<Option<ToolArgumentResolution>, ToolOutcome> {
+        Ok(None)
+    }
+
     /// Stable identity of the pre-execution planner implemented by this Tool.
     /// It becomes part of the runtime execution contract used by recovery.
     fn planning_contract(&self) -> serde_json::Value {
@@ -410,6 +472,23 @@ pub fn tool_permission_decision_digest(
 /// reference-monitor state stay behind this Host-owned boundary.
 #[async_trait]
 pub trait AgentToolRuntime: Send + Sync {
+    fn project_model_output(
+        &self,
+        _invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolRuntimeError> {
+        Ok(output.clone())
+    }
+
+    async fn freeze_model_observations(
+        &self,
+        _run_id: &RunId,
+        _observations: &ModelToolObservations,
+        _pending_calls: &[ToolCallId],
+    ) -> Result<FrozenToolObservations, ToolOutcome> {
+        Ok(FrozenToolObservations::default())
+    }
+
     /// Stable identity of the Host-side execution contract used to decide
     /// whether a private Agent checkpoint may continue after restart.
     ///
@@ -468,6 +547,27 @@ pub trait AgentToolRuntime: Send + Sync {
         self.invoke(invocation, run_grant, approval, run_cancellation)
             .await
     }
+
+    /// Uses only observations from the Host's already-dispatched model request.
+    /// Runtimes without observation resolution preserve their existing path.
+    async fn invoke_with_observations(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+        _observations: &FrozenToolObservations,
+    ) -> GuardedToolResult {
+        self.invoke_with_yield(
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+        )
+        .await
+    }
 }
 
 /// Structured result returned to the Agent loop.
@@ -506,6 +606,8 @@ pub enum ToolRuntimeError {
     DuplicateToolId(ToolId),
     #[error("model tool name is already registered: {0}")]
     DuplicateModelName(String),
+    #[error("Tool is not registered: {0}")]
+    UnknownTool(ToolId),
     #[error("Tool Runtime execution contract cannot be encoded: {0}")]
     InvalidExecutionContract(String),
     #[error("Tool activity evidence is invalid: {0}")]
@@ -523,6 +625,7 @@ pub struct ToolArtifactStore {
     store: Arc<dyn BlobStore>,
     max_artifact_bytes: u64,
     summary_max_chars: usize,
+    inline_output_limit: Option<std::num::NonZeroU64>,
     hooks: Option<Arc<HookRegistry>>,
 }
 
@@ -541,8 +644,21 @@ impl ToolArtifactStore {
             store,
             max_artifact_bytes,
             summary_max_chars,
+            inline_output_limit: None,
             hooks: None,
         })
+    }
+
+    /// Spill validated results above this model-inline ceiling without reducing
+    /// executor collection limits or the durable Artifact storage ceiling.
+    pub fn with_inline_output_limit(mut self, max_bytes: std::num::NonZeroU64) -> Self {
+        self.inline_output_limit = Some(max_bytes);
+        self
+    }
+
+    /// Maximum serialized inline result size, when configured by the Host.
+    pub fn inline_output_limit(&self) -> Option<u64> {
+        self.inline_output_limit.map(std::num::NonZeroU64::get)
     }
 
     /// Attaches the Host runtime hook registry to artifact lifecycle events.
@@ -613,6 +729,7 @@ impl ToolArtifactStore {
         invocation: &ToolInvocation,
         bytes: Vec<u8>,
         summary: String,
+        inline_max_bytes: u64,
         cancellation: &CancellationToken,
     ) -> Result<ToolArtifact, ToolArtifactError> {
         let byte_size = bytes.len() as u64;
@@ -646,6 +763,12 @@ impl ToolArtifactStore {
             self.write_artifact(invocation, bytes, byte_size, digest, summary, cancellation)
                 .await
         };
+        let result = result.and_then(|mut artifact| {
+            if self.inline_output_limit.is_some() {
+                artifact_observation::fit_artifact_summary(&mut artifact, inline_max_bytes)?;
+            }
+            Ok(artifact)
+        });
         match result {
             Ok(artifact) => {
                 let mut payload = lifecycle_payload;
@@ -816,6 +939,7 @@ struct InvocationIdentity {
     permission_digest: Digest,
     policy_digest: Digest,
     descriptor_digest: Digest,
+    argument_resolution_digest: Option<Digest>,
 }
 
 struct InvocationEntry {
@@ -841,6 +965,7 @@ struct PlannedInvocation {
     permission: ToolPermissionDecision,
     permission_digest: Digest,
     approval_binding: ApprovalBinding,
+    argument_resolution: Option<ToolArgumentResolution>,
 }
 
 type InvocationKey = (RunId, ToolCallId);
@@ -975,15 +1100,20 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 serde_json::json!({
                     "descriptor": &registered.descriptor,
                     "planning_contract": registered.executor.planning_contract(),
+                    "model_output_contract": registered.executor.model_output_contract(),
                 })
             })
             .collect::<Vec<_>>();
         let artifact_contract = self.artifact_store.as_ref().map(|store| {
-            serde_json::json!({
+            let mut contract = serde_json::json!({
                 "max_artifact_bytes": store.max_artifact_bytes,
                 "summary_max_chars": store.summary_max_chars,
                 "hooks_enabled": store.hooks.is_some(),
-            })
+            });
+            if let Some(limit) = store.inline_output_limit() {
+                contract["inline_output_limit"] = serde_json::json!(limit);
+            }
+            contract
         });
         let contract = serde_json::json!({
             "contract": "orchestral.guarded-tool-runtime/v1",
@@ -995,6 +1125,17 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let bytes = serde_jcs::to_vec(&contract)
             .map_err(|error| ToolRuntimeError::InvalidExecutionContract(error.to_string()))?;
         Ok(Digest::sha256(bytes))
+    }
+
+    pub fn project_model_output(
+        &self,
+        invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolRuntimeError> {
+        let producer = self
+            .registered_tool(&invocation.tool_id)?
+            .ok_or_else(|| ToolRuntimeError::UnknownTool(invocation.tool_id.clone()))?;
+        Ok(producer.executor.project_model_output(invocation, output))
     }
 
     /// Projects only the model-facing schema. Host policy, effect declarations,
@@ -1089,15 +1230,46 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 error.message,
             ));
         }
+        // Recovery never creates a missing preparation. In particular an
+        // omitted precondition needs no new read when no durable effect exists.
+        let recovery_key =
+            ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
+        if self
+            .effect_journal
+            .load_effect(&recovery_key)
+            .await
+            .map_err(effect_journal_recovery_error)?
+            .is_empty()
+        {
+            return Ok(None);
+        }
         let effective_policy = EffectiveToolPolicy::resolve(
             &self.host_ceiling,
             &run_grant,
             &registered.descriptor.restriction,
         )
         .map_err(|error| tool_outcome_recovery_error("invalid_effective_policy", error.message))?;
+        let argument_resolution = self
+            .resolve_invocation_arguments(
+                &invocation,
+                &registered,
+                &FrozenToolObservations::default(),
+            )
+            .await
+            .map_err(|outcome| {
+                tool_outcome_recovery_error(
+                    "operation_planning_failed",
+                    format!("Tool argument resolution failed: {outcome:?}"),
+                )
+            })?;
+        let resolved_invocation = execution_invocation(&invocation, argument_resolution.as_ref());
         let operation = registered
             .executor
-            .plan_operation(&invocation, &registered.descriptor, &effective_policy)
+            .plan_operation(
+                &resolved_invocation,
+                &registered.descriptor,
+                &effective_policy,
+            )
             .map_err(|outcome| {
                 tool_outcome_recovery_error(
                     "operation_planning_failed",
@@ -1127,6 +1299,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             )?;
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
+            argument_resolution: argument_resolution.map(Box::new),
             args_digest: invocation.args_digest().map_err(|error| {
                 tool_outcome_recovery_error("invalid_invocation", error.message)
             })?,
@@ -1248,6 +1421,26 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         run_cancellation: CancellationToken,
         yield_requested: CancellationToken,
     ) -> GuardedToolResult {
+        self.invoke_with_observations(
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+            &FrozenToolObservations::default(),
+        )
+        .await
+    }
+
+    pub async fn invoke_with_observations(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+        observations: &FrozenToolObservations,
+    ) -> GuardedToolResult {
         if let Err(error) = invocation.validate() {
             return rejected("invalid_invocation", error.message);
         }
@@ -1277,8 +1470,21 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             Ok(policy) => policy,
             Err(error) => return rejected("invalid_effective_policy", error.message),
         };
+        let argument_resolution = match self
+            .resolve_invocation_arguments(&invocation, &registered, observations)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(outcome) => {
+                return GuardedToolResult::Outcome {
+                    outcome,
+                    cached: false,
+                }
+            }
+        };
+        let resolved_invocation = execution_invocation(&invocation, argument_resolution.as_ref());
         let operation = match registered.executor.plan_operation(
-            &invocation,
+            &resolved_invocation,
             &registered.descriptor,
             &effective_policy,
         ) {
@@ -1314,7 +1520,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 Err(error) => return rejected("invalid_permission_decision", error.message),
             };
         let approval_binding = match ApprovalBinding::for_operation(
-            &invocation,
+            &resolved_invocation,
             &operation,
             &effective_policy,
             permission_digest.clone(),
@@ -1328,6 +1534,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             &effective_policy,
             &permission_digest,
             &registered.descriptor,
+            argument_resolution.as_ref(),
         ) {
             Ok(identity) => identity,
             Err(error) => return rejected("invalid_invocation", error.message),
@@ -1338,6 +1545,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             permission,
             permission_digest,
             approval_binding,
+            argument_resolution,
         };
         let effect_key = ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
         let entry = match self.invocation_entry(&invocation, identity) {
@@ -1410,7 +1618,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 self.execute(
                     registered,
                     GuardedToolExecution {
-                        invocation,
+                        invocation: resolved_invocation,
                         operation,
                         effective_policy,
                         lease,
@@ -1466,9 +1674,11 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             permission,
             permission_digest,
             approval_binding,
+            argument_resolution,
         } = planned;
         let prepared = PreparedToolEffect {
             invocation: invocation.clone(),
+            argument_resolution: argument_resolution.clone().map(Box::new),
             args_digest: invocation
                 .args_digest()
                 .map_err(|error| rejected("invalid_invocation", error.message))?,
@@ -1965,6 +2175,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let outcome = normalize_post_dispatch_outcome(&registered.descriptor, outcome);
         normalize_completed_outcome(
             &registered.descriptor,
+            registered.executor.as_ref(),
             &effective_policy,
             &output_invocation,
             self.artifact_store.as_ref(),
@@ -1980,6 +2191,24 @@ impl<S> AgentToolRuntime for GuardedToolRuntime<S>
 where
     S: ApprovalCapabilityStore + 'static,
 {
+    fn project_model_output(
+        &self,
+        invocation: &ToolInvocation,
+        output: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolRuntimeError> {
+        GuardedToolRuntime::project_model_output(self, invocation, output)
+    }
+
+    async fn freeze_model_observations(
+        &self,
+        run_id: &RunId,
+        observations: &ModelToolObservations,
+        pending_calls: &[ToolCallId],
+    ) -> Result<FrozenToolObservations, ToolOutcome> {
+        GuardedToolRuntime::freeze_model_observations(self, run_id, observations, pending_calls)
+            .await
+    }
+
     fn execution_contract_digest(&self) -> Result<Digest, ToolRuntimeError> {
         GuardedToolRuntime::execution_contract_digest(self)
     }
@@ -2043,6 +2272,27 @@ where
         )
         .await
     }
+
+    async fn invoke_with_observations(
+        &self,
+        invocation: ToolInvocation,
+        run_grant: RunToolGrant,
+        approval: Option<ApprovalCapability>,
+        run_cancellation: CancellationToken,
+        yield_requested: CancellationToken,
+        observations: &FrozenToolObservations,
+    ) -> GuardedToolResult {
+        GuardedToolRuntime::invoke_with_observations(
+            self,
+            invocation,
+            run_grant,
+            approval,
+            run_cancellation,
+            yield_requested,
+            observations,
+        )
+        .await
+    }
 }
 
 fn invocation_identity(
@@ -2051,6 +2301,7 @@ fn invocation_identity(
     effective_policy: &EffectiveToolPolicy,
     permission_digest: &Digest,
     descriptor: &ToolDescriptor,
+    argument_resolution: Option<&ToolArgumentResolution>,
 ) -> Result<InvocationIdentity, ToolProtocolError> {
     Ok(InvocationIdentity {
         tool_id: invocation.tool_id.clone(),
@@ -2059,6 +2310,18 @@ fn invocation_identity(
         permission_digest: permission_digest.clone(),
         policy_digest: effective_policy.digest()?,
         descriptor_digest: descriptor.digest()?,
+        argument_resolution_digest: argument_resolution
+            .map(|resolution| {
+                serde_jcs::to_vec(resolution)
+                    .map(Digest::sha256)
+                    .map_err(|error| {
+                        ToolProtocolError::new(
+                            ToolProtocolErrorCode::InvalidInvocation,
+                            error.to_string(),
+                        )
+                    })
+            })
+            .transpose()?,
     })
 }
 
@@ -2155,6 +2418,7 @@ fn map_execution_result(result: Result<ToolOutcome, Box<dyn std::any::Any + Send
 
 async fn normalize_completed_outcome(
     descriptor: &ToolDescriptor,
+    executor: &dyn GuardedToolExecutor,
     effective_policy: &EffectiveToolPolicy,
     invocation: &ToolInvocation,
     artifact_store: Option<&ToolArtifactStore>,
@@ -2189,16 +2453,37 @@ async fn normalize_completed_outcome(
             }
         }
     };
-    let Some(inline_max_bytes) = effective_policy.bounds().max_output_bytes else {
-        return ToolOutcome::Completed {
-            output: ToolOutput::Inline(output),
-        };
+    let policy_max = effective_policy.bounds().max_output_bytes;
+    let model_max = artifact_store.and_then(ToolArtifactStore::inline_output_limit);
+    let model_fits = match model_max {
+        Some(maximum) => {
+            match serde_jcs::to_vec(&executor.project_model_output(invocation, &output)) {
+                Ok(bytes) => bytes.len() as u64 <= maximum,
+                Err(error) => {
+                    return ToolOutcome::Failed {
+                        code: "model_output_serialization_failed".to_owned(),
+                        message: error.to_string(),
+                        retryable: false,
+                    }
+                }
+            }
+        }
+        None => true,
     };
-    if bytes.len() as u64 <= inline_max_bytes {
+    if model_fits && policy_max.is_none_or(|maximum| bytes.len() as u64 <= maximum) {
         return ToolOutcome::Completed {
             output: ToolOutput::Inline(output),
         };
     }
+    let inline_max_bytes = match (policy_max, model_max) {
+        (Some(policy), Some(model)) => Some(policy.min(model)),
+        (policy, model) => policy.or(model),
+    };
+    let Some(inline_max_bytes) = inline_max_bytes else {
+        return ToolOutcome::Completed {
+            output: ToolOutput::Inline(output),
+        };
+    };
     let Some(artifact_store) = artifact_store else {
         return ToolOutcome::Failed {
             code: "output_limit_exceeded".to_owned(),
@@ -2213,7 +2498,7 @@ async fn normalize_completed_outcome(
         artifact_store.summary_max_chars,
     );
     match artifact_store
-        .spill(invocation, bytes, summary, cancellation)
+        .spill(invocation, bytes, summary, inline_max_bytes, cancellation)
         .await
     {
         Ok(artifact) => ToolOutcome::Completed {

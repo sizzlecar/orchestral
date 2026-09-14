@@ -268,12 +268,7 @@ pub(super) fn observed_tool_exchange_messages(
     result: &serde_json::Value,
     is_error: bool,
 ) -> (ModelMessage, ModelMessage) {
-    let mut assistant_content = Vec::new();
-    if !observation.response.is_empty() {
-        assistant_content.push(ModelContent::Text {
-            text: observation.response.clone(),
-        });
-    }
+    let mut assistant_content = observation.assistant_content();
     assistant_content.push(ModelContent::ToolCall {
         call_id: call.call_id.clone(),
         name: call.name.clone(),
@@ -297,6 +292,8 @@ pub(super) fn observed_tool_exchange_messages(
 }
 
 pub(super) fn recovered_approval_exchange_messages(
+    inner: &GenericInner,
+    run_id: &RunId,
     observation: &GenericModelObservation,
     call: &GenericObservedToolCall,
     arguments: &serde_json::Value,
@@ -336,7 +333,7 @@ pub(super) fn recovered_approval_exchange_messages(
     if matches!(outcome, ToolOutcome::UnknownEffect { .. }) {
         return Ok(None);
     }
-    let (result, is_error) = model_tool_result(outcome);
+    let (result, is_error) = recovered_model_tool_result(inner, run_id, call, arguments, outcome)?;
     Ok(Some(observed_tool_exchange_messages(
         observation,
         call,

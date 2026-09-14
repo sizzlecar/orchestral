@@ -79,6 +79,16 @@ pub enum ModelTokenAccounting {
     Exact,
     /// The adapter deliberately over-counts the provider wire representation.
     ConservativeUpperBound,
+    /// A context-planning estimate, never a hard token or cost reservation.
+    Estimated,
+}
+
+/// Planning information kept separate from the meter's hard input bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContextEstimate {
+    pub tokens: u64,
+    pub accounting: ModelTokenAccounting,
 }
 
 /// Immutable identity of the token accounting strategy used to build model
@@ -98,6 +108,7 @@ impl ModelTokenMeterDescriptor {
         if self.strategy.trim().is_empty()
             || self.version.trim().is_empty()
             || !self.config_digest.is_sha256()
+            || self.accounting == ModelTokenAccounting::Estimated
         {
             return Err(ModelError::invalid_request(
                 "invalid model token meter descriptor",
@@ -113,11 +124,36 @@ impl ModelTokenMeterDescriptor {
 pub trait ModelTokenMeter: Send + Sync {
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor;
 
+    /// Whether differences between this meter's soft estimates may be added
+    /// to observed input usage for an unchanged request prefix. This remains
+    /// estimated accounting, never a hard bound. Opting in must change the
+    /// meter descriptor's immutable identity; unknown meters retain full-input
+    /// estimation. The runtime separately verifies the prefix and Run scope.
+    fn supports_observed_prefix_estimation(&self) -> bool {
+        false
+    }
+
     fn count_request_input(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelToolDefinition],
     ) -> Result<u64, ModelError>;
+
+    /// Estimate space for context selection when no hard input/cost ceiling
+    /// applies. The default retains the existing certified count. Adapters
+    /// overriding this method must bind its algorithm into their descriptor's
+    /// immutable identity. Estimates must not replace `count_request_input`
+    /// for resource reservations or validation of observed usage.
+    fn estimate_context_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<ModelContextEstimate, ModelError> {
+        Ok(ModelContextEstimate {
+            tokens: self.count_request_input(messages, tools)?,
+            accounting: self.meter_descriptor().accounting,
+        })
+    }
 }
 
 impl ModelDescriptor {
@@ -215,8 +251,16 @@ impl ModelMessage {
                 "model message content must not be empty",
             ));
         }
+        let mut continuations = BTreeSet::new();
         for content in &self.content {
             content.validate()?;
+            if let ModelContent::Continuation { namespace, .. } = content {
+                if self.role != ModelRole::Assistant || !continuations.insert(namespace) {
+                    return Err(ModelError::invalid_request(
+                        "continuation requires the Assistant role and a unique namespace",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -234,6 +278,14 @@ pub enum ModelContent {
     },
     Data {
         media_type: String,
+        value: Value,
+    },
+    /// Opaque provider-owned state belonging to this entire Assistant message,
+    /// including all its parallel Tool calls. Retained in canonical history for
+    /// native continuation; never rendered as public text or a summary and never
+    /// passed to a Tool. A provider that cannot consume it must reject it.
+    Continuation {
+        namespace: String,
         value: Value,
     },
     ToolCall {
@@ -260,6 +312,9 @@ impl ModelContent {
             }
             Self::Data { media_type, .. } if media_type.trim().is_empty() => Err(
                 ModelError::invalid_request("model data requires a media type"),
+            ),
+            Self::Continuation { namespace, .. } if namespace.trim().is_empty() => Err(
+                ModelError::invalid_request("model continuation requires a namespace"),
             ),
             Self::ToolCall {
                 call_id,
@@ -340,6 +395,13 @@ pub enum ModelEvent {
     TextDelta {
         delta: String,
     },
+    /// Complete opaque state for the current Assistant message, once per
+    /// namespace. The consumer commits it only with a terminal Finish event.
+    /// This is not an output delta or a Tool argument fragment.
+    Continuation {
+        namespace: String,
+        value: Value,
+    },
     ToolCallStart {
         call_id: ModelToolCallId,
         name: String,
@@ -368,6 +430,9 @@ impl ModelEvent {
             Self::TextDelta { delta } if delta.is_empty() => {
                 Err(ModelError::protocol("text delta must not be empty"))
             }
+            Self::Continuation { namespace, .. } if namespace.trim().is_empty() => Err(
+                ModelError::protocol("model continuation requires a namespace"),
+            ),
             Self::ToolCallStart {
                 call_id,
                 name,
@@ -421,6 +486,9 @@ pub enum ModelFinishReason {
 #[non_exhaustive]
 pub enum ModelErrorCode {
     InvalidRequest,
+    /// The backend rejected the input/output context reservation before
+    /// generation. Retrying identical input cannot recover this error.
+    ContextLengthExceeded,
     Unsupported,
     Unavailable,
     RateLimited,
@@ -514,6 +582,32 @@ fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<(), Model
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_is_message_owned_and_never_valid_as_user_or_tool_content() {
+        let state = ModelContent::Continuation {
+            namespace: "provider/native/v1".to_owned(),
+            value: serde_json::json!({"opaque": " Ω\n"}),
+        };
+        let mut message = ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![state.clone()],
+        };
+        message.validate().unwrap();
+        let restored: ModelMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        assert_eq!(restored, message);
+        for role in [ModelRole::System, ModelRole::User, ModelRole::Tool] {
+            message.role = role;
+            assert!(message.validate().is_err());
+        }
+        message.role = ModelRole::Assistant;
+        message.content.push(state);
+        assert!(
+            message.validate().is_err(),
+            "one state per namespace, not one per parallel call"
+        );
+    }
 
     #[test]
     fn request_requires_unique_tools_and_namespaced_extensions() {

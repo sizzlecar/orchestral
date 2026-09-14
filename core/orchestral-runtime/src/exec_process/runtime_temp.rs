@@ -122,6 +122,7 @@ impl Drop for RuntimeTempDirectory {
 }
 
 fn private_directory(path: &Path) -> std::io::Result<()> {
+    #[allow(unused_mut)] // Unix adds a private creation mode.
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

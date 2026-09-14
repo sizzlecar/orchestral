@@ -222,10 +222,10 @@ fn expand_user_path(path: PathBuf) -> PathBuf {
 fn well_known_adc_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return env::var_os("APPDATA")
+        env::var_os("APPDATA")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .map(|root| root.join("gcloud/application_default_credentials.json"));
+            .map(|root| root.join("gcloud/application_default_credentials.json"))
     }
     #[cfg(not(target_os = "windows"))]
     {

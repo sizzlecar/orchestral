@@ -1,3 +1,5 @@
+use super::context_recovery::{commit_context_recovery, context_recovery_for_run};
+use super::model_retry::ModelStartFailure;
 use super::*;
 
 pub(super) struct ModelRunExecution {
@@ -65,6 +67,20 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         .config
         .continuation
         .effective_tool_calls(request.run.spec.limits.max_tool_calls);
+    let mut observed_prefix = match observed_prefix_for_run(&inner, &request) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            emit_failure(&inner, &request, &user_message, session_failure(error));
+            return;
+        }
+    };
+    let mut context_recovery = match context_recovery_for_run(&inner, &request) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            emit_failure(&inner, &request, &user_message, session_failure(error));
+            return;
+        }
+    };
     'model_rounds: for round in
         std::iter::successors(Some(next_model_round), |round| round.checked_add(1))
     {
@@ -130,7 +146,20 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             None,
             ModelContextBudget {
                 remaining_input_tokens: remaining_input,
-                reserved_output_tokens: Some(inner.config.reserved_output_tokens),
+                input_capacity_tokens: context_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.input_budget_tokens),
+                input_compaction_target_tokens: context_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.compaction_target_tokens()),
+                reserved_output_tokens: Some(
+                    if inner.config.minimum_output_reserve_tokens.is_some() {
+                        output_reserve
+                    } else {
+                        inner.config.reserved_output_tokens
+                    },
+                ),
+                observed_prefix: observed_prefix.as_ref(),
             },
         )
         .await
@@ -155,6 +184,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 return;
             }
         };
+        let output_reserve = context_output_cap(&inner, &model_context, output_reserve);
         let dispatch_budget = match model_dispatch_budget(
             &inner.config,
             &request,
@@ -234,7 +264,31 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             ) => result,
         } {
             Ok(stream) => stream,
-            Err(error) => {
+            Err(ModelStartFailure::ContextRejected(error)) => {
+                if cancellation.is_cancelled() {
+                    emit_cancel(&inner, &request, &user_message);
+                    return;
+                }
+                match commit_context_recovery(
+                    &inner,
+                    &request,
+                    round,
+                    &model_request,
+                    &context_trace,
+                    context_recovery.as_ref(),
+                    error,
+                ) {
+                    Ok(recovery) => {
+                        context_recovery = Some(recovery);
+                        continue 'model_rounds;
+                    }
+                    Err(error) => {
+                        emit_failure(&inner, &request, &user_message, error);
+                        return;
+                    }
+                }
+            }
+            Err(ModelStartFailure::Failure(error)) => {
                 if cancellation.is_cancelled() {
                     emit_cancel(&inner, &request, &user_message);
                 } else {
@@ -248,6 +302,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         let mut expected_sequence = started.expected_sequence;
         has_usage |= total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
         let mut response = String::new();
+        let mut continuation = BTreeMap::new();
         let mut round_usage = started.usage;
         let mut tool_calls = Vec::<PendingModelToolCall>::new();
         loop {
@@ -338,6 +393,17 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         },
                     );
                 }
+                ModelEvent::Continuation { namespace, value } => {
+                    if continuation.insert(namespace, value).is_some() {
+                        emit_failure(
+                            &inner,
+                            &request,
+                            &user_message,
+                            model_event_failure("duplicate model continuation namespace"),
+                        );
+                        return;
+                    }
+                }
                 ModelEvent::ToolCallStart {
                     call_id,
                     name,
@@ -393,26 +459,38 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 ModelEvent::Usage { usage: observed } => round_usage = Some(observed),
                 ModelEvent::Finish { reason } => {
                     let committed_usage = round_usage.take();
+                    let observation = GenericModelObservation {
+                        finish_reason: reason.clone(),
+                        response: response.clone(),
+                        continuation: continuation.clone(),
+                        usage: committed_usage.clone(),
+                        tool_calls: tool_calls
+                            .iter()
+                            .map(|call| GenericObservedToolCall {
+                                call_id: call.call_id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                                extensions: call.extensions.clone(),
+                                ended: call.ended,
+                            })
+                            .collect(),
+                    };
+                    let assistant_message = ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: observation.assistant_content(),
+                    };
+                    let next_observed_prefix = context_trace.observed_prefix(
+                        &run_id,
+                        &model_request.request_id,
+                        &observation,
+                        dispatch_budget.max_output_tokens,
+                    );
                     if let Err(failure) = commit_model_observation(
                         &inner,
                         &run_id,
                         round,
                         &model_request.request_id,
-                        GenericModelObservation {
-                            finish_reason: reason.clone(),
-                            response: response.clone(),
-                            usage: committed_usage.clone(),
-                            tool_calls: tool_calls
-                                .iter()
-                                .map(|call| GenericObservedToolCall {
-                                    call_id: call.call_id.clone(),
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
-                                    extensions: call.extensions.clone(),
-                                    ended: call.ended,
-                                })
-                                .collect(),
-                        },
+                        observation,
                     ) {
                         emit_failure(&inner, &request, &user_message, failure);
                         return;
@@ -431,6 +509,10 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         merge_usage(&mut total_usage, observed);
                         has_usage = true;
                     }
+                    observed_prefix = next_observed_prefix;
+                    if let Some(recovery) = &mut context_recovery {
+                        recovery.generation_observed();
+                    }
                     match reason {
                         ModelFinishReason::Stop
                             if tool_calls.is_empty() && !response.is_empty() =>
@@ -446,10 +528,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                                     run_id: run_id.clone(),
                                     payload: AgentSessionEvent::RunOutputCommitted {
                                         request_id: model_request.request_id.clone(),
-                                        message: ModelMessage::text(
-                                            ModelRole::Assistant,
-                                            response.clone(),
-                                        ),
+                                        message: assistant_message.clone(),
                                         usage: committed_usage,
                                     },
                                 },
@@ -491,8 +570,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                                         return;
                                     }
                                     last_response = response.clone();
-                                    model_messages
-                                        .push(ModelMessage::text(ModelRole::Assistant, response));
+                                    model_messages.push(assistant_message);
                                     if let Err(failure) =
                                         commit_queued_steers(&inner, &request, &mut model_messages)
                                             .await
@@ -600,12 +678,9 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         );
                         return;
                     }
-                    let mut assistant_content = Vec::new();
+                    let mut assistant_content = assistant_message.content;
                     if !response.is_empty() {
                         last_response = response.clone();
-                        assistant_content.push(ModelContent::Text {
-                            text: response.clone(),
-                        });
                     }
                     let mut parsed_calls = Vec::with_capacity(tool_calls.len());
                     for call in tool_calls {
@@ -637,6 +712,9 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         run_skills: run_skills.clone(),
                         round,
                         model_request_id: model_request.request_id.clone(),
+                        observations: crate::tool_runtime::ModelToolObservations::from_messages(
+                            &model_request.messages,
+                        ),
                         parsed_calls,
                         cancellation: cancellation.clone(),
                         yield_requested: yield_requested.clone(),

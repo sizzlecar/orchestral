@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestral</title>
+  <desc id="desc">A runtime for reliable, interactive AI agents.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#363b48" stroke-width="1"/></pattern>
+    <pattern id="scan" width="4" height="6" patternUnits="userSpaceOnUse"><path d="M0 0h4" stroke="#f5f0cf" stroke-opacity=".025"/></pattern>
+  </defs>
+  <path fill="#20242d" d="M0 0h1280v360H0z"/><path fill="url(#grid)" d="M0 0h1280v360H0z"/>
+  <path fill="#090b0e" d="M44 44h1208v292H44z"/>
+  <path fill="#1d2027" stroke="#555b6b" stroke-width="4" d="M32 32h1208v292H32z"/>
+  <path fill="url(#scan)" d="M34 34h1204v288H34z"/>
+  <g font-family="'DejaVu Sans Mono',Menlo,Consolas,monospace">
+    <text x="68" y="78" fill="#63dbea" font-size="16" letter-spacing="2">OPEN SOURCE // BUILT IN RUST</text>
+    <path fill="#090b0e" d="M74 112h98v98H74z"/>
+    <path fill="#83ff6b" stroke="#090b0e" stroke-width="4" d="M66 104h96v96H66z"/>
+    <g transform="translate(66 104)" fill="#15171d"><path d="M10 64h21v8H10z"/><path d="m43 24-6 6 22 18-22 18 6 6 29-24z"/><circle cx="83" cy="68" r="4"/></g>
+    <text x="205" y="184" fill="#090b0e" font-size="76" font-weight="700" letter-spacing="-3">ORCHESTRAL</text>
+    <text x="199" y="178" fill="#f5f0cf" font-size="76" font-weight="700" letter-spacing="-3">ORCHESTRAL</text>
+    <text x="68" y="246" fill="#b0b4c0" font-size="21">A runtime for reliable, interactive AI agents.</text>
+    <path stroke="#555b6b" stroke-width="2" d="M68 270h1136"/>
+    <text x="68" y="300" fill="#83ff6b" font-size="15">TERMINAL / SESSIONS / TOOLS</text>
+    <text x="1204" y="300" fill="#a3a8b5" text-anchor="end" font-size="15">orch.pandaailabs.com</text>
+  </g>
+</svg>
