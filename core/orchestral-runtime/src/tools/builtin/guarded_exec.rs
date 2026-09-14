@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use orchestral_core::agent_protocol::wire::ToolActivityEvidence;
+use orchestral_core::config::ShellPipelineExitStatus;
 use orchestral_core::tool_protocol::{
     ApprovalPolicy, CapabilityRequest, CapabilitySelector, EffectScope, ModelToolSchema,
     ToolConcurrency, ToolDescriptor, ToolId, ToolIdempotency, ToolInvocation, ToolOperationPlan,
@@ -69,6 +70,7 @@ impl CommandEnvironmentSnapshot {
 pub struct GuardedExecCommandExecutor {
     manager: Arc<ProcessSupervisor>,
     shell: PathBuf,
+    pipeline_exit_status: ShellPipelineExitStatus,
     runtime_readable_roots: Vec<PathBuf>,
     runtime_readable_files: Vec<PathBuf>,
     environment: CommandEnvironmentSnapshot,
@@ -109,6 +111,7 @@ impl GuardedExecCommandExecutor {
         Ok(Self {
             manager,
             shell,
+            pipeline_exit_status: ShellPipelineExitStatus::default(),
             runtime_readable_roots: roots.into_iter().collect(),
             runtime_readable_files: files.into_iter().collect(),
             environment,
@@ -121,6 +124,29 @@ impl GuardedExecCommandExecutor {
     pub fn with_sandboxed_execution_enabled(mut self, enabled: bool) -> Self {
         self.sandboxed_execution_enabled = enabled;
         self
+    }
+
+    /// Select pipeline status behavior without changing the configured shell.
+    /// Auto (the default) enables pipefail for Bash/Zsh only. Requiring pipefail
+    /// on another shell fails during Host composition, before any command runs.
+    pub fn with_pipeline_exit_status(
+        mut self,
+        policy: ShellPipelineExitStatus,
+    ) -> Result<Self, String> {
+        if policy == ShellPipelineExitStatus::Pipefail && !shell_supports_pipefail(&self.shell) {
+            return Err(format!(
+                "pipeline_exit_status=pipefail requires Bash or Zsh; configured shell is {}. Select Bash/Zsh or use auto/native",
+                self.shell.display()
+            ));
+        }
+        self.pipeline_exit_status = policy;
+        Ok(self)
+    }
+
+    /// Whether the executor explicitly enables pipefail. Native shell startup
+    /// options are preserved when this is false.
+    pub fn enables_pipefail(&self) -> bool {
+        pipeline_uses_pipefail(&self.shell, self.pipeline_exit_status)
     }
 
     fn requested_host_execution(&self, arguments: &Value) -> Result<bool, ToolOutcome> {
@@ -171,9 +197,11 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
 
     fn planning_contract(&self) -> Value {
         json!({
-            "contract": "orchestral.exec-command-operation-planner/v6",
+            "contract": "orchestral.exec-command-operation-planner/v7",
             "sandboxed_execution_enabled": self.sandboxed_execution_enabled,
             "shell": self.shell,
+            "pipeline_exit_status": self.pipeline_exit_status,
+            "enables_pipefail": self.enables_pipefail(),
             "runtime_readable_roots": self.runtime_readable_roots,
             "runtime_readable_files": self.runtime_readable_files,
             "environment_names": self.environment.names(),
@@ -567,7 +595,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             if host_execution {
                 (
                     shell_identity,
-                    shell_arguments(&self.shell, cmd),
+                    shell_arguments(&self.shell, cmd, self.pipeline_exit_status),
                     BTreeMap::new(),
                     false,
                     "host-approved".to_owned(),
@@ -590,7 +618,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
                 sandbox_reads.dedup();
                 let sandboxed = match sandbox_command(
                     shell_identity,
-                    shell_arguments(&self.shell, cmd),
+                    shell_arguments(&self.shell, cmd, self.pipeline_exit_status),
                     &cwd,
                     &ShellSandboxPolicy {
                         readable_roots: sandbox_reads,
@@ -1471,13 +1499,40 @@ fn resolve_host_workdir(
     Ok(cwd)
 }
 
+fn shell_supports_pipefail(shell: &Path) -> bool {
+    matches!(
+        shell.file_stem().and_then(|name| name.to_str()),
+        Some("bash" | "zsh")
+    )
+}
+
+fn pipeline_uses_pipefail(shell: &Path, policy: ShellPipelineExitStatus) -> bool {
+    match policy {
+        ShellPipelineExitStatus::Auto => shell_supports_pipefail(shell),
+        ShellPipelineExitStatus::Pipefail => true,
+        ShellPipelineExitStatus::Native => false,
+    }
+}
+
+fn posix_shell_arguments(shell: &Path, cmd: &str, policy: ShellPipelineExitStatus) -> Vec<String> {
+    // Initialize after shell startup files, without enabling errexit or parsing
+    // the user's command. Explicit recovery and subsequent commands retain their
+    // normal shell semantics. Unsupported shells receive the command unchanged.
+    let command = if pipeline_uses_pipefail(shell, policy) {
+        format!("set -o pipefail\n{cmd}")
+    } else {
+        cmd.to_owned()
+    };
+    vec!["-c".to_owned(), command]
+}
+
 #[cfg(unix)]
-fn shell_arguments(_shell: &Path, cmd: &str) -> Vec<String> {
-    vec!["-c".to_owned(), cmd.to_owned()]
+fn shell_arguments(shell: &Path, cmd: &str, policy: ShellPipelineExitStatus) -> Vec<String> {
+    posix_shell_arguments(shell, cmd, policy)
 }
 
 #[cfg(windows)]
-fn shell_arguments(shell: &Path, cmd: &str) -> Vec<String> {
+fn shell_arguments(shell: &Path, cmd: &str, policy: ShellPipelineExitStatus) -> Vec<String> {
     match shell
         .file_stem()
         .and_then(|name| name.to_str())
@@ -1497,7 +1552,7 @@ fn shell_arguments(shell: &Path, cmd: &str) -> Vec<String> {
             "/C".to_owned(),
             cmd.to_owned(),
         ],
-        _ => vec!["-c".to_owned(), cmd.to_owned()],
+        _ => posix_shell_arguments(shell, cmd, policy),
     }
 }
 
@@ -1674,6 +1729,136 @@ mod tests {
     };
     use orchestral_core::tool_protocol::{ApprovalPolicy, ToolPolicyBounds, ToolRestriction};
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_status_preserves_upstream_failures_and_explicit_recovery() {
+        use super::{shell_arguments, ShellPipelineExitStatus};
+        use std::path::Path;
+
+        // Bash is the portable fixture; also exercise Zsh when installed.
+        let shells = [Path::new("/bin/bash"), Path::new("/bin/zsh")];
+        assert!(
+            shells[0].is_file(),
+            "Bash is required for this shell fixture"
+        );
+        for shell in shells.into_iter().filter(|shell| shell.is_file()) {
+            for (cmd, expected) in [
+                ("(printf 'kept\\n'; exit 17) | cat", 17),
+                ("(exit 17) | (exit 23) | cat", 23),
+                ("printf 'kept\\n' | cat", 0),
+                ("(exit 17) | cat || printf recovered", 0),
+                ("(exit 17) | cat; printf continued", 0),
+            ] {
+                for policy in [
+                    ShellPipelineExitStatus::Auto,
+                    ShellPipelineExitStatus::Pipefail,
+                ] {
+                    let output = std::process::Command::new(shell)
+                        .args(shell_arguments(shell, cmd, policy))
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(expected),
+                        "{shell:?} {cmd}: {output:?}"
+                    );
+                }
+            }
+            let output = std::process::Command::new(shell)
+                .args(shell_arguments(
+                    shell,
+                    "(printf 'kept\\n'; exit 17) | cat",
+                    ShellPipelineExitStatus::Native,
+                ))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(0), "{shell:?}: {output:?}");
+            assert_eq!(output.stdout, b"kept\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipeline_policy_is_part_of_planning_identity_and_rejects_unsupported_shells() {
+        use super::{
+            CommandEnvironmentSnapshot, GuardedExecCommandExecutor, ShellPipelineExitStatus,
+        };
+        use crate::{GuardedToolExecutor, ProcessSupervisor};
+        use std::sync::Arc;
+
+        let executor = GuardedExecCommandExecutor::new(
+            Arc::new(ProcessSupervisor::new(1024).unwrap()),
+            "/bin/bash",
+            [],
+            [],
+            CommandEnvironmentSnapshot::default(),
+        )
+        .unwrap();
+        assert!(executor.enables_pipefail());
+        let original_contract = executor.planning_contract();
+        assert_eq!(original_contract["pipeline_exit_status"], "auto");
+        let native = executor
+            .clone()
+            .with_pipeline_exit_status(ShellPipelineExitStatus::Native)
+            .unwrap();
+        assert!(!native.enables_pipefail());
+        assert_ne!(native.planning_contract(), original_contract);
+
+        // An arbitrary Host executable must not be probed or executed at composition.
+        let unsupported = GuardedExecCommandExecutor::new(
+            Arc::new(ProcessSupervisor::new(1024).unwrap()),
+            std::env::current_exe().unwrap(),
+            [],
+            [],
+            CommandEnvironmentSnapshot::default(),
+        )
+        .unwrap();
+        assert!(!unsupported.enables_pipefail());
+        assert!(unsupported
+            .with_pipeline_exit_status(ShellPipelineExitStatus::Pipefail)
+            .is_err());
+    }
+
+    #[test]
+    fn auto_preserves_other_shells_without_injecting_unsupported_options() {
+        use super::{posix_shell_arguments, ShellPipelineExitStatus};
+        use std::path::Path;
+
+        for shell in ["/bin/sh", "/bin/dash", "/usr/bin/fish"] {
+            let command = "printf ready | cat";
+            assert_eq!(
+                posix_shell_arguments(Path::new(shell), command, ShellPipelineExitStatus::Auto),
+                vec!["-c", command],
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auto_preserves_powershell_and_cmd_invocation() {
+        use super::{shell_arguments, ShellPipelineExitStatus};
+        use std::path::Path;
+
+        for shell in ["powershell.exe", "pwsh.exe", "cmd.exe"] {
+            assert_eq!(
+                shell_arguments(
+                    Path::new(shell),
+                    "echo ready",
+                    ShellPipelineExitStatus::Auto
+                ),
+                shell_arguments(
+                    Path::new(shell),
+                    "echo ready",
+                    ShellPipelineExitStatus::Native
+                ),
+            );
+        }
+    }
 
     #[test]
     fn command_wait_keeps_explicit_windows_and_interactions_within_host_limits() {

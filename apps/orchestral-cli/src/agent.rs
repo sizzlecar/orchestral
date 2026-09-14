@@ -1026,29 +1026,31 @@ fn build_cli_tool_runtime(
         let restriction = ToolRestriction {
             bounds: exec_bounds.clone(),
         };
-        let descriptor = if config.tools.exec.sandboxed_execution_enabled {
+        let mut descriptor = if config.tools.exec.sandboxed_execution_enabled {
             workspace_exec_command_descriptor(restriction)
         } else {
             approved_host_exec_command_descriptor(restriction)
         };
+        let executor = GuardedExecCommandExecutor::new(
+            process_supervisor.clone(),
+            exec_host.shell,
+            exec_host.runtime_readable_roots,
+            exec_host.runtime_readable_files,
+            exec_host.environment,
+        )
+        .and_then(|executor| {
+            executor.with_pipeline_exit_status(config.tools.exec.pipeline_exit_status)
+        })
+        .map_err(anyhow::Error::msg)
+        .context("configure guarded exec_command Tool")?
+        .with_sandboxed_execution_enabled(config.tools.exec.sandboxed_execution_enabled);
+        descriptor.model_schema.description.push_str(if executor.enables_pipefail() {
+            " Pipefail is enabled: a pipeline returns its rightmost nonzero status, including SIGPIPE from an early-exiting consumer."
+        } else {
+            " Pipeline exit status uses native shell behavior; a successful last stage may hide an earlier failure."
+        });
         runtime
-            .register(
-                descriptor,
-                Arc::new(
-                    GuardedExecCommandExecutor::new(
-                        process_supervisor.clone(),
-                        exec_host.shell,
-                        exec_host.runtime_readable_roots,
-                        exec_host.runtime_readable_files,
-                        exec_host.environment,
-                    )
-                    .map_err(anyhow::Error::msg)
-                    .context("configure guarded exec_command Tool")?
-                    .with_sandboxed_execution_enabled(
-                        config.tools.exec.sandboxed_execution_enabled,
-                    ),
-                ),
-            )
+            .register(descriptor, Arc::new(executor))
             .context("register guarded exec_command Tool")?;
         runtime
             .register(

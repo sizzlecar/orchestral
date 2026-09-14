@@ -239,6 +239,17 @@ the Host. Model-visible arguments cannot expand any of these permissions.
 Native Windows commands run with the current user's OS permissions after exact Host approval;
 they have process supervision and output/time limits, but no filesystem or network isolation.
 
+`tools.exec.pipeline_exit_status` defaults to `auto`: Bash and Zsh commands enable `pipefail`,
+so a pipeline returns the rightmost nonzero stage status even if its final output filter succeeds.
+Other shells, including POSIX `sh`/dash, fish, PowerShell, and cmd, retain native behavior.
+Select `pipefail` to require Bash/Zsh (unsupported shells fail configuration), or `native` to
+preserve the shell's original options. The CLI tool description reports the effective behavior;
+SDK Hosts can set the same policy with `GuardedExecCommandExecutor::with_pipeline_exit_status`.
+This does not enable `errexit`: explicit recovery (`|| true`), later successful commands, or a
+nested shell can still mask failures. Consumers that stop reading early can cause producer
+SIGPIPE and a nonzero pipeline status. Prefer the tool's output limit when shortening validation
+output, and check the validation command's own status when intentionally handling these cases.
+
 Command temporary files live outside the workspace in a private Host-managed directory.
 `TMPDIR`, `TMP`, and `TEMP` point to one Run-specific child: commands in the same Run share it,
 and the sandbox cannot access another Run's child. The directory stays alive while processes

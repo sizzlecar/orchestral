@@ -241,6 +241,10 @@ pub struct ExecToolConfig {
     pub enabled: bool,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Pipeline status behavior; `auto` enables pipefail for Bash/Zsh and
+    /// preserves native behavior for other shells.
+    #[serde(default)]
+    pub pipeline_exit_status: ShellPipelineExitStatus,
     /// Allows an invocation to request exact user approval for execution
     /// outside the default OS sandbox. This is a hard Host ceiling and is
     /// disabled by default in the library configuration.
@@ -264,11 +268,25 @@ impl Default for ExecToolConfig {
         Self {
             enabled: false,
             shell: None,
+            pipeline_exit_status: ShellPipelineExitStatus::default(),
             allow_host_execution: false,
             sandboxed_execution_enabled: default_sandboxed_execution(),
             network_targets: Vec::new(),
         }
     }
+}
+
+/// How the command executor initializes the configured shell's pipeline status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPipelineExitStatus {
+    /// Enable pipefail for supported Bash/Zsh shells; leave other shells native.
+    #[default]
+    Auto,
+    /// Require Bash/Zsh and report the rightmost nonzero pipeline exit status.
+    Pipefail,
+    /// Preserve the configured shell's native options and pipeline exit status.
+    Native,
 }
 
 fn default_sandboxed_execution() -> bool {

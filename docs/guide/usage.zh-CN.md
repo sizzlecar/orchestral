@@ -204,6 +204,15 @@ MCP 调用都继续经过 Host policy 与 Effect Journal。
 原生 Windows 命令在逐次审批后以当前用户的系统权限运行；具备进程管理和时间/输出限制，
 但没有文件系统或网络隔离。
 
+`tools.exec.pipeline_exit_status` 默认是 `auto`：Bash 与 Zsh 启用 `pipefail`，即使最后的
+输出过滤器成功，管道仍返回最右侧非零退出状态。其他 shell（包括 POSIX `sh`/dash、fish、
+PowerShell 和 cmd）保留原生行为。设为 `pipefail` 会要求 Bash/Zsh，不支持的 shell 在配置
+阶段报错；`native` 保留 shell 原有选项。CLI 的 Tool 描述会注明实际行为，SDK Host 可通过
+`GuardedExecCommandExecutor::with_pipeline_exit_status` 设置相同策略。这不会启用 `errexit`：
+显式恢复（`|| true`）、后续成功命令或嵌套 shell 仍可能掩盖失败。消费者提前停止读取也可能
+使生产者收到 SIGPIPE，导致管道非零退出。缩短验证输出时优先使用 Tool 的输出上限；若需
+主动处理上述情况，应保留并检查验证命令自身的退出状态。
+
 命令的临时文件位于仓库外、由 Host 管理的私有目录。`TMPDIR`、`TMP`、`TEMP` 指向当前
 Run 的专用子目录，同一 Run 内可共享，沙箱不能访问其他 Run 的子目录。进程使用期间
 目录持续保留，Run 结束后回收。CLI 在重启后保持 Host 根目录身份稳定，不会静默复用

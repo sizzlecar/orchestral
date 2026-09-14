@@ -29,7 +29,17 @@ fn compose(
     GuardedToolRuntime<InMemoryApprovalCapabilityStore>,
     ToolPolicyBounds,
 ) {
-    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    compose_with_shell(workspace, "/bin/sh")
+}
+
+fn compose_with_shell(
+    workspace: &Path,
+    shell: &str,
+) -> (
+    GuardedToolRuntime<InMemoryApprovalCapabilityStore>,
+    ToolPolicyBounds,
+) {
+    let shell = std::fs::canonicalize(shell).unwrap();
     let manager = Arc::new(ProcessSupervisor::new(4096).unwrap());
     let roots = BTreeSet::from([
         workspace.to_string_lossy().into_owned(),
@@ -98,6 +108,61 @@ fn compose(
     .with_sandboxed_execution_enabled(false);
     runtime.register(descriptor, Arc::new(executor)).unwrap();
     (runtime, bounds)
+}
+
+#[tokio::test]
+async fn approved_pipeline_preserves_upstream_failure_and_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let (runtime, bounds) = compose_with_shell(&workspace, "/bin/bash");
+    let invocation = ToolInvocation {
+        run_id: RunId::new("pipeline-status"),
+        call_id: ToolCallId::new("failing-producer"),
+        tool_id: ToolId::new("orchestral/exec_command/v2"),
+        arguments: json!({
+            "cmd": "(printf 'retained output\\n'; printf 'producer failed\\n' >&2; exit 17) | /bin/cat",
+            "sandbox_permissions": "require_escalated",
+            "justification": "Exercise a failing producer in the isolated test workspace",
+            "yield_time_ms": 1000,
+        }),
+    };
+    let pending = runtime
+        .invoke(
+            invocation.clone(),
+            RunToolGrant {
+                bounds: bounds.clone(),
+            },
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::ApprovalRequired { binding, .. } = pending else {
+        panic!("{pending:?}")
+    };
+    let approval = HostApprovalIssuer::new(KEY)
+        .unwrap()
+        .issue(binding, i64::MAX)
+        .unwrap();
+    let result = runtime
+        .invoke(
+            invocation,
+            RunToolGrant { bounds },
+            Some(approval),
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::Outcome {
+        outcome: ToolOutcome::Completed {
+            output: ToolOutput::Inline(output),
+        },
+        ..
+    } = result
+    else {
+        panic!("{result:?}")
+    };
+    assert_eq!(output["exit_code"], 17, "{output}");
+    assert!(output.to_string().contains("retained output"), "{output}");
+    assert!(output.to_string().contains("producer failed"), "{output}");
 }
 
 #[tokio::test]

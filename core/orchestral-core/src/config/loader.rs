@@ -322,6 +322,31 @@ agent:
     }
 
     #[test]
+    fn exec_pipeline_status_has_a_typed_compatible_default_and_explicit_overrides() {
+        use crate::config::{ExecToolConfig, ShellPipelineExitStatus};
+
+        let default: ExecToolConfig =
+            serde_yaml::from_str("enabled: true\nshell: /bin/sh").unwrap();
+        assert_eq!(default.pipeline_exit_status, ShellPipelineExitStatus::Auto);
+        assert_eq!(
+            ExecToolConfig::default().pipeline_exit_status,
+            ShellPipelineExitStatus::Auto
+        );
+        for (value, expected) in [
+            ("auto", ShellPipelineExitStatus::Auto),
+            ("pipefail", ShellPipelineExitStatus::Pipefail),
+            ("native", ShellPipelineExitStatus::Native),
+        ] {
+            let config: ExecToolConfig =
+                serde_yaml::from_str(&format!("pipeline_exit_status: {value}")).unwrap();
+            assert_eq!(config.pipeline_exit_status, expected);
+        }
+        assert!(
+            serde_yaml::from_str::<ExecToolConfig>("pipeline_exit_status: ignore_errors").is_err()
+        );
+    }
+
+    #[test]
     fn exec_network_targets_are_exact_host_and_port_pairs() {
         let mut config = OrchestralConfig::default();
         config.tools.exec.network_targets = vec![
