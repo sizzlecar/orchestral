@@ -8,6 +8,32 @@ pub(super) struct ModelContextBudget<'a> {
     pub(super) observed_prefix: Option<&'a ObservedPrefixAnchor>,
 }
 
+pub(super) fn backend_context_limit(inner: &GenericInner) -> u64 {
+    inner
+        .backend
+        .descriptor()
+        .capabilities
+        .max_context_tokens
+        .unwrap_or(inner.config.max_context_tokens)
+        .min(inner.config.max_context_tokens)
+}
+
+pub(super) fn context_output_cap(
+    inner: &GenericInner,
+    projection: &SessionContextProjection,
+    preferred: u64,
+) -> u64 {
+    if inner.config.minimum_output_reserve_tokens.is_none() {
+        return preferred;
+    }
+    let planned_input = projection
+        .context_estimate
+        .as_ref()
+        .map(|estimate| estimate.tokens)
+        .unwrap_or(projection.used_input_tokens);
+    preferred.min(backend_context_limit(inner).saturating_sub(planned_input))
+}
+
 pub(super) async fn project_model_context(
     inner: &GenericInner,
     request: &AgentStartRequest,
@@ -40,26 +66,14 @@ pub(super) async fn project_model_context(
                 .await?;
         }
     }
-    let backend_context_limit = inner
-        .backend
-        .descriptor()
-        .capabilities
-        .max_context_tokens
-        .unwrap_or(inner.config.max_context_tokens)
-        .min(inner.config.max_context_tokens);
-    let reserved_output_tokens = budget
+    let backend_context_limit = backend_context_limit(inner);
+    let mut reserved_output_tokens = budget
         .reserved_output_tokens
         .unwrap_or(inner.config.reserved_output_tokens)
         .min(inner.config.reserved_output_tokens);
-    let max_context_tokens = budget
+    let input_limit = budget
         .remaining_input_tokens
-        .or(request.run.spec.limits.max_input_tokens)
-        .map(|limit| {
-            limit
-                .saturating_add(reserved_output_tokens)
-                .min(backend_context_limit)
-        })
-        .unwrap_or(backend_context_limit);
+        .or(request.run.spec.limits.max_input_tokens);
     let system_message = system_message_for_run(&inner.config, run_skills);
     let allowed_skill_digests: std::collections::BTreeMap<_, _> = run_skills
         .map(|skills| {
@@ -71,14 +85,20 @@ pub(super) async fn project_model_context(
                 .collect()
         })
         .unwrap_or_default();
-    let make_request = || SessionContextRequest {
+    let make_request = |reserved_output_tokens| SessionContextRequest {
         session_id: request.run.spec.session_id.clone(),
         current_run_id: request.run.spec.run_id.clone(),
         through_session_seq,
         system_message: system_message.clone(),
         tools: model_definitions.to_vec(),
         history_limit: inner.config.history_limit,
-        max_context_tokens,
+        max_context_tokens: input_limit
+            .map(|limit| {
+                limit
+                    .saturating_add(reserved_output_tokens)
+                    .min(backend_context_limit)
+            })
+            .unwrap_or(backend_context_limit),
         reserved_output_tokens,
         config_digest: inner.config_digest.clone(),
         allowed_skill_digests: allowed_skill_digests.clone(),
@@ -90,6 +110,7 @@ pub(super) async fn project_model_context(
     );
 
     let mut previous_overflow = None;
+    let mut tried_smaller_reserve = false;
     loop {
         let policy = if request.run.spec.limits.max_input_tokens.is_some()
             || request.run.spec.limits.max_cost.is_some()
@@ -99,7 +120,7 @@ pub(super) async fn project_model_context(
             crate::session_context::ContextTokenPolicy::Planning
         };
         match context_engine
-            .project_with_policy(make_request(), policy)
+            .project_with_policy(make_request(reserved_output_tokens), policy)
             .await
         {
             Ok(mut projection) => {
@@ -112,11 +133,41 @@ pub(super) async fn project_model_context(
                 }
                 return Ok(projection);
             }
-            Err(SessionContextError::ContextOverflow { used, budget })
-                if through_session_seq.is_none() && inner.session_compactor.is_some() =>
-            {
+            Err(SessionContextError::ContextOverflow {
+                used,
+                budget: input_budget,
+            }) if through_session_seq.is_none() => {
+                // Keep the current raw exchanges before changing their prefix
+                // with a summary. This is a soft capacity decision under the
+                // Planning policy, never a replacement for hard Run limits.
+                if !tried_smaller_reserve {
+                    tried_smaller_reserve = true;
+                    if let Some(minimum) = inner.config.minimum_output_reserve_tokens {
+                        let minimum = minimum.min(reserved_output_tokens);
+                        let available = backend_context_limit.saturating_sub(used);
+                        if available >= minimum
+                            && available < reserved_output_tokens
+                            && input_limit.is_none_or(|limit| used <= limit)
+                        {
+                            // The new input budget is exactly the already
+                            // measured candidate: do not use the extra room
+                            // to pull more old history into this request.
+                            reserved_output_tokens = available;
+                            continue;
+                        }
+                    }
+                }
+                let Some(compactor) = &inner.session_compactor else {
+                    return Err(SessionContextError::ContextOverflow {
+                        used,
+                        budget: input_budget,
+                    });
+                };
                 if previous_overflow.is_some_and(|previous| used >= previous) {
-                    return Err(SessionContextError::ContextOverflow { used, budget });
+                    return Err(SessionContextError::ContextOverflow {
+                        used,
+                        budget: input_budget,
+                    });
                 }
                 previous_overflow = Some(used);
                 publish_telemetry(
@@ -131,20 +182,24 @@ pub(super) async fn project_model_context(
                         provider_seq: None,
                         payload: AgentTelemetry::ProgressReported {
                             message: format!(
-                                "Compacting context ({used} tokens exceed the {budget}-token input budget)"
+                                "Compacting context ({used} tokens exceed the {input_budget}-token input budget)"
                             ),
                             fraction: None,
                         },
                     },
                 );
-                let compacted = inner
-                    .session_compactor
-                    .as_ref()
-                    .expect("compactor presence was checked")
-                    .compact_active_run_for_context(&context_engine, make_request(), policy)
+                let compacted = compactor
+                    .compact_active_run_for_context(
+                        &context_engine,
+                        make_request(reserved_output_tokens),
+                        policy,
+                    )
                     .await?;
                 if compacted.is_none() {
-                    return Err(SessionContextError::ContextOverflow { used, budget });
+                    return Err(SessionContextError::ContextOverflow {
+                        used,
+                        budget: input_budget,
+                    });
                 }
                 let compacted_seq = compacted
                     .as_ref()

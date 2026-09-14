@@ -132,7 +132,11 @@ pub(super) fn model_dispatch_budget(
     }
 
     let mut output_cap = output_reserve_tokens;
-    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some();
+    // Elastic context planning must set the wire cap explicitly. Otherwise
+    // the backend's configured default could consume the room just reclaimed
+    // from the preferred output reservation.
+    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some()
+        || config.minimum_output_reserve_tokens.is_some();
     if let Some(ceiling) = &request.run.spec.limits.max_cost {
         let policy = config
             .model_cost_policy

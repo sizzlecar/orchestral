@@ -137,7 +137,13 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             None,
             ModelContextBudget {
                 remaining_input_tokens: remaining_input,
-                reserved_output_tokens: Some(inner.config.reserved_output_tokens),
+                reserved_output_tokens: Some(
+                    if inner.config.minimum_output_reserve_tokens.is_some() {
+                        output_reserve
+                    } else {
+                        inner.config.reserved_output_tokens
+                    },
+                ),
                 observed_prefix: observed_prefix.as_ref(),
             },
         )
@@ -163,6 +169,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 return;
             }
         };
+        let output_reserve = context_output_cap(&inner, &model_context, output_reserve);
         let dispatch_budget = match model_dispatch_budget(
             &inner.config,
             &request,

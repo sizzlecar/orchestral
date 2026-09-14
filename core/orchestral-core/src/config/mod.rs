@@ -118,6 +118,10 @@ pub struct AgentConfig {
     pub max_context_tokens: u64,
     #[serde(default = "default_reserved_output_tokens")]
     pub reserved_output_tokens: u64,
+    /// Minimum response room before compacting active context. When omitted,
+    /// retain the full reserved_output_tokens budget on every turn.
+    #[serde(default)]
+    pub minimum_output_reserve_tokens: Option<u64>,
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
 }
@@ -139,6 +143,7 @@ impl Default for AgentConfig {
             history_limit: default_history_limit(),
             max_context_tokens: default_max_context_tokens(),
             reserved_output_tokens: default_reserved_output_tokens(),
+            minimum_output_reserve_tokens: None,
             compaction: AgentCompactionConfig::default(),
         }
     }

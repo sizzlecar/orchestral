@@ -319,6 +319,7 @@ async fn build_agent_host_with_journals(
     agent_config.history_limit = config.agent.history_limit;
     agent_config.max_context_tokens = config.agent.max_context_tokens;
     agent_config.reserved_output_tokens = config.agent.reserved_output_tokens;
+    agent_config.minimum_output_reserve_tokens = config.agent.minimum_output_reserve_tokens;
     if let Some(system_prompt) = options
         .system_prompt
         .clone()

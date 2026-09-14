@@ -107,7 +107,14 @@ pub(super) async fn replay_started_context(
         Some(trace.through_session_seq),
         ModelContextBudget {
             remaining_input_tokens: Some(trace.input_budget_tokens),
-            reserved_output_tokens: None,
+            // An elastic turn may have kept a larger input budget than the
+            // configured preferred reserve permits. Reproduce that recorded
+            // budget rather than making a new planning/compaction decision.
+            reserved_output_tokens: Some(
+                backend_context_limit(inner)
+                    .saturating_sub(trace.input_budget_tokens)
+                    .min(inner.config.reserved_output_tokens),
+            ),
             observed_prefix: trace
                 .planning
                 .as_ref()

@@ -11,6 +11,8 @@ mod context_planning_tests {
 
     struct PlanningModel {
         starts: AtomicU64,
+        requests: Mutex<Vec<ModelRequest>>,
+        max_context_tokens: u64,
     }
 
     #[async_trait]
@@ -20,7 +22,7 @@ mod context_planning_tests {
                 backend_id: "planning-test".to_owned(),
                 capabilities: ModelCapabilities {
                     streaming: true,
-                    max_context_tokens: Some(1_024),
+                    max_context_tokens: Some(self.max_context_tokens),
                     ..ModelCapabilities::default()
                 },
                 extensions: Default::default(),
@@ -29,17 +31,20 @@ mod context_planning_tests {
 
         async fn start(
             &self,
-            _request: ModelRequest,
+            request: ModelRequest,
             _cancellation: CancellationToken,
         ) -> Result<ModelStream, ModelError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request);
             Err(ModelError::protocol(
                 "context preflight must not start a model",
             ))
         }
     }
 
-    struct PlanningMeter;
+    struct PlanningMeter {
+        estimate: u64,
+    }
 
     impl ModelTokenMeter for PlanningMeter {
         fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
@@ -47,7 +52,10 @@ mod context_planning_tests {
                 strategy: "planning-boundary-test".to_owned(),
                 version: "1".to_owned(),
                 accounting: ModelTokenAccounting::ConservativeUpperBound,
-                config_digest: Digest::sha256("planning-boundary-test/v1;bound=900;estimate=150"),
+                config_digest: Digest::sha256(format!(
+                    "planning-boundary-test/v1;bound=900;estimate={}",
+                    self.estimate
+                )),
             }
         }
 
@@ -65,7 +73,7 @@ mod context_planning_tests {
             _tools: &[ModelToolDefinition],
         ) -> Result<ModelContextEstimate, ModelError> {
             Ok(ModelContextEstimate {
-                tokens: 150,
+                tokens: self.estimate,
                 accounting: ModelTokenAccounting::Estimated,
             })
         }
@@ -76,19 +84,33 @@ mod context_planning_tests {
         Arc<InMemoryAgentSessionJournalStore>,
         Arc<PlanningModel>,
     ) {
+        fixture_with_budget(150, None)
+    }
+
+    fn fixture_with_budget(
+        estimate: u64,
+        minimum_output_reserve_tokens: Option<u64>,
+    ) -> (
+        InternalGenericAgentProvider,
+        Arc<InMemoryAgentSessionJournalStore>,
+        Arc<PlanningModel>,
+    ) {
         let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
         let backend = Arc::new(PlanningModel {
             starts: AtomicU64::new(0),
+            requests: Mutex::new(Vec::new()),
+            max_context_tokens: 1_024,
         });
         let mut config = GenericAgentConfig::new("test/provider", "test/agent");
         config.max_context_tokens = 1_024;
         config.reserved_output_tokens = 524;
+        config.minimum_output_reserve_tokens = minimum_output_reserve_tokens;
         config.model_cost_policy = Some(ModelCostPolicy::new("USD", 1_000_000, 1_000_000).unwrap());
         let provider = InternalGenericAgentProvider::new_with_session_journal(
             backend.clone(),
             config,
             journal.clone(),
-            Arc::new(PlanningMeter),
+            Arc::new(PlanningMeter { estimate }),
         )
         .unwrap();
         (provider, journal, backend)
@@ -126,6 +148,46 @@ mod context_planning_tests {
             ModelContextBudget::default(),
         )
         .await
+    }
+
+    async fn append_observation(
+        journal: &InMemoryAgentSessionJournalStore,
+        request: &AgentStartRequest,
+        result: serde_json::Value,
+    ) -> ModelMessage {
+        let call_id = ModelToolCallId::new("observation-call");
+        let tool = ModelMessage {
+            role: ModelRole::Tool,
+            content: vec![ModelContent::ToolResult {
+                call_id: call_id.clone(),
+                result,
+                is_error: false,
+            }],
+        };
+        journal
+            .append(AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new("observation"),
+                session_id: request.run.spec.session_id.clone(),
+                run_id: request.run.spec.run_id.clone(),
+                payload: AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: ModelRequestId::new("observation-request"),
+                    assistant: ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![ModelContent::ToolCall {
+                            call_id,
+                            name: "file_read".to_owned(),
+                            arguments: serde_json::json!({"path": "src/lib.rs"}),
+                            extensions: Default::default(),
+                        }],
+                    },
+                    tool: tool.clone(),
+                    retained_artifacts: Vec::new(),
+                    usage: None,
+                },
+            })
+            .await
+            .unwrap();
+        tool
     }
 
     #[tokio::test]
@@ -205,6 +267,286 @@ mod context_planning_tests {
             ));
             assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn elastic_output_preserves_context_and_replays_the_recorded_dispatch_cap() {
+        let (provider, journal, backend) = fixture_with_budget(600, Some(256));
+        let request = request(&provider, RunLimits::default());
+        // The mock fails after recording the actual ModelBackend request.
+        // This exercises dispatch and its durable Started boundary without
+        // calling a provider or executing a Tool.
+        let mut started = provider.start(request.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let item = started
+                    .stream
+                    .next()
+                    .await
+                    .expect("the provider emits its terminal failure")
+                    .expect("the protocol stream remains valid");
+                if matches!(item, AgentProviderStreamItem::Event(draft)
+                    if matches!(draft.payload, AgentEvent::RunFailed { .. }))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the mock failure reaches a terminal boundary");
+        let sent = backend.requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].max_output_tokens, Some(424));
+        let before = journal
+            .load_session(&request.run.spec.session_id)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(matches!(
+            before[0].payload,
+            AgentSessionEvent::RunInputCommitted { .. }
+        ));
+
+        let replayed = replay_started_context(&provider.inner, &request, &[], None, 1)
+            .await
+            .unwrap();
+        assert_eq!(replayed, sent[0].messages);
+        assert_eq!(
+            before,
+            journal
+                .load_session(&request.run.spec.session_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn elastic_output_respects_the_minimum_and_keeps_legacy_reservation() {
+        for minimum in [None, Some(425)] {
+            let (provider, _, backend) = fixture_with_budget(600, minimum);
+            let request = request(&provider, RunLimits::default());
+            assert!(matches!(
+                initial_projection(&provider, &request).await,
+                Err(SessionContextError::ContextOverflow {
+                    used: 600,
+                    budget: 500
+                })
+            ));
+            assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+        }
+        let (provider, _, _) = fixture_with_budget(600, Some(424));
+        let request = request(&provider, RunLimits::default());
+        let projection = initial_projection(&provider, &request).await.unwrap();
+        assert_eq!(projection.input_budget_tokens, 600);
+        // Soft context planning does not replace the hard accounting bound.
+        assert_eq!(projection.used_input_tokens, 900);
+    }
+
+    #[tokio::test]
+    async fn elastic_output_keeps_the_original_tool_observation_without_compaction() {
+        let (provider, journal, _) = fixture_with_budget(600, Some(256));
+        let provider = provider
+            .with_session_compaction(
+                Arc::new(crate::DeterministicExtractiveSessionSummarizer::new(512).unwrap()),
+                SessionCompactionPolicy {
+                    minimum_source_records: 1,
+                    keep_recent_records: 1,
+                },
+            )
+            .unwrap();
+        let request = request(&provider, RunLimits::default());
+        initial_projection(&provider, &request).await.unwrap();
+        let observation = append_observation(
+            &journal,
+            &request,
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "content": "pub fn measured_value() -> u64 { 42 }\n",
+                "truncated": false,
+                "content_digest": "host-owned-read-evidence",
+            }),
+        )
+        .await;
+        let before = journal
+            .load_session(&request.run.spec.session_id)
+            .await
+            .unwrap();
+        let projection = project_model_context(
+            &provider.inner,
+            &request,
+            &[],
+            None,
+            None,
+            None,
+            ModelContextBudget::default(),
+        )
+        .await
+        .unwrap();
+        assert!(projection.messages.contains(&observation));
+        assert_eq!(context_output_cap(&provider.inner, &projection, 524), 424);
+        assert_eq!(
+            before,
+            journal
+                .load_session(&request.run.spec.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(!before.iter().any(|record| matches!(
+            record.payload,
+            AgentSessionEvent::ActiveRunCompactionCommitted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn elastic_output_below_minimum_still_compacts_the_active_run() {
+        let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+        let backend = Arc::new(PlanningModel {
+            starts: AtomicU64::new(0),
+            requests: Mutex::new(Vec::new()),
+            max_context_tokens: 8_192,
+        });
+        let mut config = GenericAgentConfig::new("test/provider", "test/agent");
+        config.system_prompt =
+            "Review the requested change using the supplied evidence.".to_owned();
+        config.max_context_tokens = 8_192;
+        config.reserved_output_tokens = 4_096;
+        config.minimum_output_reserve_tokens = Some(2_048);
+        let provider = InternalGenericAgentProvider::new_with_session_journal(
+            backend.clone(),
+            config,
+            journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .unwrap()
+        .with_session_compaction(
+            Arc::new(crate::DeterministicExtractiveSessionSummarizer::new(512).unwrap()),
+            SessionCompactionPolicy {
+                minimum_source_records: 1,
+                keep_recent_records: 1,
+            },
+        )
+        .unwrap();
+        let request = request(&provider, RunLimits::default());
+        initial_projection(&provider, &request).await.unwrap();
+        let observation = append_observation(&journal, &request,
+            serde_json::json!({"path": "src/lib.rs", "content": "source evidence\n".repeat(1_024), "truncated": false}),
+        ).await;
+        let before = journal
+            .load_session(&request.run.spec.session_id)
+            .await
+            .unwrap();
+        assert!(
+            JsonSizeTokenMeter::default()
+                .count_request_input(&[observation], &[])
+                .unwrap()
+                > 6_144
+        );
+        let projection = project_model_context(
+            &provider.inner,
+            &request,
+            &[],
+            None,
+            None,
+            None,
+            ModelContextBudget::default(),
+        )
+        .await
+        .unwrap();
+        let after = journal
+            .load_session(&request.run.spec.session_id)
+            .await
+            .unwrap();
+        assert_eq!(&after[..before.len()], before.as_slice());
+        assert!(after.iter().any(|record| matches!(
+            record.payload,
+            AgentSessionEvent::ActiveRunCompactionCommitted { .. }
+        )));
+        assert!(projection
+            .messages
+            .contains(&ModelMessage::text(ModelRole::User, "review the change")));
+        assert!(projection.used_input_tokens <= projection.input_budget_tokens);
+        assert_eq!(
+            context_output_cap(&provider.inner, &projection, 4_096),
+            4_096
+        );
+        assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn elastic_output_cannot_spend_a_hard_input_or_cost_budget_as_context_room() {
+        let (provider, _, _) = fixture_with_budget(600, Some(100));
+        let limited = request(
+            &provider,
+            RunLimits {
+                max_input_tokens: Some(700),
+                ..RunLimits::default()
+            },
+        );
+        assert!(matches!(
+            initial_projection(&provider, &limited).await,
+            Err(SessionContextError::ContextOverflow {
+                used: 900,
+                budget: 500
+            })
+        ));
+        let cost_limited = request(
+            &provider,
+            RunLimits {
+                max_cost: Some(MoneyAmount {
+                    currency: "USD".to_owned(),
+                    microunits: 950,
+                }),
+                ..RunLimits::default()
+            },
+        );
+        let dispatch = model_dispatch_budget(
+            &provider.inner.config,
+            &cost_limited,
+            &ModelUsage::default(),
+            900,
+            124,
+        )
+        .unwrap();
+        assert_eq!(dispatch.max_output_tokens, Some(50));
+
+        let output_limited = request(
+            &provider,
+            RunLimits {
+                max_output_tokens: Some(30),
+                ..RunLimits::default()
+            },
+        );
+        let reserve = output_reserve_tokens(
+            &provider.inner.config,
+            &output_limited,
+            &ModelUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(reserve, 30);
+        let dispatch = model_dispatch_budget(
+            &provider.inner.config,
+            &output_limited,
+            &ModelUsage::default(),
+            900,
+            reserve,
+        )
+        .unwrap();
+        assert_eq!(dispatch.max_output_tokens, Some(30));
+    }
+
+    #[test]
+    fn elastic_output_policy_changes_recovery_identity_only_when_enabled() {
+        let (legacy, _, _) = fixture_with_budget(150, None);
+        let (same_legacy, _, _) = fixture_with_budget(150, None);
+        let (elastic, _, _) = fixture_with_budget(150, Some(256));
+        let (other_minimum, _, _) = fixture_with_budget(150, Some(257));
+        assert_eq!(legacy.inner.config_digest, same_legacy.inner.config_digest);
+        assert_ne!(legacy.inner.config_digest, elastic.inner.config_digest);
+        assert_ne!(
+            elastic.inner.config_digest,
+            other_minimum.inner.config_digest
+        );
     }
 
     #[tokio::test]

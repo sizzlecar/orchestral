@@ -179,6 +179,10 @@ pub struct GenericAgentConfig {
     pub history_limit: usize,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
+    /// Optional minimum response room before active context is compacted.
+    /// The preferred response budget remains reserved_output_tokens. None
+    /// preserves the fixed-reservation behavior.
+    pub minimum_output_reserve_tokens: Option<u64>,
     pub model_cost_policy: Option<ModelCostPolicy>,
 }
 
@@ -270,6 +274,7 @@ impl GenericAgentConfig {
             history_limit: 128,
             max_context_tokens: 128 * 1024,
             reserved_output_tokens: 4 * 1024,
+            minimum_output_reserve_tokens: None,
             model_cost_policy: None,
         }
     }

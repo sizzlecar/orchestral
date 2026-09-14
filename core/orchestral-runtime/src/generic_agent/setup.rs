@@ -243,7 +243,7 @@ pub(super) fn generic_config_digest(
                 .map(|workflow| workflow.recovery_contract()),
         })
     });
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "provider_id": config.provider_id,
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
@@ -271,6 +271,13 @@ pub(super) fn generic_config_digest(
         "input_requests_enabled": input_requests_enabled,
         "steer_enabled": true,
     });
+    // Preserve the identity of existing fixed-reservation configurations.
+    if let Some(minimum) = config.minimum_output_reserve_tokens {
+        value["context_output_budget"] = serde_json::json!({
+            "contract": "preserve-active-context/v1",
+            "minimum_output_reserve_tokens": minimum,
+        });
+    }
     let bytes = serde_jcs::to_vec(&value).map_err(|error| {
         AgentProtocolError::new(
             AgentProtocolErrorCode::InvalidSpec,
