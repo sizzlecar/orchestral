@@ -175,7 +175,7 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
         tool_id: ToolId::new("orchestral/file_search/v1"),
         model_schema: ModelToolSchema {
             name: "file_search".to_owned(),
-            description: "Find paths inside a Host-approved workspace with a glob. Respects .gitignore, includes hidden source files, skips dependency/build noise, never follows symlinks, and reports partial results explicitly."
+            description: "Find workspace paths by glob. Respects .gitignore, includes hidden source files, skips build/dependency noise and never follows symlinks. Partial results are explicit."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -183,11 +183,11 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob matched against both workspace-relative path and basename, for example `**/*.rs` or `Cargo.toml`."
+                        "description": "Glob against workspace-relative paths or basenames, e.g. `**/*.rs`."
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory relative to the selected workspace. Defaults to `.`."
+                        "description": "Workspace-relative directory (default '.')."
                     },
                     "workspace": {
                         "type": "string",
@@ -195,17 +195,17 @@ pub fn guarded_file_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "case_sensitive": {
                         "type": "boolean",
-                        "description": "Whether glob matching is case-sensitive. Defaults to true."
+                        "description": "Case-sensitive glob matching (default true)."
                     },
                     "include_directories": {
                         "type": "boolean",
-                        "description": "Also return matching directories. Defaults to false."
+                        "description": "Include matching directories (default false)."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_FILE_SEARCH_LIMIT,
-                        "description": "Maximum returned paths. Defaults to 100."
+                        "description": "Maximum paths (default 100)."
                     }
                 },
                 "additionalProperties": false
@@ -349,7 +349,7 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
         tool_id: ToolId::new("orchestral/text_search/v1"),
         model_schema: ModelToolSchema {
             name: "text_search".to_owned(),
-            description: "Search UTF-8 files inside a Host-approved workspace with ripgrep's streaming Rust matcher using a regular expression or literal. Results are resource-bounded, gitignore-aware, and explicitly complete or partial."
+            description: "Search workspace UTF-8 files using a Rust regex or literal. Respects .gitignore; bounded results explicitly report complete or partial output."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -357,19 +357,19 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Ripgrep-compatible Rust regular expression, or exact text when literal is true."
+                        "description": "Rust regex, or exact text when literal=true."
                     },
                     "literal": {
                         "type": "boolean",
-                        "description": "Escape pattern as literal text. Defaults to false."
+                        "description": "Treat pattern literally (default false)."
                     },
                     "case_sensitive": {
                         "type": "boolean",
-                        "description": "Whether matching is case-sensitive. Defaults to true."
+                        "description": "Case-sensitive matching (default true)."
                     },
                     "path": {
                         "type": "string",
-                        "description": "File or directory relative to the selected workspace. Defaults to `.`."
+                        "description": "Workspace-relative file/directory (default '.')."
                     },
                     "workspace": {
                         "type": "string",
@@ -377,19 +377,19 @@ pub fn guarded_text_search_descriptor(restriction: ToolRestriction) -> ToolDescr
                     },
                     "include": {
                         "type": "string",
-                        "description": "Optional file glob, for example `**/*.rs`."
+                        "description": "File glob, e.g. `**/*.rs`."
                     },
                     "context": {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": MAX_CONTEXT_LINES,
-                        "description": "Context lines before and after each match. Defaults to 0."
+                        "description": "Context lines before/after each match (default 0)."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_TEXT_SEARCH_LIMIT,
-                        "description": "Maximum matching lines. Defaults to 50."
+                        "description": "Maximum matching lines (default 50)."
                     }
                 },
                 "additionalProperties": false

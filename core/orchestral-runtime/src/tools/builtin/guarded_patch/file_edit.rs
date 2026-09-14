@@ -420,12 +420,12 @@ pub fn guarded_file_edit_descriptor(restriction: ToolRestriction) -> ToolDescrip
         model_schema: ModelToolSchema {
             name: "file_edit".to_owned(),
             description: concat!(
-                "Replace exactly one occurrence of old_text in an existing UTF-8 file. ",
-                "Use the smallest unique text region needed for the edit; add unchanged context ",
-                "only to disambiguate. Copy old_text exactly, including indentation and line endings. ",
-                "No patch markers. Empty new_text deletes ",
-                "the matched text. Paths are normalized and relative to the selected Host workspace."
-            ).to_owned(),
+                "Replace one unique occurrence of old_text in a UTF-8 file. Copy it exactly, ",
+                "including whitespace and line endings; include only enough unchanged context ",
+                "to disambiguate. Empty new_text deletes it. No patch markers. ",
+                "Use normalized workspace-relative paths."
+            )
+            .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "old_text", "new_text"],

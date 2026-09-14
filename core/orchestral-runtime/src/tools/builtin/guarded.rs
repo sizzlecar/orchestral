@@ -434,7 +434,7 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
         tool_id: ToolId::new("orchestral/file_read/v3"),
         model_schema: ModelToolSchema {
             name: "file_read".to_owned(),
-            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. Read known paths directly without a preliminary path search. Continue with next_offset when eof is false; truncation reasons are always explicit."
+            description: "Read a UTF-8 file by 1-indexed lines. Read known paths directly. If more content is needed and eof is false, continue at next_offset. Check explicit truncation reasons."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -442,7 +442,7 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path relative to the selected workspace; absolute paths and parent traversal are rejected."
+                        "description": "Workspace-relative path; no absolute paths or parent traversal."
                     },
                     "workspace": {
                         "type": "string",
@@ -451,13 +451,13 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
                     "offset": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-indexed first line. Defaults to 1."
+                        "description": "Starting line (1-indexed, default 1)."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_FILE_READ_LINES,
-                        "description": "Maximum lines to return. Defaults to 400."
+                        "description": "Line limit (default 400)."
                     }
                 },
                 "additionalProperties": false

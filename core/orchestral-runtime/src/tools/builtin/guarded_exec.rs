@@ -937,16 +937,12 @@ fn build_exec_command_descriptor(
             } else {
                 ""
             }, concat!(
-                "Short commands ",
-                "return directly; interactive or still-running commands return a session_id ",
-                "for write_stdin. Default wait_mode: completion for non-TTY (up to 60 seconds), ",
-                "output for TTY (up to 10 seconds). yield_time_ms overrides this observation ",
-                "window within Host limits. ",
-                "A wait deadline does not kill the command. ",
-                "Captured output is bounded by a shared stdout/stderr budget. Each available stream ",
-                "keeps its beginning and end where the budget permits. Preserve a validation ",
-                "command's own exit status; do not pipe it through tail or another filter merely ",
-                "to shorten output."
+                "Non-TTY defaults to completion (up to 60s); TTY defaults to output (up to 10s). ",
+                "yield_time_ms changes the observation window, not process lifetime. ",
+                "Running commands return session_id for write_stdin. Output shares a stdout/stderr ",
+                "budget and retains each stream's beginning/end where space permits. ",
+                "Preserve validation commands' own exit status; do not pipe through tail or filters ",
+                "just to shorten output."
             )),
             input_schema,
         },
@@ -979,13 +975,12 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
         model_schema: ModelToolSchema {
             name: "write_stdin".to_owned(),
             description: concat!(
-                "Send characters to a running exec session, or omit chars to poll for new output. ",
+                "Send input to an exec session, or omit chars to poll. Polls return only new output. ",
                 "If the process exits before input can be delivered, the call returns its final ",
-                "output and exit status instead of failing. Default wait_mode: completion with ",
-                "a 30-second wait for empty non-TTY polls, output for TTY or input writes. ",
-                "yield_time_ms controls the observation ",
-                "window, not the process lifetime. Long captured output shares a stdout/stderr budget and keeps ",
-                "each available stream's beginning and end where it fits. Polling returns new output only."
+                "output and exit status instead of failing. Wait defaults: empty non-TTY polls use ",
+                "completion (30s); TTY/input uses output. yield_time_ms changes the observation window, ",
+                "not process lifetime. Output shares a stdout/stderr budget and retains each stream's ",
+                "beginning/end where space permits."
             )
             .to_owned(),
             input_schema: json!({
@@ -1494,7 +1489,7 @@ fn wait_mode_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["output", "completion"],
-        "description": "output yields after a short output pause; completion aggregates output until exit or the wait deadline. Host input can yield either without terminating the process."
+        "description": "output yields after an output pause; completion waits for exit/deadline. Host input can yield either; neither terminates the process."
     })
 }
 

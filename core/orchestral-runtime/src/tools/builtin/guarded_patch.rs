@@ -792,11 +792,10 @@ pub fn guarded_apply_patch_descriptor(restriction: ToolRestriction) -> ToolDescr
         model_schema: ModelToolSchema {
             name: "apply_patch".to_owned(),
             description: concat!(
-                "Apply a structured patch to UTF-8 text files in the Host-approved workspace. ",
-                "The patch must use `*** Begin Patch` / `*** End Patch` and one or more ",
-                "exact directives: `*** Add File: path`, `*** Update File: path` with `@@` ",
-                "hunks, or `*** Delete File: path`; each path directive requires the colon. ",
-                "Paths must be normalized paths relative to the selected workspace."
+                "Patch UTF-8 files using `*** Begin Patch` / `*** End Patch`, with one or more ",
+                "directives: `*** Add File: path`, `*** Update File: path` with `@@` hunks, ",
+                "or `*** Delete File: path`. Directive colons are required. ",
+                "Use normalized workspace-relative paths."
             )
             .to_owned(),
             input_schema: json!({
@@ -829,13 +828,11 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
         model_schema: ModelToolSchema {
             name: "file_write".to_owned(),
             description: concat!(
-                "Create a new UTF-8 text file or intentionally replace a complete existing file ",
-                "inside a Host-approved workspace. Use mode='create' only when the path must ",
-                "not exist. Use mode='replace' only after reading the complete file from offset 1 ",
-                "through eof without truncation. The Host uses the latest complete read shown ",
-                "in this model request as the default version precondition; an explicit ",
-                "expected_digest overrides it and must match. Use file_edit or apply_patch ",
-                "for targeted edits to existing files. Parent directories must already exist."
+                "Write a UTF-8 file. Use mode='create' only if absent. Use mode='replace' for a ",
+                "complete rewrite only after reading from line 1 through eof without truncation. ",
+                "For replace, the latest complete file_read visible in this request supplies the ",
+                "version precondition; expected_digest overrides it and must match. ",
+                "Prefer file_edit/apply_patch for targeted edits. Parent directories must exist."
             )
             .to_owned(),
             input_schema: json!({
@@ -844,7 +841,7 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Normalized path relative to the selected workspace."
+                        "description": "Normalized workspace-relative path."
                     },
                     "workspace": {
                         "type": "string",
@@ -860,7 +857,7 @@ pub fn guarded_file_write_descriptor(restriction: ToolRestriction) -> ToolDescri
                     },
                     "expected_digest": {
                         "type": "string",
-                        "description": "Optional for replace: exact complete-file digest. If omitted, use the latest complete file_read visible in this model request. Never used for create."
+                        "description": "Replace only: digest to match. If omitted, use the latest complete file_read visible in this request."
                     }
                 },
                 "additionalProperties": false
