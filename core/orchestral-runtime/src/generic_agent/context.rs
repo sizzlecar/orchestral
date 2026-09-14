@@ -7,6 +7,9 @@ pub(super) struct ModelContextBudget<'a> {
     /// A smaller per-request capacity after a backend rejection, distinct
     /// from cumulative Run token/cost limits.
     pub(super) input_capacity_tokens: Option<u64>,
+    /// Preferred recovery compaction size, which may be relaxed only within
+    /// input_capacity_tokens and the cumulative Run budget.
+    pub(super) input_compaction_target_tokens: Option<u64>,
     pub(super) reserved_output_tokens: Option<u64>,
     pub(super) observed_prefix: Option<&'a ObservedPrefixAnchor>,
 }
@@ -80,6 +83,12 @@ pub(super) async fn project_model_context(
         .into_iter()
         .chain(budget.input_capacity_tokens)
         .min();
+    let mut active_input_limit = input_limit
+        .into_iter()
+        .chain(budget.input_compaction_target_tokens)
+        .min();
+    let mut recovery_ceiling_fallback =
+        input_limit.filter(|ceiling| active_input_limit.is_some_and(|target| target < *ceiling));
     let system_message = system_message_for_run(&inner.config, run_skills);
     let allowed_skill_digests: std::collections::BTreeMap<_, _> = run_skills
         .map(|skills| {
@@ -91,7 +100,7 @@ pub(super) async fn project_model_context(
                 .collect()
         })
         .unwrap_or_default();
-    let make_request = |reserved_output_tokens| SessionContextRequest {
+    let make_request = |reserved_output_tokens, input_limit: Option<u64>| SessionContextRequest {
         session_id: request.run.spec.session_id.clone(),
         current_run_id: request.run.spec.run_id.clone(),
         through_session_seq,
@@ -126,7 +135,10 @@ pub(super) async fn project_model_context(
             crate::session_context::ContextTokenPolicy::Planning
         };
         match context_engine
-            .project_with_policy(make_request(reserved_output_tokens), policy)
+            .project_with_policy(
+                make_request(reserved_output_tokens, active_input_limit),
+                policy,
+            )
             .await
         {
             Ok(mut projection) => {
@@ -170,6 +182,11 @@ pub(super) async fn project_model_context(
                     });
                 };
                 if previous_overflow.is_some_and(|previous| used >= previous) {
+                    if let Some(ceiling) = recovery_ceiling_fallback.take() {
+                        active_input_limit = Some(ceiling);
+                        previous_overflow = None;
+                        continue;
+                    }
                     return Err(SessionContextError::ContextOverflow {
                         used,
                         budget: input_budget,
@@ -181,7 +198,7 @@ pub(super) async fn project_model_context(
                     &request.run.spec.run_id,
                     AgentTelemetryEnvelope {
                         telemetry_id: TelemetryId::new(format!(
-                            "generic-{}-context-pressure-{used}",
+                            "generic-{}-context-pressure-{used}-{input_budget}",
                             request.run.spec.run_id.as_str()
                         )),
                         run_id: request.run.spec.run_id.clone(),
@@ -197,11 +214,20 @@ pub(super) async fn project_model_context(
                 let compacted = compactor
                     .compact_active_run_for_context(
                         &context_engine,
-                        make_request(reserved_output_tokens),
+                        make_request(reserved_output_tokens, active_input_limit),
                         policy,
                     )
                     .await?;
                 if compacted.is_none() {
+                    // Required facts may exceed the preferred half-budget.
+                    // Try compaction once within the smaller durable ceiling;
+                    // this never grants an unchanged rejected request or a
+                    // larger cumulative Run token/cost reservation.
+                    if let Some(ceiling) = recovery_ceiling_fallback.take() {
+                        active_input_limit = Some(ceiling);
+                        previous_overflow = None;
+                        continue;
+                    }
                     return Err(SessionContextError::ContextOverflow {
                         used,
                         budget: input_budget,
@@ -250,6 +276,11 @@ pub(super) async fn project_model_messages(
     } else {
         None
     };
+    let recovery = if through_session_seq.is_none() {
+        super::context_recovery::context_recovery_for_run(inner, request)?
+    } else {
+        None
+    };
     project_model_context(
         inner,
         request,
@@ -259,12 +290,12 @@ pub(super) async fn project_model_messages(
         through_session_seq,
         ModelContextBudget {
             remaining_input_tokens,
-            input_capacity_tokens: if through_session_seq.is_none() {
-                super::context_recovery::context_recovery_for_run(inner, request)?
-                    .map(|recovery| recovery.input_budget_tokens)
-            } else {
-                None
-            },
+            input_capacity_tokens: recovery
+                .as_ref()
+                .map(|recovery| recovery.input_budget_tokens),
+            input_compaction_target_tokens: recovery
+                .as_ref()
+                .map(|recovery| recovery.compaction_target_tokens()),
             reserved_output_tokens: None,
             observed_prefix: anchor.as_ref(),
         },

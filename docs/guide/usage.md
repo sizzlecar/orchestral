@@ -189,9 +189,11 @@ usage retry, since failed requests may have consumed more than their last report
 Uncertain model attempts after process loss retain the existing recovery contract.
 
 An explicit context-capacity rejection before any usage or generated content has a
-separate recovery policy. By default the agent retries once with half the rejected
-input's planning budget, compacting complete exchanges while retaining task and
-permission facts. The new request consumes a model step; completed tools are not
+separate recovery policy. By default the agent retries once, targeting half the
+rejected input's planning size while compacting complete exchanges and retaining
+task and permission facts. If required context cannot fit that preferred target,
+compaction can use a ceiling still strictly below the rejected planning size and
+bounded by cumulative Run limits. The new request consumes a model step; completed tools are not
 repeated. An irreducible context or a second rejection ends the run explicitly.
 The OpenAI-compatible adapter requires HTTP 400 with `error.code` equal to
 `context_length_exceeded`; ordinary parameter errors and errors after generation

@@ -14,6 +14,28 @@ enum Rejection {
 struct CapacityModel {
     requests: Mutex<Vec<ModelRequest>>,
     rejection: Rejection,
+    fixed_input_tokens: u64,
+}
+
+struct CapacityTokenMeter(u64);
+
+impl ModelTokenMeter for CapacityTokenMeter {
+    fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
+        ModelTokenMeterDescriptor {
+            strategy: "test/capacity-fixed-and-exchange-tokens".to_owned(),
+            version: "1".to_owned(),
+            accounting: ModelTokenAccounting::Exact,
+            config_digest: Digest::sha256(self.0.to_be_bytes()),
+        }
+    }
+
+    fn count_request_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<u64, ModelError> {
+        Ok(ExchangeCountingTokenMeter.count_request_input(messages, tools)? + self.0)
+    }
 }
 
 struct CapacitySummarizer;
@@ -128,7 +150,7 @@ impl ModelBackend for CapacityModel {
             };
         events.push(ModelEvent::Usage {
             usage: ModelUsage {
-                input_tokens: Some(if summarized { 800 } else { 700 }),
+                input_tokens: Some(self.fixed_input_tokens + if summarized { 800 } else { 700 }),
                 output_tokens: Some(7),
             },
         });
@@ -207,6 +229,7 @@ fn provider(
     checkpoints: Arc<dyn GenericAgentCheckpointStore>,
     tool: Arc<EchoTool>,
 ) -> Arc<InternalGenericAgentProvider> {
+    let meter = Arc::new(CapacityTokenMeter(model.fixed_input_tokens));
     let bounds = ToolPolicyBounds {
         approval: ApprovalPolicy::NotRequired,
         max_timeout_ms: Some(1000),
@@ -220,7 +243,7 @@ fn provider(
             durable_direct_runtime(&bounds, effects, tool),
             RunToolGrant { bounds },
             sessions,
-            Arc::new(ExchangeCountingTokenMeter),
+            meter,
         )
         .unwrap()
         .with_checkpoint_store(checkpoints)
@@ -259,18 +282,24 @@ fn run() -> AgentRunEnvelope {
 
 #[tokio::test]
 async fn capacity_recovery_compacts_whole_exchanges_and_preserves_usage_and_effects() {
-    for (rejection, retries, delivered, calls) in [
-        (Rejection::BeforeGeneration, 1, true, 3),
-        (Rejection::BeforeGeneration, 0, false, 2),
-        (Rejection::Always, 1, false, 3),
-        (Rejection::AfterUsage, 1, false, 2),
-        (Rejection::AfterText, 1, false, 2),
-        (Rejection::AfterToolStart, 1, false, 2),
-        (Rejection::Initial, 1, false, 1),
+    for (rejection, retries, fixed_input_tokens, delivered, calls) in [
+        (Rejection::BeforeGeneration, 1, 0, true, 3),
+        // Required context alone exceeds half the rejected request. A smaller
+        // complete exchange summary still fits the original context ceiling.
+        (Rejection::BeforeGeneration, 1, 1500, true, 3),
+        (Rejection::BeforeGeneration, 0, 0, false, 2),
+        (Rejection::Always, 1, 0, false, 3),
+        (Rejection::Always, 1, 1500, false, 3),
+        (Rejection::AfterUsage, 1, 0, false, 2),
+        (Rejection::AfterText, 1, 0, false, 2),
+        (Rejection::AfterToolStart, 1, 0, false, 2),
+        (Rejection::Initial, 1, 0, false, 1),
+        (Rejection::Initial, 1, 1500, false, 1),
     ] {
         let model = Arc::new(CapacityModel {
             requests: Mutex::new(Vec::new()),
             rejection,
+            fixed_input_tokens,
         });
         let tool = Arc::new(EchoTool {
             calls: AtomicUsize::new(0),
@@ -308,7 +337,8 @@ async fn capacity_recovery_compacts_whole_exchanges_and_preserves_usage_and_effe
                 AgentRunStatus::Delivered
             } else {
                 AgentRunStatus::Failed
-            }
+            },
+            "fixed_input_tokens={fixed_input_tokens}, retries={retries}"
         );
         assert_eq!(
             tool.calls.load(Ordering::SeqCst),
@@ -340,7 +370,7 @@ async fn capacity_recovery_compacts_whole_exchanges_and_preserves_usage_and_effe
         if delivered {
             assert_rejection_history_integrity(&stored);
             let usage = view.delivery.unwrap().usage.unwrap();
-            assert_eq!(usage.input_tokens, Some(1500));
+            assert_eq!(usage.input_tokens, Some(1500 + 2 * fixed_input_tokens));
             assert_eq!(usage.output_tokens, Some(14));
             let requests = model.requests.lock().unwrap();
             assert_ne!(requests[1].request_id, requests[2].request_id);
@@ -414,6 +444,7 @@ async fn capacity_recovery_cannot_bypass_the_run_model_step_limit() {
     let model = Arc::new(CapacityModel {
         requests: Mutex::new(Vec::new()),
         rejection: Rejection::BeforeGeneration,
+        fixed_input_tokens: 0,
     });
     let tool = Arc::new(EchoTool {
         calls: AtomicUsize::new(0),
@@ -485,6 +516,7 @@ async fn committed_capacity_rejection_recovers_after_lost_ack_without_repeating_
     let first_model = Arc::new(CapacityModel {
         requests: Mutex::new(Vec::new()),
         rejection: Rejection::BeforeGeneration,
+        fixed_input_tokens: 1500,
     });
     let first = Arc::new(
         AgentController::with_journal_store(
@@ -525,6 +557,7 @@ async fn committed_capacity_rejection_recovers_after_lost_ack_without_repeating_
     let model = Arc::new(CapacityModel {
         requests: Mutex::new(Vec::new()),
         rejection: Rejection::BeforeGeneration,
+        fixed_input_tokens: 1500,
     });
     let restored = Arc::new(
         AgentController::with_journal_store(

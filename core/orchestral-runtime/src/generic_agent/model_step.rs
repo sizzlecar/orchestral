@@ -149,6 +149,9 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 input_capacity_tokens: context_recovery
                     .as_ref()
                     .map(|recovery| recovery.input_budget_tokens),
+                input_compaction_target_tokens: context_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.compaction_target_tokens()),
                 reserved_output_tokens: Some(
                     if inner.config.minimum_output_reserve_tokens.is_some() {
                         output_reserve

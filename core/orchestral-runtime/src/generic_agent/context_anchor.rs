@@ -108,6 +108,7 @@ pub(super) async fn replay_started_context(
         ModelContextBudget {
             remaining_input_tokens: Some(trace.input_budget_tokens),
             input_capacity_tokens: None,
+            input_compaction_target_tokens: None,
             // An elastic turn may have kept a larger input budget than the
             // configured preferred reserve permits. Reproduce that recorded
             // budget rather than making a new planning/compaction decision.

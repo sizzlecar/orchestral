@@ -712,6 +712,14 @@ pub struct GenericContextRecovery {
     pub input_budget_tokens: u64,
 }
 
+impl GenericContextRecovery {
+    /// The ceiling is one token below the rejected input; rounding its half
+    /// upward recovers half the original rejected input without overflowing.
+    pub(crate) fn compaction_target_tokens(&self) -> u64 {
+        self.input_budget_tokens.div_ceil(2)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandCheckpoint {
     pub command: AgentCommandEnvelope,

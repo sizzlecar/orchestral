@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::model_protocol::{ModelError, ModelErrorCode};
 
 /// Recovery after a definite context-capacity rejection, separate from
-/// transport retries. Each recovery halves the rejected input's planning
-/// budget and reprojects/compacts whole exchanges. Zero disables recovery.
+/// transport retries. Each recovery targets half the rejected input's planning
+/// size while allowing required context within a strictly smaller retry ceiling.
+/// It reprojects/compacts whole exchanges. Zero disables recovery.
 /// Rejections consume model steps; successful generation resets this count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

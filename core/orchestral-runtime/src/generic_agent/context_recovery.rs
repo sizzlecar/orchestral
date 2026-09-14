@@ -42,7 +42,11 @@ pub(super) fn commit_context_recovery(
         .context_estimate
         .as_ref()
         .map_or(trace.used_input_tokens, |estimate| estimate.tokens);
-    let input_budget_tokens = trace.input_budget_tokens.min(planned_input) / 2;
+    let rejected_input_tokens = trace.input_budget_tokens.min(planned_input);
+    // The retry must be smaller, but halving a hard ceiling can exclude the
+    // immutable task itself. Keep half as the preferred compaction target.
+    let input_budget_tokens = rejected_input_tokens.saturating_sub(1);
+    let target_input_tokens = rejected_input_tokens / 2;
     let Some(retry_number) = retry_number.filter(|number| {
         *number <= inner.config.context_recovery.max_retries && input_budget_tokens > 0
     }) else {
@@ -75,7 +79,7 @@ pub(super) fn commit_context_recovery(
         provider_seq: None,
         payload: AgentTelemetry::ProgressReported {
             message: format!(
-                "Model rejected context capacity; reducing input budget to {input_budget_tokens} tokens (recovery {retry_number}/{})",
+                "Model rejected context capacity; compacting toward {target_input_tokens} input tokens within a {input_budget_tokens}-token ceiling (recovery {retry_number}/{})",
                 inner.config.context_recovery.max_retries
             ),
             fraction: None,
