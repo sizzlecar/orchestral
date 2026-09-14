@@ -204,9 +204,11 @@ cargo test -p orchestral-cli --test agent_live_e2e live_agent_uses_existing_proj
 orchestral "修复当前 workspace 中失败的项目，运行测试，并报告经过验证的结果。"
 ```
 
-模型只看到一个结构化文件修改 Tool：`apply_patch`，支持 Add/Update/Delete，不能自行选择
-workspace root 或审批权限。`file_read`、`apply_patch`、`exec_command` / `write_stdin` 和
-MCP 调用都继续经过 Host policy 与 Effect Journal。
+内置文件 Tool 包括 `file_read`、有界路径查找 `file_search` 和内容查找 `text_search`。
+修改时，`file_edit` 替换一处精确且唯一的文本；`apply_patch` 处理结构化的 Add/Update/Delete；
+`file_write` 在相应版本前提下创建或替换完整文件。workspace 选择器只指向 Host 提供的工作区。
+文件 Tool、`exec_command` / `write_stdin`、Artifact/Session 读取和 MCP 调用均继续经过
+Host policy 与 Effect Journal。
 
 在 macOS 和 Linux 上，`exec_command` 只启动 Host 解析并批准的 shell，但允许它在 OS sandbox 内运行普通子进程和
 本地工具链，不要求逐个配置程序白名单。真正的边界是 Host 批准的读写根目录、精确网络目标、
@@ -233,10 +235,39 @@ Run 的专用子目录，同一 Run 内可共享，沙箱不能访问其他 Run 
 
 进程等待支持 `wait_mode: "completion"`，将输出汇总到进程退出或本次等待到期；
 `wait_mode: "output"` 则在输出短暂停顿后返回。非 TTY 命令默认使用 completion 模式，
-首次等待 10 秒，无输入的非 TTY `write_stdin` 默认等待 30 秒；TTY 会话和发送输入默认
-使用 output 模式。`yield_time_ms` 可在 Host 执行上限内调整等待时长，等待到期会返回
+首次最多等待 60 秒，无输入的非 TTY `write_stdin` 默认等待 30 秒；TTY 会话和发送输入默认
+使用 output 模式，初始命令最多等待 10 秒，后续轮询最多等待 5 秒。Host 上限可能缩短这些
+窗口。`yield_time_ms` 可在 Host 执行上限内调整等待时长，等待到期会返回
 会话 ID，进程继续运行。收到新的 Steer 指令时，两种等待均可提前返回当前输出，让 Agent
 处理追加指令，同时保留原进程，不终止或重跑它。
+
+### 输出限额与执行顺序
+
+CLI、TUI 和 `serve` 共用 `tools.max_inline_output_bytes`。增大字节限额可减少 Artifact
+分页，同时占用更多模型上下文。它按单个结果生效，完整请求仍须适配模型上下文窗口；
+命令采集上限由 `tools.max_output_bytes` 单独控制。
+
+可把以下可选字段合并到已有的连接配置。`agent.system_prompt` 在 Agent 合同后追加 Host
+说明；已有该字段时，保留原有说明并按需合并。实际执行始终由 Host policy 控制。
+
+```yaml
+tools:
+  max_inline_output_bytes: 8192
+agent:
+  system_prompt: >-
+    Preserve the user's requested action order. When an inspection or validation is
+    requested before a change, execute it and observe its result before any tool
+    changes the target. If that check's command and working directory are already
+    known, batch it with independent read-only inspections instead of delaying it
+    for unrelated metadata reads. A check after the change cannot establish the
+    initial state. Before finishing, verify which requested steps actually ran and
+    report any omissions.
+```
+
+这些字段配置输出限额和行为说明。是否按要求执行，仍应核对实际工具轨迹和最终检查；
+仅增大限额或追加说明不能证明任务一定完成，也不能保证性能提升。
+
+### Skills 与 MCP
 
 启用 `skills.auto_discover` 后，CLI 会从 workspace 的 `.claude/skills`、`.codex/skills`、
 `skills` 以及显式 `skills.directories` 发现 `SKILL.md` 包。初始 Context 只包含 Skill descriptor；

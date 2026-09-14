@@ -242,9 +242,12 @@ Minimal coding task:
 orchestral "Repair the failing project in this workspace, run its tests, and report the verified result."
 ```
 
-The model sees one structured file-mutation tool, `apply_patch`, for Add/Update/Delete. It cannot
-choose workspace roots or approval authority. `file_read`, `apply_patch`, `exec_command` /
-`write_stdin`, and MCP calls all remain behind Host policy and effect journaling.
+The built-in file tools include `file_read`, bounded path lookup with `file_search`, and content
+lookup with `text_search`. For changes, `file_edit` replaces one exact, unique text match;
+`apply_patch` handles structured Add/Update/Delete changes; `file_write` creates or replaces a
+complete file with the applicable version preconditions. Workspace selectors refer to workspaces
+supplied by the Host. File tools, `exec_command` / `write_stdin`, Artifact/Session reads, and MCP
+calls all remain behind Host policy and effect journaling.
 
 On macOS and Linux, `exec_command` launches one Host-resolved shell and may run ordinary child
 programs and local toolchains inside the OS sandbox; it does not require a per-program allowlist. The actual boundary
@@ -277,11 +280,44 @@ filesystem read/write grants. File Tools retain their workspace-only restriction
 
 Process waits support `wait_mode: "completion"` to collect output until exit or the observation
 deadline, and `wait_mode: "output"` to return after a short pause in output. Non-TTY commands
-default to completion mode with an initial 10-second window; empty non-TTY `write_stdin` polls
-default to 30 seconds. TTY sessions and input writes default to output mode. `yield_time_ms`
-overrides the window within the Host execution limit; reaching that window leaves the process
-running and returns its session ID. New Steer input can yield either wait without stopping or
+default to completion mode with an initial window of up to 60 seconds; empty non-TTY
+`write_stdin` polls default to 30 seconds. TTY sessions and input writes default to output mode,
+with up to 10 seconds for an initial command and 5 seconds for a subsequent poll. Host bounds
+can shorten these windows. `yield_time_ms` overrides the window within the Host execution limit;
+reaching that window leaves the process running and returns its session ID.
+New Steer input can yield either wait without stopping or
 replaying the process, so the Agent can consider the instruction alongside the collected output.
+
+### Output allowance and execution order
+
+The CLI, TUI, and `serve` share the `tools.max_inline_output_bytes` setting. A larger byte allowance
+can reduce Artifact paging while using more model context. It applies to each result; the entire
+request still has to fit the model's context window. Command capture limits remain separately
+controlled by `tools.max_output_bytes`.
+
+Merge these optional fields into an existing connection configuration. `agent.system_prompt`
+adds Host instructions to the Agent contract. If you already use that field, combine the desired
+wording with your existing instructions. Host policy continues to govern all execution.
+
+```yaml
+tools:
+  max_inline_output_bytes: 8192
+agent:
+  system_prompt: >-
+    Preserve the user's requested action order. When an inspection or validation is
+    requested before a change, execute it and observe its result before any tool
+    changes the target. If that check's command and working directory are already
+    known, batch it with independent read-only inspections instead of delaying it
+    for unrelated metadata reads. A check after the change cannot establish the
+    initial state. Before finishing, verify which requested steps actually ran and
+    report any omissions.
+```
+
+This configures the output allowance and guidance; inspect the actual tool trace and final checks
+to assess whether a task followed the requested order. Increasing the allowance or adding
+instructions alone does not establish a performance or completion guarantee.
+
+### Skills and MCP
 
 With `skills.auto_discover: true`, the CLI discovers `SKILL.md` packages under workspace
 `.claude/skills`, `.codex/skills`, and `skills`, plus any explicit `skills.directories`. Only Skill
