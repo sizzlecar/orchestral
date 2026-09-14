@@ -311,6 +311,10 @@ async fn summarizer_ignoring_budget_cannot_commit_an_expanding_candidate() {
 struct PlanningMeter;
 
 impl ModelTokenMeter for PlanningMeter {
+    fn supports_observed_prefix_estimation(&self) -> bool {
+        true
+    }
+
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
         ModelTokenMeterDescriptor {
             strategy: "test-json-planning-and-bound".to_owned(),
@@ -338,6 +342,124 @@ impl ModelTokenMeter for PlanningMeter {
             accounting: ModelTokenAccounting::Estimated,
         })
     }
+}
+
+#[tokio::test]
+async fn planning_compaction_can_preserve_an_observed_prefix_above_the_raw_subset_budget() {
+    use crate::session_context::observed_prefix::ObservedPrefixAnchor;
+    use orchestral_core::agent_protocol::wire::{ArtifactRef, ArtifactRefWithDigest};
+    use orchestral_core::model_protocol::ModelRequestId;
+
+    let seed = Fixture::new(
+        &[96, 96, 1_800],
+        "Continue after inspecting the retained source.",
+    )
+    .await;
+    let store = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let artifact = ArtifactRefWithDigest {
+        artifact_ref: ArtifactRef::new("retained-source"),
+        digest: Digest::sha256("retained source bytes"),
+    };
+    for mut record in seed.records().await {
+        if record.session_seq == 2 {
+            let AgentSessionEvent::ToolExchangeCommitted {
+                tool,
+                retained_artifacts,
+                ..
+            } = &mut record.payload
+            else {
+                panic!("expected the first inspection exchange");
+            };
+            let ModelContent::ToolResult { result, .. } = &mut tool.content[0] else {
+                panic!("expected the inspection result");
+            };
+            *result = serde_json::json!({"kind":"artifact", "artifact": artifact});
+            retained_artifacts.push(artifact.clone());
+        }
+        store
+            .append(AgentSessionEventDraft {
+                event_id: record.event_id,
+                session_id: record.session_id,
+                run_id: record.run_id,
+                payload: record.payload,
+            })
+            .await
+            .unwrap();
+    }
+    let fixture = Fixture {
+        engine: AgentSessionContextEngine::new(store.clone(), Arc::new(PlanningMeter)),
+        store,
+    };
+    let request = |budget| SessionContextRequest {
+        system_message: Some(ModelMessage::text(
+            ModelRole::System,
+            "Preserve all Host rules and task instructions. ".repeat(160),
+        )),
+        ..fixture.request(budget)
+    };
+    let original = fixture.engine.project(request(100_000)).await.unwrap();
+    let prefix = &original.messages[..6];
+    let config = request(100_000).config_digest;
+    let anchor = ObservedPrefixAnchor {
+        run_id: RunId::new("current"),
+        config_digest: config.clone(),
+        source_request_id: ModelRequestId::new("observed-prefix-request"),
+        input: fixture
+            .engine
+            .planning_trace(prefix, &request(100_000).tools, None)
+            .unwrap()
+            .unwrap()
+            .input,
+        observed_input_tokens: 1_000,
+    };
+    let engine =
+        fixture
+            .engine
+            .with_observed_prefix(&RunId::new("current"), &config, Some(&anchor));
+    let policy = ContextTokenPolicy::Planning;
+    let before = engine
+        .context_input_tokens(&original.messages, &request(100_000).tools, policy)
+        .unwrap();
+    let budget = before - 1;
+    // Removing compactable groups also removes part of the observed prefix.
+    // Its uncalibrated estimate is NOT a lower bound on a full candidate that
+    // keeps that prefix and replaces only the newest completed exchange.
+    let immutable = &original.messages[..4];
+    assert!(
+        engine
+            .context_input_tokens(immutable, &request(budget).tools, policy)
+            .unwrap()
+            > budget
+    );
+    let originals = fixture.records().await;
+    let compacted = fixture
+        .compactor(default_summarizer())
+        .compact_active_run_for_context(&engine, request(budget), policy)
+        .await
+        .unwrap()
+        .expect("the newer exchange can shrink without changing the observed prefix");
+    let AgentSessionEvent::ActiveRunCompactionCommitted { source, .. } = compacted.payload else {
+        panic!("expected an active Run compaction");
+    };
+    assert_eq!(source, single_range(4));
+    let projected = engine
+        .project_with_policy(request(budget), policy)
+        .await
+        .unwrap();
+    assert_eq!(&projected.messages[..prefix.len()], prefix);
+    assert!(projected.context_estimate.unwrap().tokens <= budget);
+    assert_eq!(&fixture.records().await[..originals.len()], &originals);
+    let historical = engine
+        .project_with_policy(
+            SessionContextRequest {
+                through_session_seq: Some(originals.len() as u64),
+                ..request(100_000)
+            },
+            policy,
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.messages, original.messages);
 }
 
 struct BudgetFillingSummarizer;

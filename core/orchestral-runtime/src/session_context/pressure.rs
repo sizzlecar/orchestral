@@ -45,11 +45,15 @@ impl AgentSessionCompactor {
             .filter(|(_, group)| !is_current_compactable(group, &records, &request.current_run_id))
             .map(|(key, group)| (*key, group.clone()))
             .collect();
-        if measure(&immutable)? > budget {
+        if policy == ContextTokenPolicy::UpperBound && measure(&immutable)? > budget {
             // Task, Skills, retained artifacts and safety facts cannot be
             // removed to manufacture space, even if tool history is available.
             return Ok(None);
         }
+        // Planning estimates may use a measured prefix. The immutable subset
+        // can lose that prefix and fall back to a larger raw estimate, while a
+        // candidate retaining the prefix still fits. Only full candidates can
+        // establish progress under Planning; the subset is not a lower bound.
 
         let mut sources = Vec::new();
         if let Some(preferred) =

@@ -1,6 +1,6 @@
 # Session Context and Recall v1
 
-状态：Session journal wire schema 保持兼容；当前 projection / compaction binding 为 v2。
+状态：Session journal wire schema 保持兼容；projection、压缩与计量策略由恢复配置 digest 绑定。
 
 ## 原始记录与压缩
 
@@ -18,10 +18,17 @@ Session journal 保存原始用户输入、完整 Tool call/result 对和输出�
 history/token 预算内优先恢复它的原文及 User 角色；不能容纳时仍可回查原始记录。
 这一规则不把所有旧用户要求永久固定，也不承诺有损摘要保存全部细节。
 
-内置 extractive summarizer v2 从类型化 ToolResult 保留失败状态，并在大参数之前呈现
+内置 extractive summarizer 从类型化 ToolResult 保留失败状态，并在大参数之前呈现
 有界错误结果。Tool 成功只表示该调用的结果，不代表用户任务已经验证完成。摘要明确
 标注为历史材料，不能提升为系统权限。修改 projection、压缩策略或 summarizer 的合同
 会改变恢复配置 digest；已有不兼容的未完成 Run 明确拒绝恢复，已完成历史仍可读取。
+
+压力压缩使用与 projection 相同的完整请求计量，包含系统上下文和工具定义。严格预算
+继续遵守 `UpperBound`，不得通过压缩丢弃必需事实。使用 `Planning` 时，删去可压缩记录
+也可能删去已观测的请求前缀，使估算退回更大的原始值；这个子集估算不能作为所有候选的
+下界来提前拒绝压缩。runtime 会计量保留前缀的完整候选，只提交严格变小的结果，且不会
+移除 Artifact 引用所在的完整 exchange。若预算仍不能满足，继续有限压缩或明确失败。
+此行为通过 `context_pressure_contract = full-candidate-planning/v1` 绑定恢复配置。
 
 ## 受控历史回查
 
