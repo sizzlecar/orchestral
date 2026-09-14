@@ -1166,9 +1166,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn probe_loopback_callback(phase: &str) {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpSocket, TcpStream};
+        use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
         eprintln!(
             "loopback phase={phase} executable={:?}",
@@ -1193,8 +1194,22 @@ mod tests {
             eprintln!("loopback phase={phase} bound_address={address}");
             assert!(address.ip().is_loopback());
             assert_ne!(address.port(), 0);
-            stage("listen");
-            let listener = socket.listen(1).expect("listen on bound loopback socket");
+            // TcpSocket::listen combines the syscall with reactor registration.
+            // Separate them so the probe identifies which boundary rejects them.
+            stage("listen_syscall");
+            // SAFETY: socket owns a live, bound TCP descriptor for this call.
+            let status = unsafe { libc::listen(socket.as_raw_fd(), 1) };
+            assert_eq!(
+                status,
+                0,
+                "listen on bound loopback socket: {:?}",
+                std::io::Error::last_os_error()
+            );
+            stage("reactor_register");
+            // SAFETY: ownership is transferred once from the nonblocking TcpSocket.
+            let listener = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
+            let listener = TcpListener::from_std(listener)
+                .expect("register loopback listener with the Tokio reactor");
             assert_eq!(listener.local_addr().unwrap(), address);
             stage("connect");
             let mut client = tokio::time::timeout(timeout, TcpStream::connect(address))
