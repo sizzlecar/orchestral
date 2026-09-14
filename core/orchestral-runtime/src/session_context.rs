@@ -1,5 +1,6 @@
 //! Replay-derived model context for the Generic Agent.
 
+mod live_source;
 pub mod observed_prefix;
 mod placement;
 mod pressure;
@@ -568,26 +569,14 @@ fn replay_groups(
                         ),
                     )));
                 }
-                let source_groups = groups
-                    .values()
-                    .filter(|group| source.contains(group.producer_seq))
-                    .collect::<Vec<_>>();
-                let source_records = records
-                    .iter()
-                    .filter(|candidate| source.contains(candidate.session_seq))
-                    .collect::<Vec<_>>();
-                if source_groups.len() != source_records.len()
-                    || source_records
-                        .iter()
-                        .any(|candidate| candidate.run_id != record.run_id)
-                    || source_groups.iter().any(|group| !group.active_compactable)
-                {
+                if !live_source::valid_active_source(&groups, records, source, &record.run_id) {
                     return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
                         "active-Run compaction may shadow only live, complete Tool exchanges from one Run"
                             .to_owned(),
                     )));
                 }
-                if summary.role == ModelRole::Assistant
+                if (summary.role == ModelRole::Assistant
+                    || live_source::has_shadowed_records(&groups, source))
                     && !placement::can_replace_source(&groups, records, source)
                 {
                     return Err(SessionContextError::Journal(AgentSessionError::Corrupt(
@@ -1008,11 +997,26 @@ pub fn select_active_run_compaction_source(
             AgentSessionEvent::ToolExchangeCommitted { .. }
         );
     }
-    start.and_then(|first| {
+    let contiguous = start.and_then(|first| {
         contains_exchange.then_some(SessionSourceRange {
             first_session_seq: first,
             last_session_seq: end,
         })
+    });
+    contiguous.or_else(|| {
+        // Minimum summaries may be separated only by superseded records.
+        // Fold their live producers even when no original exchange remains
+        // individually materialized. Their immutable originals are expanded
+        // by commit/replay using the same source range and digest.
+        let groups = replay_groups(records, current_run_id, &BTreeMap::new()).ok()?;
+        live_source::compactable_segments(&groups, records, current_run_id)
+            .into_iter()
+            .find(|source| {
+                groups
+                    .range(source.first_session_seq..=source.last_session_seq)
+                    .count()
+                    > 1
+            })
     })
 }
 
@@ -1841,18 +1845,7 @@ impl AgentSessionCompactor {
             return Ok(None);
         };
         let groups = replay_groups(&records, current_run_id, &BTreeMap::new())?;
-        let source_groups = groups
-            .values()
-            .filter(|group| source.contains(group.producer_seq))
-            .map(|group| SessionCompactionGroup {
-                source: single_range(group.producer_seq),
-                messages: group.messages.clone(),
-            })
-            .collect::<Vec<_>>();
-        if source_groups.is_empty()
-            || source_groups.len()
-                != (source.last_session_seq - source.first_session_seq + 1) as usize
-        {
+        if !live_source::valid_active_source(&groups, &records, &source, current_run_id) {
             return Err(SessionContextError::Compaction(
                 "active-Run compaction source no longer matches live Context groups".to_owned(),
             ));
@@ -1885,7 +1878,13 @@ impl AgentSessionCompactor {
     ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
         let session_id = &records[0].session_id;
         let groups = replay_groups(records, current_run_id, &BTreeMap::new())?;
-        if summary.role == ModelRole::Assistant
+        if !live_source::valid_active_source(&groups, records, &source, current_run_id) {
+            return Err(SessionContextError::Compaction(
+                "active-Run source must contain live Tool producers from one Run".to_owned(),
+            ));
+        }
+        if (summary.role == ModelRole::Assistant
+            || live_source::has_shadowed_records(&groups, &source))
             && !placement::can_replace_source(&groups, records, &source)
         {
             return Ok(None);

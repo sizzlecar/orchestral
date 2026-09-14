@@ -28,7 +28,14 @@ history/token 预算内优先恢复它的原文及 User 角色；不能容纳时
 也可能删去已观测的请求前缀，使估算退回更大的原始值；这个子集估算不能作为所有候选的
 下界来提前拒绝压缩。runtime 会计量保留前缀的完整候选，只提交严格变小的结果，且不会
 移除 Artifact 引用所在的完整 exchange。若预算仍不能满足，继续有限压缩或明确失败。
-此行为通过 `context_pressure_contract = full-candidate-planning/v1` 绑定恢复配置。
+此行为通过 `context_pressure_contract = full-candidate-live-ranges/v2` 绑定恢复配置。
+
+已被摘要替代的中间日志记录不会阻断相邻有效片段的再次合并。`source` 仍是连续的原始日志
+范围，`source_digest` 绑定该范围的全部记录；两端必须是当前有效的生产记录，范围内的有效
+group 必须来自同一 Run 的完整、可压缩工具交换或其摘要。展开原始来源时沿向后引用去重，
+不会把旧记录再次计入模型上下文。用户修正、Skill、安全事实、Artifact 所在交换，以及范围外
+仍有效片段的逻辑位置都不能被跨越。合并前的历史游标仍重放原有上下文；提交和重启回放采用
+相同检查。该投影规则通过 `context_projection_contract = source-positioned-summary/v4` 绑定。
 
 extractive summarizer v7 在小预算下优先保留符合 Artifact 分页输出合同的完整引用、
 `next_offset` 和 `complete`，与来源序号和工具状态一起组成不可拆分的观察记录。该观察

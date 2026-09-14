@@ -64,7 +64,8 @@ impl AgentSessionCompactor {
         // Keeping recent exchanges is a quality preference. If the preferred
         // source cannot fit, consider each entire live segment, including its
         // newest exchange or a summary whose budget has since become smaller.
-        for source in compactable_segments(&groups, &records, &request.current_run_id) {
+        for source in live_source::compactable_segments(&groups, &records, &request.current_run_id)
+        {
             if !sources.contains(&source) {
                 sources.push(source);
             }
@@ -162,27 +163,6 @@ fn is_current_compactable(
     current_run_id: &RunId,
 ) -> bool {
     group.active_compactable && records[(group.producer_seq - 1) as usize].run_id == *current_run_id
-}
-
-fn compactable_segments(
-    groups: &BTreeMap<u64, MessageGroup>,
-    records: &[AgentSessionRecord],
-    current_run_id: &RunId,
-) -> Vec<SessionSourceRange> {
-    let mut segments: Vec<SessionSourceRange> = Vec::new();
-    for group in groups
-        .values()
-        .filter(|group| is_current_compactable(group, records, current_run_id))
-    {
-        if let Some(last) = segments.last_mut() {
-            if last.last_session_seq + 1 == group.producer_seq {
-                last.last_session_seq = group.producer_seq;
-                continue;
-            }
-        }
-        segments.push(single_range(group.producer_seq));
-    }
-    segments
 }
 
 #[cfg(test)]

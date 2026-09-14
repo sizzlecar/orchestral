@@ -3,6 +3,8 @@ use super::*;
 use orchestral_core::agent_session::InMemoryAgentSessionJournalStore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod live_ranges;
+
 struct Fixture {
     store: Arc<InMemoryAgentSessionJournalStore>,
     engine: AgentSessionContextEngine,
