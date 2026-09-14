@@ -29,6 +29,9 @@ const SESSION_APPROVAL_PROMPT: &str = "Approve? [y] once / [a] this session / [N
 static LIVE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LOCAL_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[path = "agent_live_e2e/context_output.rs"]
+#[cfg(unix)]
+mod context_output;
 #[path = "agent_live_e2e/context_reliability.rs"]
 mod context_reliability;
 #[path = "agent_live_e2e/failure_diagnostics.rs"]

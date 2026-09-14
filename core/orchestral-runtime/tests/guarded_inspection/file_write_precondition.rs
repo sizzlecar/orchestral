@@ -16,6 +16,9 @@ mod generic_flow;
 #[path = "file_write_precondition/model_output_projection.rs"]
 mod model_output_projection;
 
+#[path = "file_write_precondition/artifact_pages.rs"]
+mod artifact_pages;
+
 type Runtime = GuardedToolRuntime<InMemoryApprovalCapabilityStore>;
 
 struct ReadShapedOutput(Value);
@@ -55,16 +58,44 @@ impl Fixture {
     }
 
     fn runtime(&self) -> Runtime {
-        let runtime = GuardedToolRuntime::new_with_effect_journal(
-            HostToolPolicy {
-                bounds: self.policy.clone(),
-            },
+        self.runtime_with_artifacts(None)
+    }
+
+    fn runtime_with_artifacts(
+        &self,
+        artifacts: Option<orchestral_runtime::ToolArtifactStore>,
+    ) -> Runtime {
+        let host = HostToolPolicy {
+            bounds: self.policy.clone(),
+        };
+        let verifier =
             HostApprovalVerifier::new(SIGNING_KEY, InMemoryApprovalCapabilityStore::default())
-                .unwrap(),
-            self.journal.clone(),
-        )
+                .unwrap();
+        let runtime = match &artifacts {
+            Some(artifacts) => GuardedToolRuntime::new_with_effect_journal_and_artifacts(
+                host,
+                verifier,
+                self.journal.clone(),
+                artifacts.clone(),
+            ),
+            None => {
+                GuardedToolRuntime::new_with_effect_journal(host, verifier, self.journal.clone())
+            }
+        }
         .unwrap()
         .with_permission_policy(Arc::new(WorkspacePermissionPolicy));
+        if let Some(artifacts) = artifacts {
+            runtime
+                .register(
+                    orchestral_runtime::tools::guarded_artifact_read_descriptor(ToolRestriction {
+                        bounds: self.policy.clone(),
+                    }),
+                    Arc::new(orchestral_runtime::tools::GuardedArtifactReadExecutor::new(
+                        artifacts,
+                    )),
+                )
+                .unwrap();
+        }
         runtime
             .register(
                 guarded_file_read_descriptor(ToolRestriction {

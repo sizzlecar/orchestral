@@ -211,6 +211,10 @@ pub struct ToolsConfig {
     pub max_timeout_ms: u64,
     #[serde(default = "default_tool_output_bytes")]
     pub max_output_bytes: u64,
+    /// Separate model-inline ceiling; larger results are retained as Artifacts.
+    /// Omission lets the application derive a share of the model input window.
+    #[serde(default)]
+    pub max_inline_output_bytes: Option<std::num::NonZeroU64>,
 }
 
 impl Default for ToolsConfig {
@@ -219,6 +223,7 @@ impl Default for ToolsConfig {
             exec: ExecToolConfig::default(),
             max_timeout_ms: default_tool_timeout_ms(),
             max_output_bytes: default_tool_output_bytes(),
+            max_inline_output_bytes: None,
         }
     }
 }

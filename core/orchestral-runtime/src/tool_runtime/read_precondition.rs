@@ -127,7 +127,8 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         observations: &ModelToolObservations,
         pending_calls: &[ToolCallId],
     ) -> Result<FrozenToolObservations, ToolOutcome> {
-        let mut reads = Vec::new();
+        let mut verified = Vec::new();
+        let mut pages = Vec::new();
         for (call_id, visible) in &observations.0 {
             // Call IDs need not be globally unique across Runs. An old
             // message cannot be rebound to a read in this response's batch.
@@ -144,10 +145,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
                 continue;
             };
             let ToolEffectPhase::Committed {
-                outcome:
-                    ToolOutcome::Completed {
-                        output: ToolOutput::Inline(ref output),
-                    },
+                outcome: ToolOutcome::Completed { ref output },
                 ..
             } = prior.phase
             else {
@@ -173,20 +171,61 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             {
                 continue;
             }
-            // Old sessions may contain the complete canonical output. New
-            // sessions contain exactly the registered producer's model view;
-            // summaries or edited values are never read evidence.
-            if output != visible
-                && producer
-                    .executor
-                    .project_model_output(&prior.prepared.invocation, output)
-                    != *visible
-            {
-                continue;
+            match output {
+                ToolOutput::Inline(output) => {
+                    // Exact committed bytes or the producer's complete model
+                    // view are evidence; a summary or edited page is not.
+                    if output != visible
+                        && producer
+                            .executor
+                            .project_model_output(&prior.prepared.invocation, output)
+                            != *visible
+                    {
+                        continue;
+                    }
+                    if let Some(page) = producer
+                        .executor
+                        .artifact_read_observation(&prior.prepared.invocation, output)
+                    {
+                        pages.push(page);
+                    }
+                }
+                ToolOutput::Artifact(artifact) => {
+                    if artifact_model_output(artifact) != *visible {
+                        continue;
+                    }
+                }
+                _ => continue,
             }
+            verified.push((source, prior, producer, records));
+        }
+        let mut reads = Vec::new();
+        for (source, prior, producer, records) in verified {
+            let ToolEffectPhase::Committed {
+                outcome: ToolOutcome::Completed { output },
+                ..
+            } = prior.phase
+            else {
+                continue;
+            };
+            let output = match output {
+                ToolOutput::Inline(output) => output,
+                ToolOutput::Artifact(artifact) => {
+                    let Some(output) =
+                        super::artifact_observation::observed_artifact_output(&artifact, &pages)
+                    else {
+                        continue;
+                    };
+                    if producer.descriptor.validate_output(&output).is_err() {
+                        continue;
+                    }
+                    output
+                }
+                _ => continue,
+            };
             let Some(version) = producer
                 .executor
-                .complete_file_read(&prior.prepared.invocation, output)
+                .complete_file_read(&prior.prepared.invocation, &output)
             else {
                 continue;
             };

@@ -61,6 +61,9 @@ use tokio_util::sync::CancellationToken;
 
 const SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
+#[path = "tool_runtime/context_output.rs"]
+mod context_output;
+
 fn strings(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }

@@ -3,7 +3,10 @@
 //! An executor must opt in to the Host-owned effective policy
 //! and cancellation contract by implementing [`GuardedToolExecutor`].
 
+mod artifact_observation;
 mod read_precondition;
+pub(crate) use artifact_observation::artifact_model_output;
+pub use artifact_observation::ArtifactReadObservation;
 use read_precondition::execution_invocation;
 pub use read_precondition::{
     CompleteFileRead, FrozenToolObservations, ModelToolObservations, ObservedFileRead,
@@ -174,6 +177,19 @@ pub trait GuardedToolExecutor: Send + Sync {
         _invocation: &ToolInvocation,
         _output: &serde_json::Value,
     ) -> Option<CompleteFileRead> {
+        None
+    }
+
+    /// Declares Artifact bytes retained in this executor's model view. Opt-in
+    /// readers must version this behavior in their planning contract. The
+    /// runtime verifies committed visible pages and the original result digest
+    /// before recognizing a complete read; matching JSON field names alone is
+    /// never evidence.
+    fn artifact_read_observation(
+        &self,
+        _invocation: &ToolInvocation,
+        _output: &serde_json::Value,
+    ) -> Option<ArtifactReadObservation> {
         None
     }
 
@@ -609,6 +625,7 @@ pub struct ToolArtifactStore {
     store: Arc<dyn BlobStore>,
     max_artifact_bytes: u64,
     summary_max_chars: usize,
+    inline_output_limit: Option<std::num::NonZeroU64>,
     hooks: Option<Arc<HookRegistry>>,
 }
 
@@ -627,8 +644,21 @@ impl ToolArtifactStore {
             store,
             max_artifact_bytes,
             summary_max_chars,
+            inline_output_limit: None,
             hooks: None,
         })
+    }
+
+    /// Spill validated results above this model-inline ceiling without reducing
+    /// executor collection limits or the durable Artifact storage ceiling.
+    pub fn with_inline_output_limit(mut self, max_bytes: std::num::NonZeroU64) -> Self {
+        self.inline_output_limit = Some(max_bytes);
+        self
+    }
+
+    /// Maximum serialized inline result size, when configured by the Host.
+    pub fn inline_output_limit(&self) -> Option<u64> {
+        self.inline_output_limit.map(std::num::NonZeroU64::get)
     }
 
     /// Attaches the Host runtime hook registry to artifact lifecycle events.
@@ -699,6 +729,7 @@ impl ToolArtifactStore {
         invocation: &ToolInvocation,
         bytes: Vec<u8>,
         summary: String,
+        inline_max_bytes: u64,
         cancellation: &CancellationToken,
     ) -> Result<ToolArtifact, ToolArtifactError> {
         let byte_size = bytes.len() as u64;
@@ -732,6 +763,12 @@ impl ToolArtifactStore {
             self.write_artifact(invocation, bytes, byte_size, digest, summary, cancellation)
                 .await
         };
+        let result = result.and_then(|mut artifact| {
+            if self.inline_output_limit.is_some() {
+                artifact_observation::fit_artifact_summary(&mut artifact, inline_max_bytes)?;
+            }
+            Ok(artifact)
+        });
         match result {
             Ok(artifact) => {
                 let mut payload = lifecycle_payload;
@@ -1068,11 +1105,15 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             })
             .collect::<Vec<_>>();
         let artifact_contract = self.artifact_store.as_ref().map(|store| {
-            serde_json::json!({
+            let mut contract = serde_json::json!({
                 "max_artifact_bytes": store.max_artifact_bytes,
                 "summary_max_chars": store.summary_max_chars,
                 "hooks_enabled": store.hooks.is_some(),
-            })
+            });
+            if let Some(limit) = store.inline_output_limit() {
+                contract["inline_output_limit"] = serde_json::json!(limit);
+            }
+            contract
         });
         let contract = serde_json::json!({
             "contract": "orchestral.guarded-tool-runtime/v1",
@@ -2134,6 +2175,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
         let outcome = normalize_post_dispatch_outcome(&registered.descriptor, outcome);
         normalize_completed_outcome(
             &registered.descriptor,
+            registered.executor.as_ref(),
             &effective_policy,
             &output_invocation,
             self.artifact_store.as_ref(),
@@ -2376,6 +2418,7 @@ fn map_execution_result(result: Result<ToolOutcome, Box<dyn std::any::Any + Send
 
 async fn normalize_completed_outcome(
     descriptor: &ToolDescriptor,
+    executor: &dyn GuardedToolExecutor,
     effective_policy: &EffectiveToolPolicy,
     invocation: &ToolInvocation,
     artifact_store: Option<&ToolArtifactStore>,
@@ -2410,16 +2453,37 @@ async fn normalize_completed_outcome(
             }
         }
     };
-    let Some(inline_max_bytes) = effective_policy.bounds().max_output_bytes else {
-        return ToolOutcome::Completed {
-            output: ToolOutput::Inline(output),
-        };
+    let policy_max = effective_policy.bounds().max_output_bytes;
+    let model_max = artifact_store.and_then(ToolArtifactStore::inline_output_limit);
+    let model_fits = match model_max {
+        Some(maximum) => {
+            match serde_jcs::to_vec(&executor.project_model_output(invocation, &output)) {
+                Ok(bytes) => bytes.len() as u64 <= maximum,
+                Err(error) => {
+                    return ToolOutcome::Failed {
+                        code: "model_output_serialization_failed".to_owned(),
+                        message: error.to_string(),
+                        retryable: false,
+                    }
+                }
+            }
+        }
+        None => true,
     };
-    if bytes.len() as u64 <= inline_max_bytes {
+    if model_fits && policy_max.is_none_or(|maximum| bytes.len() as u64 <= maximum) {
         return ToolOutcome::Completed {
             output: ToolOutput::Inline(output),
         };
     }
+    let inline_max_bytes = match (policy_max, model_max) {
+        (Some(policy), Some(model)) => Some(policy.min(model)),
+        (policy, model) => policy.or(model),
+    };
+    let Some(inline_max_bytes) = inline_max_bytes else {
+        return ToolOutcome::Completed {
+            output: ToolOutput::Inline(output),
+        };
+    };
     let Some(artifact_store) = artifact_store else {
         return ToolOutcome::Failed {
             code: "output_limit_exceeded".to_owned(),
@@ -2434,7 +2498,7 @@ async fn normalize_completed_outcome(
         artifact_store.summary_max_chars,
     );
     match artifact_store
-        .spill(invocation, bytes, summary, cancellation)
+        .spill(invocation, bytes, summary, inline_max_bytes, cancellation)
         .await
     {
         Ok(artifact) => ToolOutcome::Completed {

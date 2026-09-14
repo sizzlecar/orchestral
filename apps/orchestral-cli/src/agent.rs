@@ -402,7 +402,11 @@ async fn build_agent_host_with_journals(
         config.artifacts.max_bytes,
         config.artifacts.summary_max_chars,
     )
-    .context("configure Tool Artifact store")?;
+    .context("configure Tool Artifact store")?
+    .with_inline_output_limit(model_inline_output_limit(
+        &config,
+        model_backend.descriptor().capabilities.max_context_tokens,
+    ));
     let CliToolComposition {
         runtime: tool_runtime,
         run_grant,
@@ -659,6 +663,25 @@ pub(crate) async fn resume_unfinished(
         }
     }
     Ok(resumed)
+}
+
+fn model_inline_output_limit(
+    config: &OrchestralConfig,
+    backend_context_tokens: Option<u64>,
+) -> std::num::NonZeroU64 {
+    if let Some(limit) = config.tools.max_inline_output_bytes {
+        return limit;
+    }
+    let context = backend_context_tokens
+        .unwrap_or(config.agent.max_context_tokens)
+        .min(config.agent.max_context_tokens);
+    // A per-result allowance, not a tokenizer estimate or a guarantee for an
+    // entire conversation. Leave room for the request, history and other tools.
+    let bytes = context
+        .saturating_sub(config.agent.reserved_output_tokens)
+        .div_ceil(4)
+        .max(1);
+    std::num::NonZeroU64::new(bytes).expect("inline output allowance is positive")
 }
 
 fn build_cli_tool_runtime(
@@ -2095,6 +2118,10 @@ fn select_entry_mode(
 #[cfg(test)]
 #[path = "agent/tool_capability_tests.rs"]
 mod tool_capability_tests;
+
+#[cfg(test)]
+#[path = "agent/tool_output_budget_tests.rs"]
+mod tool_output_budget_tests;
 
 #[cfg(test)]
 mod entry_mode_tests {

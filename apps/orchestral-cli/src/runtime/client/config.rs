@@ -446,6 +446,9 @@ providers:
 tools:
   max_timeout_ms: 130000
   max_output_bytes: 1048576
+  # null: one quarter of the model input window, in bytes, per inline result.
+  # Complete larger results remain available through artifact_read.
+  max_inline_output_bytes: null
   exec:
     enabled: true
     allow_host_execution: true

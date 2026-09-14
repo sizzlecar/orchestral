@@ -29,6 +29,10 @@ fn configure_pressure(workspace: &TestWorkspace) {
         config["agent"]["reserved_output_tokens"] =
             serde_yaml::to_value(PRESSURE_OUTPUT_TOKENS).unwrap();
         config["agent"]["compaction"]["summary_max_chars"] = serde_yaml::to_value(1024).unwrap();
+        // This fixture deliberately retains large observations to exercise
+        // aggregate context pressure and recovery. Default early Artifact
+        // spilling is covered by context_output, and would remove this trigger.
+        config["tools"]["max_inline_output_bytes"] = serde_yaml::to_value(64 * 1024).unwrap();
     });
     fs::write(
         workspace.path("dataset.txt"),

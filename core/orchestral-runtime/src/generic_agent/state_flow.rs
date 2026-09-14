@@ -29,16 +29,7 @@ fn model_tool_result_envelope(outcome: ToolOutcome) -> (serde_json::Value, bool)
         } => (output, false),
         ToolOutcome::Completed {
             output: ToolOutput::Artifact(artifact),
-        } => (
-            serde_json::json!({
-                "kind": "artifact",
-                "artifact": artifact.artifact,
-                "media_type": artifact.media_type,
-                "byte_size": artifact.byte_size,
-                "summary": artifact.summary,
-            }),
-            false,
-        ),
+        } => (crate::tool_runtime::artifact_model_output(&artifact), false),
         other => (
             serde_json::to_value(other).unwrap_or_else(|error| {
                 serde_json::json!({
