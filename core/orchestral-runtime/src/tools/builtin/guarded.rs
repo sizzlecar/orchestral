@@ -434,7 +434,7 @@ pub fn guarded_file_read_descriptor(restriction: ToolRestriction) -> ToolDescrip
         tool_id: ToolId::new("orchestral/file_read/v3"),
         model_schema: ModelToolSchema {
             name: "file_read".to_owned(),
-            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. Continue with next_offset when eof is false; truncation reasons are always explicit."
+            description: "Read UTF-8 source text by 1-indexed line range from a Host-approved workspace-relative path. Read known paths directly without a preliminary path search. Continue with next_offset when eof is false; truncation reasons are always explicit."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",

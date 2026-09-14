@@ -943,7 +943,10 @@ fn build_exec_command_descriptor(
                 "output for TTY (up to 10 seconds). yield_time_ms overrides this observation ",
                 "window within Host limits. ",
                 "A wait deadline does not kill the command. ",
-                "Long captured output shares a stdout/stderr budget. Each available stream keeps its beginning and end where the budget permits."
+                "Captured output is bounded by a shared stdout/stderr budget. Each available stream ",
+                "keeps its beginning and end where the budget permits. Preserve a validation ",
+                "command's own exit status; do not pipe it through tail or another filter merely ",
+                "to shorten output."
             )),
             input_schema,
         },
