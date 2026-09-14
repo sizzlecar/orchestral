@@ -188,6 +188,15 @@ With explicit cumulative Run token/cost limits, only rate-limit rejections witho
 usage retry, since failed requests may have consumed more than their last reported usage.
 Uncertain model attempts after process loss retain the existing recovery contract.
 
+An explicit context-capacity rejection before any usage or generated content has a
+separate recovery policy. By default the agent retries once with half the rejected
+input's planning budget, compacting complete exchanges while retaining task and
+permission facts. The new request consumes a model step; completed tools are not
+repeated. An irreducible context or a second rejection ends the run explicitly.
+The OpenAI-compatible adapter requires HTTP 400 with `error.code` equal to
+`context_length_exceeded`; ordinary parameter errors and errors after generation
+do not trigger this recovery. The rejection and smaller budget survive restart.
+
 Configure discovery, compatibility filenames, and retries as follows:
 
 ```yaml
@@ -200,6 +209,8 @@ agent:
     max_retries: 3 # 0 disables automatic retries
     base_delay_ms: 500
     max_delay_ms: 8000
+  context_recovery:
+    max_retries: 1 # 0 disables context-capacity recovery
 ```
 
 Credential-free CLI/PTY E2E tests cover instruction precedence, scope, snapshots,

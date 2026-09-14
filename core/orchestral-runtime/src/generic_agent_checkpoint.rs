@@ -312,6 +312,16 @@ pub enum GenericCheckpointEvent {
         request_id: ModelRequestId,
         observation: GenericModelObservation,
     },
+    /// A definite capacity rejection, before any model usage or content.
+    /// This closes the attempt without executing tools and durably reserves
+    /// a smaller input budget for a new model round, including after restart.
+    ModelContextRejected {
+        round: u64,
+        request_id: ModelRequestId,
+        retry_number: u32,
+        input_budget_tokens: u64,
+        error: orchestral_core::model_protocol::ModelError,
+    },
     /// A retry within an open logical attempt, before any non-usage event was
     /// observed. Recovery still treats an open attempt as interrupted; this
     /// fact does not authorize replaying a model request after process loss.
@@ -350,6 +360,26 @@ pub enum GenericCheckpointEvent {
 impl GenericCheckpointEvent {
     fn validate(&self, run_id: &RunId) -> Result<(), GenericCheckpointError> {
         match self {
+            Self::ModelContextRejected {
+                round,
+                request_id,
+                retry_number,
+                input_budget_tokens,
+                error,
+            } => {
+                if *round == 0
+                    || round.checked_add(1).is_none()
+                    || request_id.is_empty()
+                    || *retry_number == 0
+                    || *input_budget_tokens == 0
+                    || error.code
+                        != orchestral_core::model_protocol::ModelErrorCode::ContextLengthExceeded
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context recovery requires a definite capacity rejection and positive budget".to_owned(),
+                    ));
+                }
+            }
             Self::ModelRetryScheduled {
                 round,
                 request_id,
@@ -673,6 +703,13 @@ pub struct GenericAgentCheckpointProjection {
     pub last_checkpoint_seq: u64,
     /// Derived from the last completed request, never cumulative/output usage.
     pub observed_prefix: Option<ObservedPrefixAnchor>,
+    pub context_recovery: Option<GenericContextRecovery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericContextRecovery {
+    pub retry_number: u32,
+    pub input_budget_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -694,6 +731,7 @@ pub fn replay_generic_agent_checkpoint(
     let mut checkpoint_ids = BTreeMap::<GenericCheckpointEventId, Digest>::new();
     let mut last_retry_number = 0_u32;
     let mut observed_prefix = None;
+    let mut context_recovery: Option<GenericContextRecovery> = None;
     let mut started_context: Option<(GenericModelContextTrace, Option<u64>)> = None;
 
     for (index, record) in run.records.iter().enumerate() {
@@ -722,6 +760,61 @@ pub fn replay_generic_agent_checkpoint(
         }
 
         match &record.payload {
+            GenericCheckpointEvent::ModelContextRejected {
+                round,
+                request_id,
+                retry_number,
+                input_budget_tokens,
+                ..
+            } => {
+                let GenericCheckpointPhase::ModelAttemptOpen {
+                    boundary,
+                    round: open_round,
+                    request_id: open_request_id,
+                    ..
+                } = &phase
+                else {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context rejection must close an open model attempt".to_owned(),
+                    ));
+                };
+                let trace = &started_context
+                    .as_ref()
+                    .ok_or_else(|| {
+                        GenericCheckpointError::InvalidData(
+                            "missing rejected context trace".to_owned(),
+                        )
+                    })?
+                    .0;
+                let planned_input = trace
+                    .context_estimate
+                    .as_ref()
+                    .map_or(trace.used_input_tokens, |estimate| estimate.tokens);
+                if round != open_round
+                    || request_id != open_request_id
+                    || context_recovery
+                        .as_ref()
+                        .map_or(Some(1), |prior| prior.retry_number.checked_add(1))
+                        != Some(*retry_number)
+                    || *input_budget_tokens >= trace.input_budget_tokens
+                    || *input_budget_tokens >= planned_input
+                {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "context recovery must advance its rejection count and reduce the rejected input budget".to_owned(),
+                    ));
+                }
+                let mut next = boundary.clone();
+                next.next_model_round = round.checked_add(1).ok_or_else(|| {
+                    GenericCheckpointError::InvalidData(
+                        "context recovery round overflow".to_owned(),
+                    )
+                })?;
+                phase = GenericCheckpointPhase::Stable(next);
+                context_recovery = Some(GenericContextRecovery {
+                    retry_number: *retry_number,
+                    input_budget_tokens: *input_budget_tokens,
+                });
+            }
             GenericCheckpointEvent::ModelRetryScheduled {
                 round,
                 request_id,
@@ -797,6 +890,13 @@ pub fn replay_generic_agent_checkpoint(
                         "model attempt round does not match the stable boundary".to_owned(),
                     ));
                 }
+                if context_recovery.as_ref().is_some_and(|recovery| {
+                    context.input_budget_tokens > recovery.input_budget_tokens
+                }) {
+                    return Err(GenericCheckpointError::InvalidData(
+                        "model retry exceeded its durable recovery input budget".to_owned(),
+                    ));
+                }
                 if context.planning.as_ref().is_some_and(|planning| {
                     context.config_digest != run.registration.config_digest
                         || planning
@@ -842,6 +942,7 @@ pub fn replay_generic_agent_checkpoint(
                 observed_prefix = started_context.as_ref().and_then(|(context, cap)| {
                     context.observed_prefix(run_id, request_id, observation, *cap)
                 });
+                context_recovery = None;
                 phase = GenericCheckpointPhase::ModelAttemptObserved {
                     boundary: boundary.clone(),
                     round: *round,
@@ -952,6 +1053,7 @@ pub fn replay_generic_agent_checkpoint(
         commands,
         last_checkpoint_seq: run.last_checkpoint_seq(),
         observed_prefix,
+        context_recovery,
     })
 }
 

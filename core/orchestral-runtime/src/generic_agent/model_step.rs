@@ -1,3 +1,5 @@
+use super::context_recovery::{commit_context_recovery, context_recovery_for_run};
+use super::model_retry::ModelStartFailure;
 use super::*;
 
 pub(super) struct ModelRunExecution {
@@ -72,6 +74,13 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             return;
         }
     };
+    let mut context_recovery = match context_recovery_for_run(&inner, &request) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            emit_failure(&inner, &request, &user_message, session_failure(error));
+            return;
+        }
+    };
     'model_rounds: for round in
         std::iter::successors(Some(next_model_round), |round| round.checked_add(1))
     {
@@ -137,6 +146,9 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             None,
             ModelContextBudget {
                 remaining_input_tokens: remaining_input,
+                input_capacity_tokens: context_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.input_budget_tokens),
                 reserved_output_tokens: Some(
                     if inner.config.minimum_output_reserve_tokens.is_some() {
                         output_reserve
@@ -249,7 +261,31 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             ) => result,
         } {
             Ok(stream) => stream,
-            Err(error) => {
+            Err(ModelStartFailure::ContextRejected(error)) => {
+                if cancellation.is_cancelled() {
+                    emit_cancel(&inner, &request, &user_message);
+                    return;
+                }
+                match commit_context_recovery(
+                    &inner,
+                    &request,
+                    round,
+                    &model_request,
+                    &context_trace,
+                    context_recovery.as_ref(),
+                    error,
+                ) {
+                    Ok(recovery) => {
+                        context_recovery = Some(recovery);
+                        continue 'model_rounds;
+                    }
+                    Err(error) => {
+                        emit_failure(&inner, &request, &user_message, error);
+                        return;
+                    }
+                }
+            }
+            Err(ModelStartFailure::Failure(error)) => {
                 if cancellation.is_cancelled() {
                     emit_cancel(&inner, &request, &user_message);
                 } else {
@@ -471,6 +507,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                         has_usage = true;
                     }
                     observed_prefix = next_observed_prefix;
+                    context_recovery = None;
                     match reason {
                         ModelFinishReason::Stop
                             if tool_calls.is_empty() && !response.is_empty() =>

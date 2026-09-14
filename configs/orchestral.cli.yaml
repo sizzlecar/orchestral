@@ -19,6 +19,8 @@ agent:
     max_retries: 3
     base_delay_ms: 500
     max_delay_ms: 8000
+  context_recovery:
+    max_retries: 1
   compaction:
     enabled: true
     minimum_source_records: 32

@@ -65,6 +65,9 @@ mod observed_write_recovery;
 #[path = "generic_agent/observed_prefix_recovery.rs"]
 mod observed_prefix_recovery;
 
+#[path = "generic_agent/context_recovery.rs"]
+mod context_recovery;
+
 struct ScriptedModel;
 
 struct BlockingModel;

@@ -4,6 +4,9 @@ use crate::session_context::observed_prefix::ObservedPrefixAnchor;
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ModelContextBudget<'a> {
     pub(super) remaining_input_tokens: Option<u64>,
+    /// A smaller per-request capacity after a backend rejection, distinct
+    /// from cumulative Run token/cost limits.
+    pub(super) input_capacity_tokens: Option<u64>,
     pub(super) reserved_output_tokens: Option<u64>,
     pub(super) observed_prefix: Option<&'a ObservedPrefixAnchor>,
 }
@@ -73,7 +76,10 @@ pub(super) async fn project_model_context(
         .min(inner.config.reserved_output_tokens);
     let input_limit = budget
         .remaining_input_tokens
-        .or(request.run.spec.limits.max_input_tokens);
+        .or(request.run.spec.limits.max_input_tokens)
+        .into_iter()
+        .chain(budget.input_capacity_tokens)
+        .min();
     let system_message = system_message_for_run(&inner.config, run_skills);
     let allowed_skill_digests: std::collections::BTreeMap<_, _> = run_skills
         .map(|skills| {
@@ -253,6 +259,12 @@ pub(super) async fn project_model_messages(
         through_session_seq,
         ModelContextBudget {
             remaining_input_tokens,
+            input_capacity_tokens: if through_session_seq.is_none() {
+                super::context_recovery::context_recovery_for_run(inner, request)?
+                    .map(|recovery| recovery.input_budget_tokens)
+            } else {
+                None
+            },
             reserved_output_tokens: None,
             observed_prefix: anchor.as_ref(),
         },

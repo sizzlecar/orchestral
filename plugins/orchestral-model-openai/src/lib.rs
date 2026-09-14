@@ -1035,14 +1035,19 @@ fn map_transport_error(error: reqwest::Error) -> ModelError {
 }
 
 fn map_http_error(status: StatusCode, body: &[u8]) -> ModelError {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let context_rejected = status == StatusCode::BAD_REQUEST
+        && parsed.as_ref().is_some_and(|body| {
+            body.pointer("/error/code").and_then(Value::as_str) == Some("context_length_exceeded")
+        });
     let code = match status.as_u16() {
+        400 if context_rejected => ModelErrorCode::ContextLengthExceeded,
         401 | 403 => ModelErrorCode::Authentication,
         429 => ModelErrorCode::RateLimited,
         500..=599 => ModelErrorCode::Unavailable,
         _ => ModelErrorCode::InvalidRequest,
     };
-    let message = serde_json::from_slice::<Value>(body)
-        .ok()
+    let message = parsed
         .and_then(|value| {
             value
                 .pointer("/error/message")
@@ -1064,6 +1069,40 @@ mod tests {
     };
 
     struct OpenAiConformanceFixture;
+
+    #[test]
+    fn only_structured_bad_request_capacity_errors_enable_context_recovery() {
+        let body = serde_json::to_vec(&json!({"error": {
+            "code":"context_length_exceeded", "message":"input reservation rejected",
+        }}))
+        .unwrap();
+        let error = map_http_error(StatusCode::BAD_REQUEST, &body);
+        assert_eq!(error.code, ModelErrorCode::ContextLengthExceeded);
+        assert!(
+            !error.retryable,
+            "an unchanged request must not enter transport retries"
+        );
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_ne!(
+                map_http_error(status, &body).code,
+                ModelErrorCode::ContextLengthExceeded
+            );
+        }
+        for body in [
+            json!({"error":{"message":"context_length_exceeded"}}),
+            json!({"error":{"code":"invalid_parameter","message":"too many tokens"}}),
+            json!({"code":"context_length_exceeded"}),
+        ] {
+            assert_eq!(
+                map_http_error(StatusCode::BAD_REQUEST, &serde_json::to_vec(&body).unwrap()).code,
+                ModelErrorCode::InvalidRequest
+            );
+        }
+    }
 
     impl ModelFixtureFactory for OpenAiConformanceFixture {
         fn adapter_name(&self) -> &'static str {

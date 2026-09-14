@@ -486,6 +486,9 @@ pub enum ModelFinishReason {
 #[non_exhaustive]
 pub enum ModelErrorCode {
     InvalidRequest,
+    /// The backend rejected the input/output context reservation before
+    /// generation. Retrying identical input cannot recover this error.
+    ContextLengthExceeded,
     Unsupported,
     Unavailable,
     RateLimited,

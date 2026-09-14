@@ -42,7 +42,7 @@ use orchestral_core::model_protocol::{
     ModelMessage, ModelRequest, ModelRequestId, ModelRole, ModelToolCallId, ModelToolDefinition,
     ModelUsage,
 };
-pub use orchestral_core::model_retry::ModelRetryPolicy;
+pub use orchestral_core::model_retry::{ContextRecoveryPolicy, ModelRetryPolicy};
 use orchestral_core::project_instructions::ProjectInstruction;
 use orchestral_core::skill_protocol::SkillLoad;
 use orchestral_core::tool_protocol::{
@@ -174,6 +174,7 @@ pub struct GenericAgentConfig {
     pub project_instructions: Vec<ProjectInstruction>,
     /// Retries before model content or Finish; never replays tool execution.
     pub model_retry: ModelRetryPolicy,
+    pub context_recovery: ContextRecoveryPolicy,
     pub stream_buffer: usize,
     pub continuation: ContinuationPolicy,
     pub history_limit: usize,
@@ -270,6 +271,7 @@ impl GenericAgentConfig {
             input_requests_enabled: true,
             project_instructions: Vec::new(),
             model_retry: ModelRetryPolicy::default(),
+            context_recovery: ContextRecoveryPolicy::default(),
             continuation: ContinuationPolicy::default(),
             history_limit: 128,
             max_context_tokens: 128 * 1024,
@@ -500,6 +502,7 @@ mod recovery_projection;
 use recovery_projection::*;
 mod context;
 use context::*;
+mod context_recovery;
 mod model_retry;
 mod model_step;
 use model_step::*;

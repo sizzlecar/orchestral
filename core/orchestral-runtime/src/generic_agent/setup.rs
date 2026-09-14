@@ -251,6 +251,8 @@ pub(super) fn generic_config_digest(
         "context_projection_contract": "source-positioned-summary/v3",
         "observed_prefix_planning_contract": "completed-input-prefix/v1",
         "model_retry": config.model_retry,
+        "context_recovery": config.context_recovery,
+        "context_recovery_contract": "rejected-input-half-budget/v1",
         "model_descriptor": model_descriptor,
         "token_meter": token_meter,
         "continuation_policy": {

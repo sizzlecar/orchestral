@@ -25,6 +25,7 @@ pub(super) fn checkpoint_recovery_events(
             GenericCheckpointEvent::LoopBoundaryCommitted { .. }
             | GenericCheckpointEvent::ModelAttemptStarted { .. }
             | GenericCheckpointEvent::ModelRetryScheduled { .. }
+            | GenericCheckpointEvent::ModelContextRejected { .. }
             | GenericCheckpointEvent::ModelAttemptObserved { .. }
             | GenericCheckpointEvent::WorkflowAttemptStarted { .. } => {}
         }

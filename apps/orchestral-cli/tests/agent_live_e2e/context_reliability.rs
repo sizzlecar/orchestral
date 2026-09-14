@@ -41,6 +41,99 @@ fn configure_pressure(workspace: &TestWorkspace) {
     .unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn real_http_capacity_rejection_compacts_without_repeating_an_exec_effect() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("http-context-rejection");
+    workspace.rewrite_config(|config| {
+        config["agent"]["max_context_tokens"] =
+            serde_yaml::to_value(PRESSURE_CONTEXT_TOKENS).unwrap();
+        config["agent"]["reserved_output_tokens"] =
+            serde_yaml::to_value(PRESSURE_OUTPUT_TOKENS).unwrap();
+        config["agent"]["compaction"]["summary_max_chars"] = serde_yaml::to_value(1024).unwrap();
+        config["tools"]["max_inline_output_bytes"] = serde_yaml::to_value(64 * 1024).unwrap();
+    });
+    fs::write(
+        workspace.path("dataset.txt"),
+        "record=unrelated_observation;".repeat(520),
+    )
+    .unwrap();
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(|_| {
+            openai_tool_response(
+                "append-once",
+                "exec_command",
+                json!({
+                    "cmd":"printf 'once\\n' >> marker.txt", "wait_mode":"completion", "yield_time_ms":10000,
+                }),
+            )
+        }),
+        Box::new(|request| {
+            assert_eq!(
+                model_tool_result_envelopes(&request.body).last().unwrap()["result"]["exit_code"],
+                0
+            );
+            openai_tool_response("read-dataset", "file_read", json!({"path":"dataset.txt"}))
+        }),
+        Box::new(|request| {
+            assert!(model_request_text(&request.body).contains("record=unrelated_observation;"));
+            FixtureHttpResponse {
+                status: "400 Bad Request",
+                content_type: "application/json",
+                repeat_handler: false,
+                body: serde_json::to_vec(&json!({"error":{
+                    "type":"invalid_request_error", "code":"context_length_exceeded",
+                    "message":"the input and output reservation exceeds model capacity",
+                }}))
+                .unwrap(),
+            }
+        }),
+        Box::new(|request| {
+            let text = model_request_text(&request.body);
+            assert!(text.contains("UNTRUSTED earlier transcript"), "{text}");
+            assert!(text.contains("Preserve stable_api"));
+            openai_tool_response("verify-once", "file_read", json!({"path":"marker.txt"}))
+        }),
+        Box::new(|request| {
+            assert_eq!(
+                model_tool_result_envelopes(&request.body).last().unwrap()["result"]["content"],
+                "once\n"
+            );
+            openai_text_response("The prior effect ran once and its result was verified.")
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    let output = run_to_completion(
+        local_default_agent_command(
+            &workspace,
+            "http-capacity-session",
+            "Record the inspection once and verify it. Preserve stable_api.",
+            true,
+            true,
+        ),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert!(!output.stderr_text().contains(APPROVAL_PROMPT));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        &requests[2].body["messages"].as_array().unwrap()[..2],
+        &requests[3].body["messages"].as_array().unwrap()[..2]
+    );
+    assert!(
+        serde_json::to_vec(&requests[3].body).unwrap().len()
+            < serde_json::to_vec(&requests[2].body).unwrap().len()
+    );
+    assert_eq!(
+        checkpoint_event_count(&workspace, "model_context_rejected"),
+        1
+    );
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+    assert_eq!(fs::read(workspace.path("marker.txt")).unwrap(), b"once\n");
+}
+
 fn assert_planning_boundaries(workspace: &TestWorkspace) {
     let mut saw_attempt = false;
     let mut planning_differs_from_hard_reservation = false;
@@ -69,6 +162,53 @@ fn assert_planning_boundaries(workspace: &TestWorkspace) {
         planning_differs_from_hard_reservation,
         "a conservative wire reservation must not become the planning estimate"
     );
+}
+
+#[test]
+fn cli_capacity_recovery_honors_disable_and_leaves_ordinary_bad_requests_terminal() {
+    let _guard = local_e2e_guard();
+    for (code, max_retries) in [
+        (Some("context_length_exceeded"), 0),
+        (Some("invalid_parameter"), 1),
+        (None, 1),
+    ] {
+        let workspace = TestWorkspace::new("capacity-recovery-disabled-or-invalid");
+        workspace.disable_exec();
+        if max_retries != 1 {
+            workspace.rewrite_config(|config| {
+                config["agent"]["context_recovery"] =
+                    serde_yaml::to_value(json!({"max_retries":max_retries})).unwrap();
+            });
+        }
+        let (endpoint, server) =
+            spawn_fixture_http_server(vec![Box::new(move |_| FixtureHttpResponse {
+                status: "400 Bad Request",
+                content_type: "application/json",
+                repeat_handler: false,
+                body: serde_json::to_vec(
+                    &json!({"error":{"code":code,"message":"request rejected"}}),
+                )
+                .unwrap(),
+            })]);
+        workspace.configure_local_openai(&endpoint);
+        let output = run_to_completion(
+            local_default_agent_command(
+                &workspace,
+                "rejection-session",
+                "Inspect the workspace.",
+                true,
+                true,
+            ),
+            LOCAL_PROCESS_TIMEOUT,
+        );
+        assert!(!output.status.success());
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(
+            checkpoint_event_count(&workspace, "model_context_rejected"),
+            0
+        );
+        assert_eq!(run_payload_count(&workspace, "run_failed"), 1);
+    }
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::session_context::observed_prefix::ObservedPrefixAnchor;
 
-fn context_checkpoint(
+pub(super) fn context_checkpoint(
     inner: &GenericInner,
     request: &AgentStartRequest,
 ) -> Result<Option<StoredGenericAgentRun>, SessionContextError> {
@@ -107,6 +107,7 @@ pub(super) async fn replay_started_context(
         Some(trace.through_session_seq),
         ModelContextBudget {
             remaining_input_tokens: Some(trace.input_budget_tokens),
+            input_capacity_tokens: None,
             // An elastic turn may have kept a larger input budget than the
             // configured preferred reserve permits. Reproduce that recorded
             // budget rather than making a new planning/compaction decision.

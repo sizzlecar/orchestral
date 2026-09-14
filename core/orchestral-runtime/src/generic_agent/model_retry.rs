@@ -7,6 +7,17 @@ pub(super) struct StartedModelStream {
     pub(super) usage: Option<ModelUsage>,
 }
 
+pub(super) enum ModelStartFailure {
+    Failure(AgentFailure),
+    ContextRejected(ModelError),
+}
+
+impl From<AgentFailure> for ModelStartFailure {
+    fn from(failure: AgentFailure) -> Self {
+        Self::Failure(failure)
+    }
+}
+
 /// Opens a logical attempt through its first non-usage event. Usage snapshots
 /// are validated and retained without buffering an unbounded event prefix.
 /// Failed attempts cannot reach the Session journal or the tool executor.
@@ -18,14 +29,15 @@ pub(super) async fn start_model_with_retry(
     request: &ModelRequest,
     cancellation: CancellationToken,
     total_usage: &mut ModelUsage,
-) -> Result<StartedModelStream, AgentFailure> {
+) -> Result<StartedModelStream, ModelStartFailure> {
     let mut retry_number = 0_u32;
     loop {
         if cancellation.is_cancelled() {
             return Err(model_failure(ModelError::new(
                 ModelErrorCode::Cancelled,
                 "model request cancelled",
-            )));
+            ))
+            .into());
         }
         let attempt_cancellation = cancellation.child_token();
         let guard = attempt_cancellation.clone().drop_guard();
@@ -72,9 +84,14 @@ pub(super) async fn start_model_with_retry(
             Err(error) => error,
         };
         drop(guard);
+        // Only an explicit rejection before any usage/content is known safe
+        // to reproject. A late error cannot certify that generation was absent.
+        if error.code == ModelErrorCode::ContextLengthExceeded && usage.is_none() {
+            return Err(ModelStartFailure::ContextRejected(error));
+        }
         retry_number = match retry_number.checked_add(1) {
             Some(number) => number,
-            None => return Err(model_failure(error)),
+            None => return Err(model_failure(error).into()),
         };
         // An unobserved transport failure may already have consumed paid
         // tokens. Without usage evidence, retrying cannot preserve a strict
@@ -91,7 +108,7 @@ pub(super) async fn start_model_with_retry(
             {
                 delay
             }
-            _ => return Err(model_failure(error)),
+            _ => return Err(model_failure(error).into()),
         };
         let run_id = &run.run.spec.run_id;
         append_checkpoint(

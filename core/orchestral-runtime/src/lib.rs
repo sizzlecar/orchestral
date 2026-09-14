@@ -30,8 +30,8 @@ pub use exec_process::{
     ExecSessionStatus, ExecSpawnSpec, ExecWaitMode, ExecWaitOptions, ProcessSupervisor,
 };
 pub use generic_agent::{
-    ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider, ModelCostPolicy,
-    ModelRetryPolicy,
+    ContextRecoveryPolicy, ContinuationPolicy, GenericAgentConfig, InternalGenericAgentProvider,
+    ModelCostPolicy, ModelRetryPolicy,
 };
 pub use generic_agent_checkpoint::{
     replay_generic_agent_checkpoint, AppendGenericCheckpointOutcome, CommandCheckpoint,

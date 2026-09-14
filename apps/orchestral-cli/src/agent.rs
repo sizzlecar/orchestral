@@ -300,6 +300,7 @@ async fn build_agent_host_with_journals(
     agent_config.input_requests_enabled =
         config.agent.input_requests_enabled && local_input_available.unwrap_or(true);
     agent_config.model_retry = config.agent.model_retry.clone();
+    agent_config.context_recovery = config.agent.context_recovery.clone();
     {
         use orchestral_core::project_instructions::ProjectInstructionSource;
         use orchestral_project_instructions_fs::FileProjectInstructionSource;

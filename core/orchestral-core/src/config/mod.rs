@@ -95,6 +95,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub model_retry: crate::model_retry::ModelRetryPolicy,
     #[serde(default)]
+    pub context_recovery: crate::model_retry::ContextRecoveryPolicy,
+    #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]
     pub model_profile: Option<String>,
@@ -132,6 +134,7 @@ impl Default for AgentConfig {
             input_requests_enabled: true,
             project_instructions: Default::default(),
             model_retry: Default::default(),
+            context_recovery: Default::default(),
             backend: None,
             model_profile: None,
             model: None,
