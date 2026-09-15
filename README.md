@@ -18,7 +18,41 @@ running tests concurrently.
 [Watch the English demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 seconds · 8× speed.
 
 <details>
-<summary><strong>Run this demo: installation and startup commands</strong></summary>
+<summary><strong>Try it locally</strong></summary>
+
+Ferrum is an optional local model server for this example, not an Orchestral
+dependency. Orchestral also connects to other OpenAI-compatible providers.
+
+On macOS or Linux, install the latest releases:
+
+```sh
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+On Windows, follow the [Ferrum installation instructions](https://github.com/sizzlecar/ferrum-infer-rs#installation)
+and [Orchestral's Windows installation command](#install) below.
+Open a new terminal after installation, then start Ferrum:
+
+```sh
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF
+```
+
+Ferrum automatically selects an available backend and downloads the model and
+metadata as needed, reusing its cache on later starts. Wait for the server to be
+ready, then open another terminal in your project directory and run:
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
+```
+
+Type a task and press Enter. These defaults are a quick starting point, not a
+reproduction of the recording's three-session configuration or performance.
+
+</details>
+
+<details>
+<summary><strong>Advanced: reproduce the recording configuration</strong></summary>
 
 The recording uses an **M1 Max Mac with 32 GB unified memory**, Metal, and
 **Qwen3.5-9B Q4_K_M**. The commands below reproduce its serving settings:

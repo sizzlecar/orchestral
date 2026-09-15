@@ -17,7 +17,39 @@ Agents are the new processes. Orchestral is the runtime.
 [观看英文演示](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 秒 · 8 倍速。
 
 <details>
-<summary><strong>运行演示：安装与启动命令</strong></summary>
+<summary><strong>快速试用</strong></summary>
+
+Ferrum 只是这个示例可选的本地模型服务，不是 Orchestral 的依赖。
+Orchestral 也可以连接其他 OpenAI 兼容服务。
+
+在 macOS 或 Linux 上安装最新版本：
+
+```sh
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+Windows 请参阅 [Ferrum 安装说明](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#安装)
+和下方的 [Orchestral Windows 安装命令](#安装)。
+安装后打开新终端，启动 Ferrum：
+
+```sh
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF
+```
+
+Ferrum 会自动选择可用的后端，按需下载模型和元数据，后续启动复用缓存。
+等待服务就绪后，在另一个终端打开你的项目目录，运行：
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
+```
+
+输入任务并按 Enter 即可开始。这些默认参数用于快速试用，不代表复现录像中的三会话配置或性能。
+
+</details>
+
+<details>
+<summary><strong>高级：复现录像配置</strong></summary>
 
 视频使用 **M1 Max、32 GB 统一内存的 Mac**，通过 Metal 运行 **Qwen3.5-9B Q4_K_M**。
 以下命令采用相同的服务参数：每个上下文 24,576 token、三个活跃序列、20 GiB 运行时内存预算，
