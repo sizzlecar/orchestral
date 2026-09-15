@@ -20,6 +20,9 @@ const server = http.createServer((req, res) => {
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
+    // UI behavior must remain testable when optional remote media is unavailable.
+    // Verify public video bytes, playback and seeking against the deployed CDN separately.
+    await page.route('https://ferrum-downloads.pandaailabs.com/**', route => route.abort());
     await page.route('https://api.github.com/**', route => route.fulfill({ status: 404, body: '{}' }));
     await page.goto(url);
     await page.screenshot({ path: process.env.SITE_SCREENSHOT || '/tmp/orchestral-site-desktop.png', fullPage: true });
