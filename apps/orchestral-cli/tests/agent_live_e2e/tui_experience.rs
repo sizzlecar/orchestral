@@ -9,7 +9,7 @@ fn tui_welcome_and_editable_queue_follow_real_runtime_consumption() {
     let (endpoint, server) = spawn_fixture_http_server(vec![
         Box::new(move |_| {
             started_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            release_rx.recv_timeout(PROCESS_TIMEOUT).unwrap();
             openai_text_response("Original response completed")
         }),
         Box::new(move |request| {
@@ -25,12 +25,14 @@ fn tui_welcome_and_editable_queue_follow_real_runtime_consumption() {
         }),
     ]);
     workspace.configure_local_openai(&endpoint);
-    let mut tui = PtyHarness::spawn(local_tui_command(
-        &workspace,
-        "queue-session",
-        "Follow the user's task.",
-    ));
-    tui.resize(120, 32);
+    // Match the emulator and native console before either can emit a frame.
+    // Resizing immediately after spawning can decode ConPTY's queued 80-column
+    // startup output at 120 columns and leave stale cells in later assertions.
+    let mut tui = PtyHarness::spawn_with_size(
+        local_tui_command(&workspace, "queue-session", "Follow the user's task."),
+        120,
+        32,
+    );
     tui.wait_for_screen(
         |screen| {
             screen.contains("A runtime for reliable, interactive AI agents.")
@@ -812,12 +814,16 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
     );
     tui.send(b"\r");
     tui.wait_for_screen(
-        |s| s.contains("Skill · report-builder"),
+        |s| s.contains("Skill · report-builder") && s.contains("After restart: disabled"),
         LOCAL_PROCESS_TIMEOUT,
     );
     tui.send(b" ");
     tui.wait_for_screen(
-        |s| s.contains("This process: enabled") && !s.contains("restart pending"),
+        |s| {
+            s.contains("This process: enabled")
+                && s.contains("Space: disable for future launches")
+                && !s.contains("After restart: disabled")
+        },
         LOCAL_PROCESS_TIMEOUT,
     );
     tui.send(b"\x1b");

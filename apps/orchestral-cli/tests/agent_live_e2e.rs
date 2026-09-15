@@ -2973,7 +2973,15 @@ impl PtyOutput {
 }
 
 impl PtyHarness {
-    fn spawn(#[allow(unused_mut)] mut command: CommandBuilder) -> Self {
+    fn spawn(command: CommandBuilder) -> Self {
+        Self::spawn_with_size(command, 80, 24)
+    }
+
+    fn spawn_with_size(
+        #[allow(unused_mut)] mut command: CommandBuilder,
+        cols: u16,
+        rows: u16,
+    ) -> Self {
         #[cfg(windows)]
         {
             // portable-pty refreshes base variables from the registry. Tests
@@ -3000,8 +3008,8 @@ impl PtyHarness {
         }
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -3029,8 +3037,8 @@ impl PtyHarness {
         Self {
             started: Instant::now(),
             recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
-            max_size: (80, 24),
-            screen: vt100::Parser::new(24, 80, 0),
+            max_size: (cols, rows),
+            screen: vt100::Parser::new(rows, cols, 0),
             screen_frames: Vec::new(),
             master: pair.master,
             child,
