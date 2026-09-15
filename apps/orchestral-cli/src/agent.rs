@@ -222,7 +222,7 @@ pub(crate) struct HostMetadata {
     pub workspaces: Vec<PathBuf>,
     pub journal_location: String,
     pub context: String,
-    pub context_budget: u64,
+    pub context_budget: Option<u64>,
     pub models: Vec<ModelProfile>,
 }
 
@@ -236,7 +236,7 @@ pub struct AgentHost {
     pub model: String,
     pub workspace_root: PathBuf,
     pub execution_profile: AgentSessionExecutionProfile,
-    pub session_history: JournalSessionHistory,
+    pub session_history: crate::local_sessions::LocalSessionHistory,
     session_origin: SessionOrigin,
     pub(crate) skill_manager: SkillManager,
     controller: Arc<AgentController>,
@@ -262,7 +262,19 @@ impl AgentHost {
         )
         .await?;
         next.metadata.journal_location = self.metadata.journal_location.clone();
+        next.session_history = self.session_history.clone();
         Ok(next)
+    }
+
+    pub(crate) async fn switch_session(&self, options: &AgentRunOptions) -> anyhow::Result<Self> {
+        if matches!(
+            self.session_history,
+            crate::local_sessions::LocalSessionHistory::Single(_)
+        ) {
+            self.reconfigure(options).await
+        } else {
+            build_agent_host_with_journals(options, None, self.local_input_available).await
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -319,7 +331,11 @@ async fn build_agent_host_with_journals(
         max_tool_calls: config.agent.max_tool_calls,
     };
     agent_config.history_limit = config.agent.history_limit;
-    agent_config.max_context_tokens = config.agent.max_context_tokens;
+    let declared_context_capacity = model_backend.descriptor().capabilities.max_context_tokens;
+    agent_config.max_context_tokens = declared_context_capacity
+        .map_or(config.agent.max_context_tokens, |capacity| {
+            capacity.min(config.agent.max_context_tokens)
+        });
     agent_config.reserved_output_tokens = config.agent.reserved_output_tokens;
     agent_config.minimum_output_reserve_tokens = config.agent.minimum_output_reserve_tokens;
     if let Some(system_prompt) = options
@@ -347,6 +363,18 @@ async fn build_agent_host_with_journals(
         workspaces.primary.display(),
         workspace_context
     ));
+    let base_journal_root = std::path::PathBuf::from(&config.journal.root_dir);
+    let journal_root = if local_input_available.is_some()
+        && matches!(config.journal.backend.as_str(), "fs" | "filesystem")
+    {
+        let id = options
+            .session_id
+            .as_deref()
+            .context("local Agent requires a session identity before opening storage")?;
+        crate::local_sessions::writer_root(&base_journal_root, &AgentSessionId::new(id)).await?
+    } else {
+        base_journal_root.clone()
+    };
     let journals = if let Some(shared) = shared {
         shared
     } else {
@@ -358,10 +386,10 @@ async fn build_agent_host_with_journals(
                 checkpoint: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
             },
             "filesystem" | "fs" => {
-                let root = config.journal.root_dir.as_str();
+                let root = &journal_root;
                 let store = Arc::new(
                     FileAgentJournalStore::open_single_writer(root)
-                        .with_context(|| format!("open Agent Journal at '{root}'"))?,
+                        .with_context(|| format!("open Agent Journal at '{}'; if resuming, close the other terminal controlling this session", root.display()))?,
                 );
                 CliJournalStores {
                     run: store.clone(),
@@ -380,20 +408,25 @@ async fn build_agent_host_with_journals(
         checkpoint: generic_checkpoint_journal,
     } = journals.clone();
     let metadata = HostMetadata {
-        context_budget: config.agent.max_context_tokens,
+        context_budget: declared_context_capacity.map(|_| agent_config.max_context_tokens),
         workspaces: std::iter::once(workspaces.primary.clone()).chain(workspaces.additional.clone()).collect(),
-        journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&config.journal.root_dir)?.display().to_string() },
-        context: format!("Context budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
-            config.agent.max_context_tokens, config.agent.reserved_output_tokens,
+        journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&journal_root)?.display().to_string() },
+        context: format!("Declared model/server context limit: {}\nEffective Host budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
+            declared_context_capacity.map_or_else(|| "unknown (not reported or configured)".to_owned(), |capacity| format!("{capacity} tokens")),
+            agent_config.max_context_tokens, config.agent.reserved_output_tokens,
             if config.agent.compaction.enabled { "automatic" } else { "disabled" },
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
         models: config.providers.models.clone(),
     };
-    let session_history = JournalSessionHistory::new(
-        run_journal.clone(),
-        session_journal.clone(),
-        ProviderBindingRef::new(crate::local_sessions::GENERIC_BINDING),
-    );
+    let session_history = if matches!(config.journal.backend.as_str(), "fs" | "filesystem") {
+        crate::local_sessions::LocalSessionHistory::Directory(base_journal_root)
+    } else {
+        crate::local_sessions::LocalSessionHistory::Single(JournalSessionHistory::new(
+            run_journal.clone(),
+            session_journal.clone(),
+            ProviderBindingRef::new(crate::local_sessions::GENERIC_BINDING),
+        ))
+    };
     let mcp_configs = if options.no_mcp {
         Vec::new()
     } else {
@@ -564,7 +597,13 @@ async fn build_agent_host_with_journals(
     })
 }
 
-pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
+pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
+    let session_id = AgentSessionId::new(
+        options
+            .session_id
+            .get_or_insert_with(|| unique_id("cli-session", 0))
+            .clone(),
+    );
     let stdin_is_terminal = io::stdin().is_terminal();
     let entry_mode = select_entry_mode(
         options.input.clone(),
@@ -576,12 +615,6 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         build_agent_host_with_journals(&options, None, Some(local_input_available)).await?,
     );
     let tui_options = options.clone();
-    let session_id = AgentSessionId::new(
-        options
-            .session_id
-            .clone()
-            .unwrap_or_else(|| unique_id("cli-session", 0)),
-    );
     let client = host.client(session_id.clone());
 
     let result = async {
@@ -1575,10 +1608,7 @@ async fn resolve_model(
         .model
         .clone()
         .or_else(|| profile.as_ref().map(|profile| profile.model.clone()));
-    let model = match model {
-        Some(model) => model,
-        None => crate::openai_connection::discover_single_model(&backend).await?,
-    };
+    let (backend, model) = crate::openai_connection::resolve_model(backend, model).await?;
     let candidate = config
         .agent
         .temperature
@@ -1591,7 +1621,7 @@ async fn resolve_model(
     Ok((backend, profile, model, temperature))
 }
 
-fn build_model_backend(
+pub(crate) fn build_model_backend(
     backend: &BackendSpec,
     model: &str,
     temperature: f32,
@@ -2181,7 +2211,7 @@ mod entry_mode_tests {
     }
 
     #[test]
-    fn model_profile_tool_result_format_defaults_to_yaml_and_is_strict() {
+    fn model_profile_tool_result_format_defaults_to_text_and_is_strict() {
         let backend = serde_json::from_value(serde_json::json!({
             "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
             "config": {"auth": "none"},
@@ -2195,7 +2225,7 @@ mod entry_mode_tests {
             .unwrap()
         };
         for format in [
-            serde_json::json!("text"),
+            serde_json::json!("unsupported"),
             serde_json::json!(true),
             serde_json::Value::Null,
         ] {
@@ -2230,11 +2260,22 @@ mod entry_mode_tests {
         )
         .unwrap();
         assert_ne!(json_meter.meter_descriptor(), yaml_meter.meter_descriptor());
+        let (_, text_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&profile(serde_json::json!("text"))),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_ne!(text_meter.meter_descriptor(), yaml_meter.meter_descriptor());
+        assert_ne!(text_meter.meter_descriptor(), json_meter.meter_descriptor());
         let (_, default_meter) =
             super::build_model_backend(&backend, "local-model", 0.6, None, 8, None).unwrap();
         assert_eq!(
             default_meter.meter_descriptor(),
-            yaml_meter.meter_descriptor()
+            text_meter.meter_descriptor()
         );
         let mut omitted_format = profile(serde_json::json!("json"));
         omitted_format
@@ -2253,7 +2294,7 @@ mod entry_mode_tests {
         .unwrap();
         assert_eq!(
             omitted_meter.meter_descriptor(),
-            yaml_meter.meter_descriptor()
+            text_meter.meter_descriptor()
         );
     }
 

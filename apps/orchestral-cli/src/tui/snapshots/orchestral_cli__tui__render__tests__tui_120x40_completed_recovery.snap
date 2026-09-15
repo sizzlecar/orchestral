@@ -41,4 +41,4 @@ expression: "render_to_string(&state, 120, 40)"
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   › Ask Orchestral to do anything…
 
-  gemini-3.1-pro · context: —                                                        enter send · / commands · f1 help
+  gemini-3.1-pro · last input: unknown · limit: unknown                              enter send · / commands · f1 help

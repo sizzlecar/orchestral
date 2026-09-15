@@ -345,7 +345,8 @@ impl InternalGenericAgentProvider {
                     EffectMediation::None
                 },
             },
-            extensions: Default::default(),
+            extensions:
+                orchestral_core::agent_protocol::wire::QueuedInputOperation::descriptor_extensions(),
         })?;
         let config_digest = generic_config_digest(
             &config,

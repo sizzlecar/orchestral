@@ -261,7 +261,7 @@ fn tui_steer_interrupts_retry_backoff_and_rebuilds_the_model_context() {
     tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
     tui.send_paste("Inspect the project.");
     tui.wait_for_text("retry 1/3", LOCAL_PROCESS_TIMEOUT);
-    tui.send_paste("Focus on the parser first.");
+    tui.send(b"\x1b[200~Focus on the parser first.\x1b[201~\x1b\r");
     tui.wait_for_text("STEER_AFTER_RETRY_OK", Duration::from_secs(5));
     tui.wait_for_text("○ replied", Duration::from_secs(5));
     tui.send(&[0x04]);

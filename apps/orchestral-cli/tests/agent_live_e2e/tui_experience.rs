@@ -1,6 +1,92 @@
 use super::*;
 
 #[test]
+fn tui_welcome_and_editable_queue_follow_real_runtime_consumption() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("tui-input-queue");
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(PROCESS_TIMEOUT).unwrap();
+            openai_text_response("Original response completed")
+        }),
+        Box::new(move |request| {
+            let text = model_request_text(&request.body);
+            assert!(text.contains("Revised queued requirement"), "{text}");
+            assert!(!text.contains("Original queued requirement"), "{text}");
+            assert!(text.contains("Original response completed"), "{text}");
+            let usage = json!({"choices": [], "usage": {"prompt_tokens": 123, "completion_tokens": 2, "total_tokens": 125}});
+            let answer = json!({"choices": [{"delta": {"content": "Queued requirement received"}, "finish_reason": "stop"}]});
+            sse_response(format!(
+                "data: {usage}\n\ndata: {answer}\n\ndata: [DONE]\n\n"
+            ))
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    // Match the emulator and native console before either can emit a frame.
+    // Resizing immediately after spawning can decode ConPTY's queued 80-column
+    // startup output at 120 columns and leave stale cells in later assertions.
+    let mut tui = PtyHarness::spawn_with_size(
+        local_tui_command(&workspace, "queue-session", "Follow the user's task."),
+        120,
+        32,
+    );
+    tui.wait_for_screen(
+        |screen| {
+            screen.contains("A runtime for reliable, interactive AI agents.")
+                && screen.contains(env!("CARGO_PKG_VERSION"))
+                && screen.contains("fixture-model")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("Inspect this project");
+    started_rx.recv_timeout(LOCAL_PROCESS_TIMEOUT).unwrap();
+    tui.send_paste("Original queued requirement");
+    tui.wait_for_screen(
+        |screen| screen.contains("Queued 1") && screen.contains("Original queued requirement"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("/queue");
+    tui.wait_for_screen(
+        |screen| screen.contains("Pending messages"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\r");
+    tui.wait_for_screen(
+        |screen| screen.contains("esc discard edit"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\x01\x0bRevised queued requirement\r");
+    tui.wait_for_screen(
+        |screen| {
+            screen.contains("Queued 1")
+                && screen.contains("Revised queued requirement")
+                && !screen.contains("Original queued requirement")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    release_tx.send(()).unwrap();
+    tui.wait_for_screen(
+        |screen| {
+            screen.contains("replied")
+                && screen.contains("Queued requirement received")
+                && screen.contains("last input: 123")
+                && !screen.contains("Queued 1")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    output.assert_terminal_restored();
+    assert_eq!(server.join().unwrap().len(), 2);
+    assert_eq!(run_payload_count(&workspace, "input_committed"), 1);
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+}
+
+#[test]
 #[ignore = "spends real Google Vertex quota; requires ADC or a service-account credential"]
 fn live_tui_repairs_rust_and_continues_after_session_selection() {
     let _guard = live_test_guard();
@@ -670,7 +756,10 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
     );
     assert!(!list.contains("DESCRIPTION_END"));
     assert!(!list.contains("SKILL.md"));
-    assert!(!list.contains(workspace.root.to_str().unwrap()));
+    // The welcome view above the menu intentionally shows the workspace.
+    // Skill source paths belong in details, not in the catalog itself.
+    let catalog = list.split_once("Skills · this workspace").unwrap().1;
+    assert!(!catalog.contains(workspace.root.to_str().unwrap()));
     let description_row = list
         .lines()
         .position(|line| line.contains("Prepare reports."))
@@ -725,19 +814,30 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
     );
     tui.send(b"\r");
     tui.wait_for_screen(
-        |s| s.contains("Skill · report-builder"),
+        |s| s.contains("Skill · report-builder") && s.contains("After restart: disabled"),
         LOCAL_PROCESS_TIMEOUT,
     );
     tui.send(b" ");
     tui.wait_for_screen(
-        |s| s.contains("This process: enabled") && !s.contains("restart pending"),
+        |s| {
+            s.contains("This process: enabled")
+                && s.contains("Space: disable for future launches")
+                && !s.contains("After restart: disabled")
+        },
         LOCAL_PROCESS_TIMEOUT,
     );
     tui.send(b"\x1b");
     tui.wait_for_screen(|s| s.contains("Filter: report"), LOCAL_PROCESS_TIMEOUT);
     tui.send(b"\x1b");
     let closed = tui.wait_for_screen(
-        |s| s.contains("Ask Orchestral") && !s.contains("Filter:"),
+        // PTY reads can split the redraw after the filter has cleared but
+        // before the remaining catalog rows are erased.
+        |s| {
+            s.contains("Ask Orchestral")
+                && !s.contains("Filter:")
+                && !s.contains("Prepare reports.")
+                && !s.contains("report-builder")
+        },
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(!closed.contains("Prepare reports."));

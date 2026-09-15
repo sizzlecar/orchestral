@@ -1,6 +1,126 @@
 use super::*;
 use orchestral_core::model_protocol::ModelErrorCode;
 
+struct OutputCapacityModel(Mutex<Vec<ModelRequest>>);
+
+#[async_trait]
+impl ModelBackend for OutputCapacityModel {
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            backend_id: "output-capacity".to_owned(),
+            capabilities: ModelCapabilities {
+                streaming: true,
+                ..Default::default()
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _: CancellationToken,
+    ) -> Result<ModelStream, ModelError> {
+        self.0.lock().unwrap().push(request.clone());
+        if request.max_output_tokens.unwrap() > 4096 {
+            return Err(ModelError::new(
+                ModelErrorCode::ContextLengthExceeded,
+                "input plus output exceeds capacity",
+            ));
+        }
+        Ok(stream::iter(
+            [
+                ModelEvent::TextDelta {
+                    delta: "Connected".to_owned(),
+                },
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            .map(move |(index, payload)| {
+                Ok(ModelStreamEvent {
+                    request_id: request.request_id.clone(),
+                    event_id: ModelEventId::new(format!("output-capacity-{index}")),
+                    sequence: index as u64 + 1,
+                    payload,
+                })
+            }),
+        )
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn first_turn_capacity_rejection_reduces_output_without_discarding_pinned_input() {
+    let model = Arc::new(OutputCapacityModel(Mutex::new(Vec::new())));
+    let checkpoints = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let mut config = GenericAgentConfig::new("capacity-provider", "capacity-agent");
+    config.reserved_output_tokens = 8192;
+    let provider = InternalGenericAgentProvider::new_with_session_journal(
+        model.clone(),
+        config,
+        Arc::new(InMemoryAgentSessionJournalStore::default()),
+        Arc::new(CapacityTokenMeter(5000)),
+    )
+    .unwrap()
+    .with_checkpoint_store(checkpoints.clone())
+    .unwrap();
+    let controller = Arc::new(
+        AgentController::new(
+            Arc::new(provider),
+            ProviderBindingRef::new("capacity-binding"),
+        )
+        .unwrap(),
+    );
+    let run = AgentRunEnvelope::new(
+        AGENT_PROTOCOL_V1,
+        AgentSessionId::new("first-turn"),
+        RunId::new("first-turn"),
+        vec![Content::text("Hello")],
+    )
+    .unwrap();
+    let run_id = run.spec.run_id.clone();
+    controller.start(run).await.unwrap();
+    let view = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        controller.wait_for_terminal(&run_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.state.status(), AgentRunStatus::Delivered);
+    let requests = model.0.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_output_tokens, Some(8192));
+    assert_eq!(requests[1].max_output_tokens, Some(4096));
+    assert_eq!(requests[0].messages, requests[1].messages);
+    let stored = checkpoints.load_run(&run_id).unwrap().unwrap();
+    let recovery = stored.validate().unwrap().context_recovery.unwrap();
+    assert_eq!(recovery.output_budget_tokens, Some(4096));
+    assert_eq!(recovery.retry_number, 0);
+    assert!(!recovery.compact_input);
+    // The rejection boundary itself must be sufficient to restore the cap,
+    // before any successful generation resets its retry count.
+    let mut cut = stored.clone();
+    let rejected = cut
+        .records
+        .iter()
+        .position(|record| {
+            matches!(
+                record.payload,
+                GenericCheckpointEvent::ModelContextRejected { .. }
+            )
+        })
+        .unwrap();
+    cut.records.truncate(rejected + 1);
+    let restored = cut.validate().unwrap().context_recovery.unwrap();
+    assert_eq!(restored.output_budget_tokens, Some(4096));
+    assert_eq!(restored.retry_number, 1);
+    assert!(!restored.compact_input);
+}
+
 #[derive(Clone, Copy)]
 enum Rejection {
     BeforeGeneration,
@@ -182,11 +302,24 @@ impl ModelBackend for CapacityModel {
 }
 
 #[derive(Default)]
-struct RejectionAckLostStore {
+pub(super) struct RejectionAckLostStore {
     inner: InMemoryGenericAgentCheckpointStore,
     cut_after_observation: bool,
     cut_once: AtomicBool,
     unavailable: AtomicBool,
+}
+
+impl RejectionAckLostStore {
+    pub(super) fn after_observation() -> Self {
+        Self {
+            cut_after_observation: true,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn resume(&self) {
+        self.unavailable.store(false, Ordering::SeqCst);
+    }
 }
 
 impl GenericAgentCheckpointStore for RejectionAckLostStore {

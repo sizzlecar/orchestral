@@ -217,7 +217,7 @@ impl AgentSessionContextEngine {
                     .or_insert_with(|| MessageGroup {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
-                        source: single_range(record.session_seq),
+                        source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![message.clone()],
                         pinned: false,
@@ -289,23 +289,25 @@ impl AgentSessionContextEngine {
             // Provenance is a partition of source records. An original User
             // anchor restored from a summary must not also appear in that
             // summary's included/deferred range in the durable model trace.
-            if let Some(anchor) = retained_anchor
-                .filter(|anchor| group.key != *anchor && group.source.contains(*anchor))
-            {
-                if group.source.first_session_seq < anchor {
-                    destination.push(SessionSourceRange {
-                        first_session_seq: group.source.first_session_seq,
-                        last_session_seq: anchor - 1,
-                    });
+            for source in &group.source_ranges {
+                if let Some(anchor) = retained_anchor
+                    .filter(|anchor| group.key != *anchor && source.contains(*anchor))
+                {
+                    if source.first_session_seq < anchor {
+                        destination.push(SessionSourceRange {
+                            first_session_seq: source.first_session_seq,
+                            last_session_seq: anchor - 1,
+                        });
+                    }
+                    if source.last_session_seq > anchor {
+                        destination.push(SessionSourceRange {
+                            first_session_seq: anchor + 1,
+                            last_session_seq: source.last_session_seq,
+                        });
+                    }
+                } else {
+                    destination.push(source.clone());
                 }
-                if group.source.last_session_seq > anchor {
-                    destination.push(SessionSourceRange {
-                        first_session_seq: anchor + 1,
-                        last_session_seq: group.source.last_session_seq,
-                    });
-                }
-            } else {
-                destination.push(group.source.clone());
             }
         }
         Ok(SessionContextProjection {
@@ -358,7 +360,10 @@ struct MessageGroup {
     /// compaction shadows producer records, not the older records summarized
     /// by those producers.
     producer_seq: u64,
-    source: SessionSourceRange,
+    /// Live producer records consumed by this group. A compaction range can
+    /// contain shadowed records whose live replacement survives elsewhere;
+    /// those gaps must not be claimed as this group's provenance.
+    source_ranges: Vec<SessionSourceRange>,
     /// Extent of the original history represented by this group, including
     /// transitive summary sources. Producer order remains the durable identity
     /// and history-selection order; this range controls new summary placement.
@@ -385,7 +390,7 @@ fn replay_groups(
                     MessageGroup {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
-                        source: single_range(record.session_seq),
+                        source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![message.clone()],
                         pinned: record.run_id == *current_run_id,
@@ -404,7 +409,7 @@ fn replay_groups(
                     MessageGroup {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
-                        source: single_range(record.session_seq),
+                        source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![assistant.clone(), tool.clone()],
                         pinned: record.run_id == *current_run_id || !retained_artifacts.is_empty(),
@@ -423,7 +428,7 @@ fn replay_groups(
                     MessageGroup {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
-                        source: single_range(record.session_seq),
+                        source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![effect_uncertainty_message(
                             effect_call_id,
@@ -442,7 +447,7 @@ fn replay_groups(
                     MessageGroup {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
-                        source: single_range(record.session_seq),
+                        source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![message.clone()],
                         pinned: record.run_id == *current_run_id,
@@ -481,7 +486,7 @@ fn replay_groups(
                     MessageGroup {
                         key: record.session_seq,
                         producer_seq: record.session_seq,
-                        source: single_range(record.session_seq),
+                        source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![skill_load_message(load)],
                         // Current-Run instructions stay pinned for recovery

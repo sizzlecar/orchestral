@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context};
 use orchestral_core::config::BackendSpec;
-use orchestral_model_openai::{discover_models, OpenAiEndpoint};
+use orchestral_model_openai::{discover_model_metadata, DiscoveredModel, OpenAiEndpoint};
 
 pub(crate) fn api_key(backend: &BackendSpec) -> anyhow::Result<String> {
     match backend
@@ -32,12 +32,28 @@ pub(crate) fn api_key(backend: &BackendSpec) -> anyhow::Result<String> {
     }
 }
 
-pub(crate) async fn discover_single_model(backend: &BackendSpec) -> anyhow::Result<String> {
+pub(crate) async fn resolve_model(
+    mut backend: BackendSpec,
+    configured_model: Option<String>,
+) -> anyhow::Result<(BackendSpec, String)> {
     if !matches!(
-        backend.kind.to_ascii_lowercase().as_str(),
+        backend.kind.trim().to_ascii_lowercase().as_str(),
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral"
     ) {
-        bail!("no model configured; use --model MODEL or --model-profile PROFILE");
+        return Ok((
+            backend,
+            configured_model
+                .context("no model configured; use --model MODEL or --model-profile PROFILE")?,
+        ));
+    }
+    let enabled = backend
+        .get_config::<bool>("discover_model_capabilities")
+        .unwrap_or(true);
+    if let Some(model) = configured_model
+        .as_ref()
+        .filter(|_| backend.endpoint.is_none() || !enabled)
+    {
+        return Ok((backend, model.clone()));
     }
     let endpoint = OpenAiEndpoint::parse(
         backend
@@ -45,17 +61,141 @@ pub(crate) async fn discover_single_model(backend: &BackendSpec) -> anyhow::Resu
             .as_deref()
             .context("model discovery requires an endpoint; use --model MODEL")?,
     )?;
-    let models = discover_models(&endpoint, &api_key(backend)?)
+    let key = api_key(&backend)?;
+    // Selecting an explicit model must remain usable with servers that only
+    // implement completions. Optional discovery has a short, bounded wait.
+    let discovery = if configured_model.is_some() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            discover_model_metadata(&endpoint, &key),
+        )
         .await
-        .map_err(anyhow::Error::msg)?;
-    match models.as_slice() {
+        .unwrap_or_else(|_| Err("optional model capacity discovery timed out".to_owned()))
+    } else {
+        discover_model_metadata(&endpoint, &key).await
+    };
+    let models = match discovery {
+        Ok(models) => models,
+        Err(error) if configured_model.is_some() => {
+            tracing::debug!(%error, "model capacity was not discovered; retaining configured budget");
+            return Ok((backend, configured_model.expect("model checked")));
+        }
+        Err(error) => return Err(anyhow::Error::msg(error)),
+    };
+    let model = match configured_model {
+        Some(id) => models
+            .iter()
+            .find(|model| model.id == id)
+            .cloned()
+            .unwrap_or(DiscoveredModel {
+                id,
+                max_context_tokens: None,
+            }),
+        None => select_single_model(&models)?,
+    };
+    apply_capacity(&mut backend, model.max_context_tokens);
+    Ok((backend, model.id))
+}
+
+fn select_single_model(models: &[DiscoveredModel]) -> anyhow::Result<DiscoveredModel> {
+    match models {
         [model] => Ok(model.clone()),
         [] => {
             bail!("the server has no models loaded; load a model, then retry or pass --model MODEL")
         }
         _ => bail!(
             "the server offers multiple models; select one with --model MODEL. Available: {}",
-            models.join(", ")
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
+    }
+}
+
+fn apply_capacity(backend: &mut BackendSpec, discovered: Option<u64>) {
+    let Some(capacity) = discovered else {
+        return;
+    };
+    let effective = backend
+        .get_config::<u64>("max_context_tokens")
+        .map_or(capacity, |configured| configured.min(capacity));
+    if backend.config.is_null() {
+        backend.config = serde_json::json!({});
+    }
+    if let Some(config) = backend.config.as_object_mut() {
+        config.insert("max_context_tokens".to_owned(), effective.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn both_explicit_and_automatic_model_selection_use_served_capacity() {
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data":[{"id":"served","max_model_len":12288}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for configured in [None, Some("served".to_owned())] {
+            let backend = BackendSpec {
+                name: "local".into(),
+                kind: "openai".into(),
+                endpoint: Some(endpoint.clone()),
+                api_key_env: None,
+                config: serde_json::json!({"auth":"none"}),
+            };
+            let (backend, model) = resolve_model(backend, configured).await.unwrap();
+            assert_eq!(model, "served");
+            assert_eq!(backend.get_config::<u64>("max_context_tokens"), Some(12288));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_model_survives_an_endpoint_without_discovery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, axum::Router::new()).await.unwrap() });
+        let backend = BackendSpec {
+            name: "local".into(),
+            kind: "openai".into(),
+            endpoint: Some(endpoint),
+            api_key_env: None,
+            config: serde_json::json!({"auth":"none"}),
+        };
+        let (backend, model) = resolve_model(backend, Some("explicit".into()))
+            .await
+            .unwrap();
+        assert_eq!(model, "explicit");
+        assert_eq!(backend.get_config::<u64>("max_context_tokens"), None);
+        server.abort();
+    }
+
+    #[test]
+    fn discovery_can_only_tighten_a_configured_capacity() {
+        let mut backend = BackendSpec {
+            name: "test".to_owned(),
+            kind: "openai".to_owned(),
+            endpoint: None,
+            api_key_env: None,
+            config: serde_json::Value::Null,
+        };
+        apply_capacity(&mut backend, None);
+        assert_eq!(backend.get_config::<u64>("max_context_tokens"), None);
+        apply_capacity(&mut backend, Some(8192));
+        assert_eq!(backend.get_config::<u64>("max_context_tokens"), Some(8192));
+        apply_capacity(&mut backend, Some(16384));
+        assert_eq!(backend.get_config::<u64>("max_context_tokens"), Some(8192));
+        apply_capacity(&mut backend, Some(4096));
+        assert_eq!(backend.get_config::<u64>("max_context_tokens"), Some(4096));
     }
 }

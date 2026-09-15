@@ -1,8 +1,29 @@
 # Changelog
 
-## [0.3.0]
+## [0.3.1]
+
+The v0.3.0 tag remains an unpublished candidate; v0.3.1 includes the changes below.
 
 Pre-1.0 Agent Foundation release, replacing the workflow-first architecture in 0.2.
+
+### Compatibility
+
+- Updated the transitive ChaCha20 dependency to 0.10.2 so the Google Cloud authentication RNG's SSE2 path does not require SSE4.1 instructions on older x86 processors.
+
+### Local startup and interaction
+
+- Independent CLI sessions can run in the same workspace while retaining exclusive control of each conversation and read-only access to legacy history.
+- Context-capacity recovery can reduce output reservation without discarding required first-turn instructions; the reduced budget survives checkpoint recovery.
+- After an output-only capacity retry succeeds, new tool observations can use the released context space. Input ceilings learned from input reduction and cumulative Run limits remain enforced.
+- Accepted Host cancellation takes precedence when a model stream concurrently returns an error, EOF, or completion.
+- `doctor` validates model profile options through the same adapter construction as startup.
+- `file_edit` supports atomic batches of independent edits to one file.
+- OpenAI-compatible tool results default to a single string with typed metadata and verbatim fenced multiline fields, avoiding YAML presentation indentation in source text. Explicit JSON, YAML, and text-part array encodings remain available; encoding changes invalidate unfinished Run recovery identity.
+- Generated configuration is published atomically and isolated by content, preventing concurrent terminals from reading partial configuration or overwriting each other's model connection.
+- Nested context compaction records the live source intervals it consumed, keeping checkpoint provenance disjoint when newer summaries have replaced older records.
+- Model discovery uses declared serving capacity to bound context planning. The TUI distinguishes estimated and reported input tokens, preserves unknown limits, and clears stale recovery and acceptance messages on progress.
+- Empty TUI sessions show the Orchestral logo, running version, selected model, and workspace.
+- During a run, Enter queues input for the next model call. `/queue` edits or withdraws pending messages; Alt+Enter explicitly interrupts generation to steer. Queue commands and consumption survive journal replay.
 
 ### Breaking changes and upgrade notes
 

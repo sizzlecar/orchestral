@@ -7,6 +7,8 @@ impl InternalGenericAgentProvider {
         command: AgentCommandEnvelope,
     ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
         command.verify_digest()?;
+        use orchestral_core::agent_protocol::wire::QueuedInputOperation;
+        let queue_operation = QueuedInputOperation::from_command(&command)?;
         let approval_bridge = self
             .inner
             .tools
@@ -105,6 +107,47 @@ impl InternalGenericAgentProvider {
                     );
                 }
                 AgentCommand::Steer { content } => {
+                    if let Some(
+                        QueuedInputOperation::Replace { target }
+                        | QueuedInputOperation::Withdraw { target },
+                    ) = &queue_operation
+                    {
+                        let Some(index) = run
+                            .queued_steers
+                            .iter()
+                            .position(|steer| steer.deferred && &steer.command_id == target)
+                        else {
+                            return record_command(&self.inner, run, &command, ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::InvalidTransition,
+                                message: "This message has already been consumed or withdrawn; it can no longer be edited in the queue".to_owned(),
+                            });
+                        };
+                        let replacement = if matches!(
+                            &queue_operation,
+                            Some(QueuedInputOperation::Replace { .. })
+                        ) {
+                            Some(agent_content_message(content)?)
+                        } else {
+                            None
+                        };
+                        let disposition = record_command(
+                            &self.inner,
+                            run,
+                            &command,
+                            ProviderCommandOutcome::Accepted,
+                        )?;
+                        if let Some(message) = replacement {
+                            run.queued_steers[index] = QueuedSteer {
+                                command_id: command.command_id.clone(),
+                                content: content.clone(),
+                                message,
+                                deferred: true,
+                            };
+                        } else {
+                            run.queued_steers.remove(index);
+                        }
+                        return Ok(disposition);
+                    }
                     let message = match agent_content_message(content) {
                         Ok(message) => message,
                         Err(error) => {
@@ -140,7 +183,11 @@ impl InternalGenericAgentProvider {
                         command_id: command.command_id.clone(),
                         content: content.clone(),
                         message,
+                        deferred: queue_operation.is_some(),
                     });
+                    if queue_operation.is_some() {
+                        return Ok(disposition);
+                    }
                     let signal = run.steer_signal.clone();
                     drop(state);
                     signal.send_modify(|generation| {

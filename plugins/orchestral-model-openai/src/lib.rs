@@ -2,7 +2,7 @@
 
 mod continuation;
 mod endpoint;
-pub use endpoint::{discover_models, OpenAiEndpoint};
+pub use endpoint::{discover_model_metadata, discover_models, DiscoveredModel, OpenAiEndpoint};
 mod sampling;
 pub use sampling::OpenAiSamplingConfig;
 mod tool_result;
@@ -218,6 +218,11 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
         );
         // Bind both the encoding and opt-in observed-prefix planning semantics.
         let (strategy, version, config) = match self.tool_result_format {
+            OpenAiToolResultFormat::Text => (
+                "openai-compatible/wire-json-text-tool-upper-bound",
+                "1",
+                serde_json::to_vec(&(config, tool_result::TEXT_ENCODING_IDENTITY)),
+            ),
             OpenAiToolResultFormat::Json => (
                 "openai-compatible/wire-json-upper-bound",
                 "3",
@@ -282,6 +287,7 @@ impl ModelBackend for OpenAiCompatibleBackend {
             Value::String(continuation::NAMESPACE.to_owned()),
         );
         let encoding_identity = match self.tool_result_format {
+            OpenAiToolResultFormat::Text => Some(tool_result::TEXT_ENCODING_IDENTITY),
             OpenAiToolResultFormat::Json => None,
             OpenAiToolResultFormat::Yaml => Some(tool_result::YAML_ENCODING_IDENTITY),
             OpenAiToolResultFormat::TextParts => Some(tool_result::TEXT_PARTS_ENCODING_IDENTITY),

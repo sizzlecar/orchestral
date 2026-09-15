@@ -66,10 +66,24 @@ pub(super) fn summary_group(
     let logical_source = source_extent(groups, source).ok_or_else(|| {
         SessionContextError::Compaction("summary source has no live Context groups".to_owned())
     })?;
+    let mut source_ranges: Vec<SessionSourceRange> = Vec::new();
+    for producer in groups
+        .values()
+        .filter(|group| source.contains(group.producer_seq))
+    {
+        if let Some(last) = source_ranges
+            .last_mut()
+            .filter(|last| last.last_session_seq.checked_add(1) == Some(producer.producer_seq))
+        {
+            last.last_session_seq = producer.producer_seq;
+        } else {
+            source_ranges.push(single_range(producer.producer_seq));
+        }
+    }
     Ok(MessageGroup {
         key: producer_seq,
         producer_seq,
-        source: source.clone(),
+        source_ranges,
         logical_source,
         messages: vec![summary.clone()],
         pinned,

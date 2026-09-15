@@ -13,7 +13,7 @@ fn last_result(request: &CapturedHttpRequest) -> Value {
         .rev()
         .find(|message| message["role"] == "tool")
         .expect("model receives the committed Tool result");
-    let envelope: Value = serde_yaml::from_str(message["content"].as_str().unwrap()).unwrap();
+    let envelope = tool_content::decode_tool_envelope(message["content"].as_str().unwrap());
     assert_eq!(envelope["is_error"], false, "{envelope}");
     envelope["result"].clone()
 }

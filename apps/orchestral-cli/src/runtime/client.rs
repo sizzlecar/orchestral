@@ -1,6 +1,7 @@
 //! CLI configuration resolution shared by the Agent entry point.
 
 mod config;
+mod config_storage;
 
 pub(crate) use config::inspect_runtime_config;
 pub(crate) use config::prepare_runtime_config_path;

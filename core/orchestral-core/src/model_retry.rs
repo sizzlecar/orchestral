@@ -5,19 +5,25 @@ use serde::{Deserialize, Serialize};
 use crate::model_protocol::{ModelError, ModelErrorCode};
 
 /// Recovery after a definite context-capacity rejection, separate from
-/// transport retries. Each recovery targets half the rejected input's planning
-/// size while allowing required context within a strictly smaller retry ceiling.
-/// It reprojects/compacts whole exchanges. Zero disables recovery.
+/// transport retries. Recovery first reduces output reservation to its floor,
+/// then reprojects/compacts whole exchanges under a smaller input ceiling.
+/// Zero disables recovery.
 /// Rejections consume model steps; successful generation resets this count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextRecoveryPolicy {
     pub max_retries: u32,
+    /// After a definite capacity rejection, reduce output reservation before
+    /// compacting input. None preserves the configured output reservation.
+    pub minimum_output_tokens: Option<std::num::NonZeroU64>,
 }
 
 impl Default for ContextRecoveryPolicy {
     fn default() -> Self {
-        Self { max_retries: 1 }
+        Self {
+            max_retries: 1,
+            minimum_output_tokens: std::num::NonZeroU64::new(1024),
+        }
     }
 }
 

@@ -122,6 +122,78 @@ fn saved_summary(record: &AgentSessionRecord) -> ModelMessage {
 }
 
 #[tokio::test]
+async fn recompaction_across_a_shadowed_producer_keeps_checkpoint_ranges_disjoint() {
+    let fixture = Fixture::new();
+    append_input(&fixture.store, 1, "current", "Inspect the state".into()).await;
+    for i in 1..=4 {
+        append_tool_exchange(&fixture.store, i, "current", 64).await;
+    }
+    let first = fixture
+        .append_summary(
+            SessionSourceRange {
+                first_session_seq: 2,
+                last_session_seq: 3,
+            },
+            ModelRole::Assistant,
+        )
+        .await;
+    append_tool_exchange(&fixture.store, 5, "current", 64).await;
+    let nested = fixture
+        .append_summary(single_range(first.session_seq), ModelRole::Assistant)
+        .await;
+    let spanning = fixture
+        .append_summary(
+            SessionSourceRange {
+                first_session_seq: 4,
+                last_session_seq: 7,
+            },
+            ModelRole::Assistant,
+        )
+        .await;
+
+    for fixture in [fixture.restart().await, fixture] {
+        let projected = fixture
+            .engine()
+            .project(fixture.request(50_000))
+            .await
+            .unwrap();
+        assert!(projected.messages.contains(&saved_summary(&nested)));
+        assert!(projected.messages.contains(&saved_summary(&spanning)));
+        let trace = crate::generic_agent_checkpoint::GenericModelContextTrace {
+            through_session_seq: projected.through_session_seq,
+            included_ranges: projected.included_ranges.clone(),
+            deferred_ranges: projected.deferred_ranges.clone(),
+            config_digest: projected.config_digest.clone(),
+            history_limit: 100,
+            used_input_tokens: projected.used_input_tokens,
+            context_estimate: projected.context_estimate.clone(),
+            planning: projected.planning.clone(),
+            input_budget_tokens: projected.input_budget_tokens,
+        };
+        trace
+            .validate()
+            .expect("valid nested summaries must produce a valid durable model trace");
+        assert!(trace
+            .included_ranges
+            .contains(&single_range(first.session_seq)));
+        assert!(trace.included_ranges.contains(&SessionSourceRange {
+            first_session_seq: 4,
+            last_session_seq: 5
+        }));
+        assert!(trace.included_ranges.contains(&single_range(7)));
+        let earlier = fixture
+            .engine()
+            .project(SessionContextRequest {
+                through_session_seq: Some(nested.session_seq),
+                ..fixture.request(50_000)
+            })
+            .await
+            .unwrap();
+        assert!(earlier.included_ranges.contains(&single_range(4)));
+    }
+}
+
+#[tokio::test]
 async fn legacy_system_summary_keeps_its_projection_and_historical_cursor() {
     let fixture = Fixture::new();
     append_input(&fixture.store, 1, "current", "Inspect the state".into()).await;

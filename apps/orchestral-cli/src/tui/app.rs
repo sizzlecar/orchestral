@@ -55,7 +55,8 @@ pub(crate) async fn run_tui(
         .unwrap_or(host.workspace_root.as_os_str())
         .to_string_lossy()
         .into_owned();
-    state.context_budget = Some(host.metadata.context_budget);
+    state.context_budget = host.metadata.context_budget;
+    state.workspace_path = host.workspace_root.display().to_string();
     state.color_enabled = std::env::var_os("NO_COLOR").is_none();
     let mut drafts = std::collections::BTreeMap::new();
     let (service_tx, mut service_rx) = mpsc::unbounded_channel();
@@ -67,6 +68,9 @@ pub(crate) async fn run_tui(
     let mut file_refresh_tick = tokio::time::interval(FILE_REFRESH_INTERVAL);
     file_refresh_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Some(history) = &resume.history {
+        for record in history.runs.iter().flat_map(|run| &run.records) {
+            state.input_queue.observe(record);
+        }
         state.session_title = history.summary.title.clone();
         state.transcript = super::history_entries(history);
         for entry in &state.transcript {
@@ -153,7 +157,7 @@ pub(crate) async fn run_tui(
                         needs_redraw = true;
                         continue;
                     }
-                    if matches!(message, UiMsg::Submit) && state.menu.is_none() {
+                    if matches!(message, UiMsg::Submit | UiMsg::SubmitImmediately) && state.menu.is_none() {
                         if let Err(error) = super::menu::validate_references(&state.references, &state.composer) {
                             state.ui_notice = Some(error.to_string()); needs_redraw = true; continue;
                         }
@@ -161,7 +165,9 @@ pub(crate) async fn run_tui(
                     let effects = update(&mut state, message);
                     let mut execution = Vec::new();
                     for effect in effects {
-                        if matches!(&effect, UiEffect::MenuChoice { kind: super::menu::MenuKind::Commands, value } if value == "/quit") {
+                        if let Some(queue_effects) = super::input_queue::route_effect(&effect, &mut state) {
+                            execution.extend(queue_effects);
+                        } else if matches!(&effect, UiEffect::MenuChoice { kind: super::menu::MenuKind::Commands, value } if value == "/quit") {
                             service_tasks.cancel_read(&mut state);
                             execution.extend(update(&mut state, UiMsg::Quit));
                         } else if !service_tasks.dispatch(&effect, host.clone(), options.clone(), &mut state) { execution.push(effect); }
@@ -204,22 +210,34 @@ pub(crate) async fn run_tui(
                         process_events = process_supervisor.subscribe();
                         process_events_open = true;
                         state.model = host.model.clone();
-                        state.context_budget = Some(host.metadata.context_budget);
+                        state.context_budget = host.metadata.context_budget;
+                        state.context_input_tokens = None;
                         state.ui_notice = Some("Model selected for the next request".to_owned());
                     }
-                    Ok(super::services::Response::Session { client: next, history, run }) => {
+                    Ok(super::services::Response::Session { host: next_host, options: next_options, client: next, history, run }) => {
+                        if !Arc::ptr_eq(host, &next_host) {
+                            let old = std::mem::replace(host, next_host);
+                            service_tasks.cleanup.push(tokio::spawn(async move { old.shutdown().await; }));
+                        }
+                        options = *next_options;
+                        approval_broker = host.approvals.clone();
+                        process_supervisor = host.process_supervisor.clone();
+                        process_events = process_supervisor.subscribe();
+                        process_events_open = true;
                         drafts.insert(state.session_id.clone(), (state.composer.clone(), state.composer_cursor, state.references.clone()));
                         let mut next_state = UiState::new(next.session_id().as_str(), host.model.clone());
                         next_state.terminal_size = state.terminal_size;
                         next_state.exit_requested = state.exit_requested;
-                        next_state.context_budget = Some(host.metadata.context_budget);
+                        next_state.context_budget = host.metadata.context_budget;
                         next_state.project = state.project.clone();
+                        next_state.workspace_path = host.workspace_root.display().to_string();
                         next_state.files = state.files.clone(); next_state.files_loaded = state.files_loaded;
                         next_state.theme = state.theme.clone(); next_state.color_enabled = state.color_enabled;
                         if let Some((text, cursor, references)) = drafts.remove(next.session_id().as_str()) {
                             next_state.composer = text; next_state.composer_cursor = cursor; next_state.references = references;
                         }
                         if let Some(history) = &history {
+                            for record in history.runs.iter().flat_map(|run| &run.records) { next_state.input_queue.observe(record); }
                             next_state.session_title = history.summary.title.clone();
                             next_state.transcript = super::history_entries(history);
                             for entry in &next_state.transcript { if entry.role == super::state::TranscriptRole::User { next_state.input_history.push(&entry.text); } }
@@ -417,6 +435,7 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
     }
     if key.modifiers.contains(KeyModifiers::ALT) {
         return match key.code {
+            KeyCode::Enter => Some(UiMsg::SubmitImmediately),
             KeyCode::Char('b') | KeyCode::Left => Some(UiMsg::Edit(Edit::WordLeft)),
             KeyCode::Char('f') | KeyCode::Right => Some(UiMsg::Edit(Edit::WordRight)),
             KeyCode::Backspace => Some(UiMsg::Edit(Edit::DeleteWord)),
@@ -575,6 +594,54 @@ async fn execute_effects(
                         }
                     }
                 } else {
+                    restore_submission(state, &input);
+                }
+            }
+            UiEffect::QueueInput {
+                run_id,
+                command_id,
+                input,
+                operation,
+            } => {
+                let editing = matches!(
+                    operation,
+                    orchestral_core::agent_protocol::wire::QueuedInputOperation::Replace { .. }
+                );
+                let withdrawing = matches!(
+                    operation,
+                    orchestral_core::agent_protocol::wire::QueuedInputOperation::Withdraw { .. }
+                );
+                if let Some(run) = matching_active(active, &run_id, state) {
+                    let command = operation.command(
+                        CommandId::new(command_id),
+                        run.handle.run_id().clone(),
+                        vec![Content::text(input.clone())],
+                    )?;
+                    match run.handle.command(command).await {
+                        Ok(ack) => {
+                            if matches!(
+                                ack.state,
+                                CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
+                            ) {
+                                if editing {
+                                    super::input_queue::finish_edit(state);
+                                }
+                            } else if !withdrawing {
+                                super::input_queue::detach_edit(state);
+                                restore_submission(state, &input);
+                            }
+                            project_ack(state, ack, "queued input");
+                        }
+                        Err(error) => {
+                            if !withdrawing {
+                                super::input_queue::detach_edit(state);
+                                restore_submission(state, &input);
+                            }
+                            notice(state, "queue-error", error.to_string(), true);
+                        }
+                    }
+                } else if !withdrawing {
+                    super::input_queue::detach_edit(state);
                     restore_submission(state, &input);
                 }
             }
@@ -915,6 +982,21 @@ async fn try_resolve_remembered_approval(
 }
 
 fn project_durable(state: &mut UiState, record: &AgentJournalRecord) -> bool {
+    if let Some(message) = state.input_queue.observe(record) {
+        let mut entry = super::state::TranscriptEntry::user(message.text);
+        entry.continuation = true;
+        entry.id = Some(format!("queued-input:{}", message.id));
+        state.transcript.push(entry);
+        state.transcript_revision = state.transcript_revision.wrapping_add(1);
+        state.viewport.follow();
+        if state.input_queue.editing.as_deref() == Some(message.id.as_str()) {
+            super::input_queue::detach_edit(state);
+            state.ui_notice = Some(
+                "Message received; edits remain as a new draft. Previous draft is in input history"
+                    .to_owned(),
+            );
+        }
+    }
     match &record.event.payload {
         AgentEvent::RunStarted => {
             update(
@@ -1097,6 +1179,13 @@ fn project_terminal_view(
 }
 
 fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentTelemetryEnvelope) {
+    if let Some(context) = orchestral_core::agent_protocol::wire::ContextUsageReport::from_telemetry(
+        &telemetry.payload,
+    ) {
+        state.context_input_tokens = Some((context.input_tokens, context.input_tokens_estimated));
+        state.context_budget = context.max_context_tokens;
+        return;
+    }
     let telemetry_id = telemetry.telemetry_id.as_str().to_owned();
     match telemetry.payload {
         AgentTelemetry::OutputDelta { output_id, delta } => {
@@ -1191,7 +1280,7 @@ fn project_ack(state: &mut UiState, ack: CommandAck, operation: &str) {
     }
 }
 
-fn display_contents(contents: &[Content]) -> String {
+pub(super) fn display_contents(contents: &[Content]) -> String {
     contents
         .iter()
         .map(display_content)
@@ -1245,6 +1334,22 @@ mod tests {
     use super::key_message;
     use crate::tui::{ApprovalChoice, UiMsg, UiPhase, UiState};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn enter_variants_route_to_queue_interrupt_and_newline() {
+        let mut state = UiState::new("session", "model");
+        state.phase = UiPhase::Running;
+        for (modifiers, expected) in [
+            (KeyModifiers::NONE, UiMsg::Submit),
+            (KeyModifiers::ALT, UiMsg::SubmitImmediately),
+            (KeyModifiers::SHIFT, UiMsg::InsertText("\n".into())),
+        ] {
+            assert_eq!(
+                key_message(KeyEvent::new(KeyCode::Enter, modifiers), &state),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn approval_keys_cannot_become_composer_text() {

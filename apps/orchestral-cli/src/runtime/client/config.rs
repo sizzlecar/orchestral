@@ -146,15 +146,8 @@ fn discover_config_path() -> Option<PathBuf> {
 fn generate_default_config() -> anyhow::Result<PathBuf> {
     let root = std::env::current_dir().context("resolve current directory")?;
     let directory = root.join(GENERATED_CONFIG_DIR);
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("create config directory '{}'", directory.display()))?;
-    let path = directory.join(GENERATED_CONFIG_FILE);
     let desired = embedded_default_config();
-    if fs::read_to_string(&path).ok().as_deref() != Some(desired.as_str()) {
-        fs::write(&path, desired)
-            .with_context(|| format!("write generated config '{}'", path.display()))?;
-    }
-    Ok(path)
+    super::config_storage::publish(&directory, &format!(".{GENERATED_CONFIG_FILE}"), &desired)
 }
 
 fn write_overridden_runtime_config(
@@ -169,20 +162,8 @@ fn write_overridden_runtime_config(
         .with_context(|| format!("parse config '{}'", base_path.display()))?;
     apply_model_overrides_to_yaml(&mut yaml, &config, overrides)?;
     let output = serde_yaml::to_string(&yaml).context("serialize model overrides")?;
-    let path = runtime_override_config_path(base_path);
-    fs::write(&path, output)
-        .with_context(|| format!("write override config '{}'", path.display()))?;
-    Ok(path)
-}
-
-fn runtime_override_config_path(base_path: &Path) -> PathBuf {
     let parent = base_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = base_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("orchestral");
-    parent.join(format!("{stem}{GENERATED_OVERRIDE_CONFIG_SUFFIX}"))
+    super::config_storage::publish(parent, GENERATED_OVERRIDE_CONFIG_SUFFIX, &output)
 }
 
 fn apply_model_overrides_to_yaml(
@@ -507,6 +488,61 @@ fn has_env(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_generated_configs_preserve_each_process_connection() {
+        let directory = std::env::temp_dir().join(format!("orch-config-{}", uuid::Uuid::new_v4()));
+        let raw = embedded_default_config();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let workers = (0..3)
+                .map(|index| {
+                    let directory = &directory;
+                    let raw = &raw;
+                    let ready = ready.clone();
+                    scope.spawn(move || {
+                        let base = super::super::config_storage::publish(
+                            directory,
+                            ".default.agent.yaml",
+                            raw,
+                        )
+                        .unwrap();
+                        let model = format!("model-{index}");
+                        let endpoint = format!("http://127.0.0.1:{}/v1", 18000 + index);
+                        let path = write_overridden_runtime_config(
+                            &base,
+                            &ModelOverrides {
+                                model: Some(model.clone()),
+                                base_url: Some(endpoint.clone()),
+                                no_auth: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        // Every process has finished publishing before any reads.
+                        // A shared override path would expose the last writer here.
+                        ready.wait();
+                        let config = load_config(&path).unwrap();
+                        assert_eq!(config.agent.model.as_deref(), Some(model.as_str()));
+                        assert_eq!(
+                            config
+                                .providers
+                                .get_backend("cli-openai")
+                                .unwrap()
+                                .endpoint
+                                .as_deref(),
+                            Some(endpoint.as_str())
+                        );
+                        assert_eq!(fs::read_to_string(base).unwrap(), *raw);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn generated_config_is_strict_agent_config() {

@@ -418,9 +418,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -3061,7 +3061,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orchestral"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "orchestral-core",
  "orchestral-runtime",
@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-agent-acp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-agent-codex"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-agent-journal-fs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "fs2",
@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-artifact-r2"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-blob-fs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-coding-eval"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3265,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-mcp-streamable-http"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3281,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-model-gemini"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-model-openai"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3326,7 +3326,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-project-instructions-fs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cap-std",
  "orchestral-core",
@@ -3334,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-release"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-runtime"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "orchestral-web"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dioxus",
  "futures-util",

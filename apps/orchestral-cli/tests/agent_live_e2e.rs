@@ -564,7 +564,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
             // This CLI has no format override: inspect its actual model wire,
             // including the complete source and its literal backslashes.
             assert!(serde_json::from_str::<Value>(text).is_err());
-            let envelope: Value = serde_yaml::from_str(text).unwrap();
+            let envelope = tool_content::decode_tool_envelope(text);
             assert_eq!(envelope["is_error"], false);
             assert_eq!(envelope["result"]["path"], "request.txt");
             assert_eq!(
@@ -2973,7 +2973,15 @@ impl PtyOutput {
 }
 
 impl PtyHarness {
-    fn spawn(#[allow(unused_mut)] mut command: CommandBuilder) -> Self {
+    fn spawn(command: CommandBuilder) -> Self {
+        Self::spawn_with_size(command, 80, 24)
+    }
+
+    fn spawn_with_size(
+        #[allow(unused_mut)] mut command: CommandBuilder,
+        cols: u16,
+        rows: u16,
+    ) -> Self {
         #[cfg(windows)]
         {
             // portable-pty refreshes base variables from the registry. Tests
@@ -3000,8 +3008,8 @@ impl PtyHarness {
         }
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -3029,8 +3037,8 @@ impl PtyHarness {
         Self {
             started: Instant::now(),
             recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
-            max_size: (80, 24),
-            screen: vt100::Parser::new(24, 80, 0),
+            max_size: (cols, rows),
+            screen: vt100::Parser::new(rows, cols, 0),
             screen_frames: Vec::new(),
             master: pair.master,
             child,
@@ -3708,8 +3716,9 @@ fn model_tool_result_envelopes(body: &Value) -> Vec<Value> {
         .iter()
         .filter(|message| message["role"] == "tool")
         .map(|message| {
-            serde_yaml::from_str::<Value>(message["content"].as_str().expect("tool result text"))
-                .expect("complete JSON or YAML tool envelope")
+            tool_content::decode_tool_envelope(
+                message["content"].as_str().expect("tool result text"),
+            )
         })
         .collect()
 }
@@ -3736,9 +3745,8 @@ fn continue_exec_until_exit(request: &CapturedHttpRequest) -> Option<FixtureHttp
         .rev()
         .find(|message| message["role"] == "tool")
         .expect("exec observation in model history");
-    let payload: Value =
-        serde_yaml::from_str(message["content"].as_str().expect("tool result text"))
-            .expect("structured exec result");
+    let payload =
+        tool_content::decode_tool_envelope(message["content"].as_str().expect("tool result text"));
     assert_eq!(payload["is_error"], false, "{payload}");
     let result = &payload["result"];
     if result["alive"] == true {
@@ -3829,9 +3837,24 @@ fn run_payload_count(workspace: &TestWorkspace, kind: &str) -> usize {
 
 fn journal_files(workspace: &TestWorkspace, prefix: &str) -> Vec<PathBuf> {
     let directory = workspace.path(".orchestral/agent-journal");
-    let mut files = fs::read_dir(&directory)
-        .unwrap_or_else(|error| panic!("read journal directory '{}': {error}", directory.display()))
-        .map(|entry| entry.expect("journal entry").path())
+    let mut directories = vec![directory.clone()];
+    if let Ok(entries) = fs::read_dir(directory.join("sessions")) {
+        directories.extend(
+            entries
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_dir())
+                .map(|entry| entry.path()),
+        );
+    }
+    let mut files = directories
+        .iter()
+        .flat_map(|directory| {
+            fs::read_dir(directory)
+                .unwrap_or_else(|error| {
+                    panic!("read journal directory '{}': {error}", directory.display())
+                })
+                .map(|entry| entry.expect("journal entry").path())
+        })
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -3843,6 +3866,8 @@ fn journal_files(workspace: &TestWorkspace, prefix: &str) -> Vec<PathBuf> {
 }
 
 struct CapturedHttpRequest {
+    method: String,
+    path: String,
     headers: std::collections::BTreeMap<String, String>,
     body: Value,
 }
@@ -3896,6 +3921,20 @@ fn spawn_fixture_http_server(
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .expect("bound fixture write timeout");
                 let request = read_http_fixture_request(&mut stream);
+                // These fixtures implement generation/MCP, not discovery.
+                // Optional capability probes must not consume a scripted POST.
+                if request.method == "GET" && request.path.ends_with("/models") {
+                    write_http_fixture_response(
+                        &mut stream,
+                        FixtureHttpResponse {
+                            status: "404 Not Found",
+                            content_type: "application/json",
+                            body: b"{}".to_vec(),
+                            repeat_handler: false,
+                        },
+                    );
+                    continue;
+                }
                 let response = handler(&request);
                 let repeat = response.repeat_handler;
                 write_http_fixture_response(&mut stream, response);
@@ -3927,6 +3966,9 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         }
     };
     let header_text = std::str::from_utf8(&bytes[..header_end]).expect("HTTP headers are UTF-8");
+    let mut request_line = header_text.lines().next().unwrap().split_whitespace();
+    let method = request_line.next().unwrap().to_owned();
+    let path = request_line.next().unwrap().to_owned();
     let headers = header_text
         .lines()
         .skip(1)
@@ -3935,7 +3977,8 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         .collect::<std::collections::BTreeMap<_, _>>();
     let content_length = headers
         .get("content-length")
-        .expect("HTTP fixture request has Content-Length")
+        .map(String::as_str)
+        .unwrap_or("0")
         .parse::<usize>()
         .expect("HTTP fixture Content-Length is valid");
     while bytes.len() < header_end + content_length {
@@ -3944,9 +3987,15 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         bytes.extend_from_slice(&buffer[..count]);
     }
     CapturedHttpRequest {
+        method,
+        path,
         headers,
-        body: serde_json::from_slice(&bytes[header_end..header_end + content_length])
-            .expect("HTTP fixture request body is JSON"),
+        body: if content_length == 0 {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                .expect("HTTP fixture request body is JSON")
+        },
     }
 }
 

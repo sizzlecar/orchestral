@@ -20,6 +20,11 @@ orchestral --base-url http://127.0.0.1:8000/v1 --model your-model-id
 也可以设置 `OPENAI_BASE_URL` 和 `OPENAI_MODEL` 环境变量。命令行参数优先；显式指定
 `--backend` 或 `--model-profile` 时，不使用 URL 环境变量。
 
+自定义端点的模型发现同时读取可选容量字段 `max_model_len`；实际预算取服务端容量与
+Host/backend 配置预算的较小值。显式 `--model` 也会查询容量，最多等待两秒；不支持查询
+的端点仍可使用已指定模型，未声明的容量显示 `unknown`。需要禁用额外查询时，在 backend
+中设置 `config.discover_model_capabilities: false`，并明确指定模型。
+
 自定义 URL 默认**不发送鉴权信息**，也不会继承已有云端密钥。服务或网关需要鉴权时，
 先在环境中设置密钥，再指定它的变量名：
 
@@ -29,6 +34,12 @@ orchestral --base-url https://your-gateway.example/v1 --api-key-env LOCAL_MODEL_
 
 在 YAML 中，无鉴权 provider 使用 `endpoint` 和 `config: { auth: none }`；默认鉴权模式
 是 `api_key`。编程操作还需要模型具备工具调用能力，仅接口兼容不代表模型一定支持。
+
+OpenAI 兼容工具结果默认使用 `text`：在一个字符串中呈现类型化元数据和带边界的多行
+原文，保留源码缩进、制表符和换行。模型 profile 可显式设置 `config.tool_result_format`
+为 `json`、`yaml` 或 `text_parts`；最后一种需要服务端聊天模板支持文本片段数组。
+这些格式不修改会话原始记录。改变格式会改变未完成 Run 的恢复身份；恢复旧 Run 时
+需要选择原先使用的格式。
 
 检查配置，或在不生成回答的情况下查询模型列表：
 
@@ -61,7 +72,10 @@ orchestral --model-profile gemini-2.5-flash "检查这个工作区"
 | `printf '修复这个 bug' \| orchestral` | Headless 单轮 |
 
 Headless stdout 只输出最终 Delivery，进度和错误进入 stderr，适合管道消费。TUI 中 Enter
-发送消息、Steer 或回答当前问题；Ctrl+J 换行（终端支持时也可用 Shift+Enter）。上下键先移动
+启动任务或回答当前问题；任务运行中按 Enter 将追加消息排队，在下一次模型调用前接收，
+不会打断当前生成或已分派的工具。Alt+Enter 明确中断生成并发送新指令。待接收列表与已接收
+对话分开展示，`/queue` 可修改或撤回消息；如果模型先接收了消息，修改会被拒绝并保留草稿。
+任务停止时尚未接收的消息标记为未发送。Ctrl+J 换行（终端支持时也可用 Shift+Enter）。上下键先移动
 多行光标，再访问本会话输入历史，返回时恢复草稿。粘贴支持中文、组合字符与 emoji；超过
 20 行显示有界预览，Ctrl+P 展开。
 
@@ -70,7 +84,12 @@ F1 / Ctrl+] 打开命令并保留草稿。`/` 发现命令，`//` 发送以斜�
 包含新建、重命名后的文件。空闲时可通过 `/model`、
 `/new`、`/resume` 切换配置中的模型或会话；草稿在当前进程内按会话保留。`/resume` 面板中的
 “Current session details” 查看实际存储位置和已报告用量。`/context` 区分当前或最近一轮的
-技能加载记录，并展示进程加载的规则来源和会话压缩记录。没有依据的上下文占用显示 `—`。
+技能加载记录，并展示进程加载的规则来源和会话压缩记录。底栏 `last input` 是最近一次模型
+请求的输入 token 数；`≈` 表示规划估算，收到服务端用量后更新为实报值。它不是会话累计用量，
+也不是实时 KV 缓存占用。`limit` 是已声明容量与 Host 预算的较小值；未知容量显示 `unknown`。
+
+空白 TUI 会话先展示 Orchestral Logo、当前构建版本、所选模型和工作目录；发送首条任务后
+进入对话。恢复会话直接显示历史。
 
 Ctrl+O 在对话中展开工具记录；PgUp/PgDn 阅读历史或当前面板，End 跟随新输出。保留终端原生
 文本选择；存在本地剪贴板工具时，`/copy` 复制最近的已提交回答。`/`、F1 和 `/help` 提供统一
@@ -86,7 +105,8 @@ Ctrl+D 退出，或使用 `/quit` 停止并退出。审批须用 `a`/`d`，或�
 
 CLI 依次发现 `.orchestral/config.yaml`、`.orchestral/config.yml`、
 `configs/orchestral.cli.yaml`、`orchestral.yaml`；都不存在时会生成
-`.orchestral/generated/default.agent.yaml`。可以用 `--config`、`--backend`、`--model-profile` 或
+`.orchestral/generated/` 下按内容隔离的配置缓存。默认配置与 CLI 覆盖配置以原子写入发布，
+并发终端不会读到写入中的文件，也不会覆盖其他终端的连接参数。可以用 `--config`、`--backend`、`--model-profile` 或
 `--model` 显式选择，例如：
 
 ```bash
@@ -127,7 +147,9 @@ Run/Session 日志重建；压缩影响模型上下文，TUI 仍回放原始对�
 Run；未完成的 Run 先由 Controller 按现有 checkpoint 合同恢复，等待输入或审批时继续
 原交互，未观察到结果的模型尝试收束为 `Incomplete`，已提交工具效果不会重复执行。
 无法确认的效果保留 `UnknownEffect`；恢复身份不兼容时明确报错，不另起 Run 掩盖问题。
-同一文件日志目录同时只允许一个 Host 写入，浏览命令可以并行只读访问。
+本地 CLI 会话分别存储在 `journal.root_dir/sessions` 下，多个终端可在同一项目中工作。
+同一会话同时只允许一个终端控制；浏览和恢复同时包含新会话与旧日志。
+`serve` 保留共享 Host 的日志目录和写锁，浏览命令可以并行只读访问。
 
 长会话多次压缩时，runtime 会沿日志引用重新读取原始记录，避免反复压缩旧摘要。
 跨 Run 续聊会在历史条数和 token 预算内优先恢复最近一条被压缩的用户输入；有界摘要
@@ -205,7 +227,10 @@ orchestral "修复当前 workspace 中失败的项目，运行测试，并报告
 ```
 
 内置文件 Tool 包括 `file_read`、有界路径查找 `file_search` 和内容查找 `text_search`。
-修改时，`file_edit` 替换一处精确且唯一的文本；`apply_patch` 处理结构化的 Add/Update/Delete；
+修改时，`file_edit` 替换精确且唯一的文本。同一文件的多处已知修改可放入
+`edits: [{old_text, new_text}, ...]`，所有匹配均以原文件为准，重叠匹配会被拒绝，
+全部检查通过后才一次提交。原有单处 `old_text`/`new_text` 写法继续支持，不能与
+`edits` 混用。`apply_patch` 处理结构化的 Add/Update/Delete；
 `file_write` 在相应版本前提下创建或替换完整文件。workspace 选择器只指向 Host 提供的工作区。
 文件 Tool、`exec_command` / `write_stdin`、Artifact/Session 读取和 MCP 调用均继续经过
 Host policy 与 Effect Journal。

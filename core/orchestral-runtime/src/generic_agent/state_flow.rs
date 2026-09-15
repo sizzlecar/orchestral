@@ -195,11 +195,8 @@ pub(super) fn model_dispatch_budget(
     }
 
     let mut output_cap = output_reserve_tokens;
-    // Elastic context planning must set the wire cap explicitly. Otherwise
-    // the backend's configured default could consume the room just reclaimed
-    // from the preferred output reservation.
-    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some()
-        || config.minimum_output_reserve_tokens.is_some();
+    // Every projection reserves response room, including unconstrained Runs.
+    // Send that same cap: an adapter default may exceed the planned capacity.
     if let Some(ceiling) = &request.run.spec.limits.max_cost {
         let policy = config
             .model_cost_policy
@@ -221,12 +218,11 @@ pub(super) fn model_dispatch_budget(
         if output_cap == 0 {
             return Err(RunLimitKind::Cost);
         }
-        bounded_output = true;
     }
 
     Ok(ModelDispatchBudget {
         projected_input_tokens,
-        max_output_tokens: bounded_output.then_some(output_cap),
+        max_output_tokens: Some(output_cap),
     })
 }
 
@@ -491,6 +487,57 @@ pub(super) fn model_context_trace(
         planning: projection.planning.clone(),
         input_budget_tokens: projection.input_budget_tokens,
     }
+}
+
+pub(super) fn publish_context_usage(
+    inner: &GenericInner,
+    run_id: &RunId,
+    request: &ModelRequest,
+    trace: &GenericModelContextTrace,
+    reported_input: Option<u64>,
+) {
+    use orchestral_core::agent_protocol::wire::ContextUsageReport;
+    use orchestral_core::model_protocol::ModelTokenAccounting;
+    let (input_tokens, input_tokens_estimated) = if let Some(tokens) = reported_input {
+        (tokens, false)
+    } else if let Some(estimate) = &trace.context_estimate {
+        (
+            estimate.tokens,
+            estimate.accounting != ModelTokenAccounting::Exact,
+        )
+    } else {
+        (trace.used_input_tokens, true)
+    };
+    let max_context_tokens = inner
+        .backend
+        .descriptor()
+        .capabilities
+        .max_context_tokens
+        .map(|capacity| capacity.min(inner.config.max_context_tokens));
+    publish_telemetry(
+        inner,
+        run_id,
+        AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!(
+                "{}-context-{}",
+                request.request_id.as_str(),
+                if reported_input.is_some() {
+                    "reported"
+                } else {
+                    "planned"
+                }
+            )),
+            run_id: run_id.clone(),
+            provider_seq: None,
+            payload: ContextUsageReport {
+                request_id: request.request_id.as_str().to_owned(),
+                input_tokens,
+                input_tokens_estimated,
+                max_context_tokens,
+            }
+            .into_telemetry(),
+        },
+    );
 }
 
 pub(super) fn model_request_for_round(

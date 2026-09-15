@@ -8,6 +8,7 @@ mod app;
 mod editor;
 mod files;
 mod history;
+mod input_queue;
 mod insights;
 mod interaction;
 mod menu;

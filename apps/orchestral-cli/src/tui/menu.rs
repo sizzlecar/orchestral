@@ -15,6 +15,8 @@ pub(crate) enum MenuKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LocalAction {
+    EditQueuedInput(String),
+    WithdrawQueuedInput(String),
     Keyboard,
     Appearance,
     SessionDetails,
@@ -117,6 +119,11 @@ fn score(value: &str, query: &str) -> Option<usize> {
 }
 
 pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "/queue",
+        "Pending messages",
+        "Inspect, edit or withdraw messages awaiting the next model call",
+    ),
     (
         "/new",
         "New conversation",

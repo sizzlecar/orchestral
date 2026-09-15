@@ -384,6 +384,18 @@ impl AgentController {
         command: AgentCommandEnvelope,
     ) -> Result<CommandAck, AgentControlError> {
         command.verify_digest()?;
+        if orchestral_core::agent_protocol::wire::QueuedInputOperation::from_command(&command)?
+            .is_some()
+            && !orchestral_core::agent_protocol::wire::QueuedInputOperation::is_supported(
+                &self.descriptor.descriptor,
+            )
+        {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::Unsupported,
+                "this Agent does not support queued input; use immediate Steer explicitly",
+            )
+            .into());
+        }
         let slot = self.run_slot(&command.run_id).await?;
         let mut entry = slot.entry.lock().await;
         if entry
