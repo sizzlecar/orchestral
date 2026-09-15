@@ -302,11 +302,24 @@ impl ModelBackend for CapacityModel {
 }
 
 #[derive(Default)]
-struct RejectionAckLostStore {
+pub(super) struct RejectionAckLostStore {
     inner: InMemoryGenericAgentCheckpointStore,
     cut_after_observation: bool,
     cut_once: AtomicBool,
     unavailable: AtomicBool,
+}
+
+impl RejectionAckLostStore {
+    pub(super) fn after_observation() -> Self {
+        Self {
+            cut_after_observation: true,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn resume(&self) {
+        self.unavailable.store(false, Ordering::SeqCst);
+    }
 }
 
 impl GenericAgentCheckpointStore for RejectionAckLostStore {

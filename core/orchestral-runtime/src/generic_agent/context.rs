@@ -292,7 +292,7 @@ pub(super) async fn project_model_messages(
             remaining_input_tokens,
             input_capacity_tokens: recovery
                 .as_ref()
-                .map(|recovery| recovery.input_budget_tokens),
+                .and_then(|recovery| recovery.input_capacity_tokens()),
             input_compaction_target_tokens: recovery
                 .as_ref()
                 .and_then(|recovery| recovery.compaction_target_tokens()),

@@ -712,8 +712,8 @@ pub struct GenericAgentCheckpointProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenericContextRecovery {
-    /// Consecutive rejected attempts. Zero means generation succeeded while
-    /// the learned per-request ceiling remains in force for this Run.
+    /// Consecutive rejected attempts. Zero means generation succeeded; an
+    /// input ceiling remains learned only when input reduction was required.
     pub retry_number: u32,
     pub input_budget_tokens: u64,
     pub output_budget_tokens: Option<u64>,
@@ -721,6 +721,13 @@ pub struct GenericContextRecovery {
 }
 
 impl GenericContextRecovery {
+    /// An output-only rejection does not establish a smaller input capacity.
+    /// Keep its original input fixed during retry; after success, allow new
+    /// observations to use the space released by the smaller output budget.
+    pub(crate) fn input_capacity_tokens(&self) -> Option<u64> {
+        (self.retry_number > 0 || self.compact_input).then_some(self.input_budget_tokens)
+    }
+
     /// The ceiling is one token below the rejected input; rounding its half
     /// upward recovers half the original rejected input without overflowing.
     pub(crate) fn compaction_target_tokens(&self) -> Option<u64> {
@@ -835,7 +842,10 @@ pub fn replay_generic_agent_checkpoint(
                     retry_number: *retry_number,
                     input_budget_tokens: *input_budget_tokens,
                     output_budget_tokens: *output_budget_tokens,
-                    compact_input: *input_budget_tokens < planned_input,
+                    compact_input: *input_budget_tokens < planned_input
+                        || context_recovery
+                            .as_ref()
+                            .is_some_and(|prior| prior.compact_input),
                 });
             }
             GenericCheckpointEvent::ModelRetryScheduled {
@@ -913,9 +923,11 @@ pub fn replay_generic_agent_checkpoint(
                         "model attempt round does not match the stable boundary".to_owned(),
                     ));
                 }
-                if context_recovery.as_ref().is_some_and(|recovery| {
-                    context.input_budget_tokens > recovery.input_budget_tokens
-                }) {
+                if context_recovery
+                    .as_ref()
+                    .and_then(GenericContextRecovery::input_capacity_tokens)
+                    .is_some_and(|ceiling| context.input_budget_tokens > ceiling)
+                {
                     return Err(GenericCheckpointError::InvalidData(
                         "model retry exceeded its durable recovery input budget".to_owned(),
                     ));

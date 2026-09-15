@@ -14,6 +14,8 @@ Pre-1.0 Agent Foundation release, replacing the workflow-first architecture in 0
 
 - Independent CLI sessions can run in the same workspace while retaining exclusive control of each conversation and read-only access to legacy history.
 - Context-capacity recovery can reduce output reservation without discarding required first-turn instructions; the reduced budget survives checkpoint recovery.
+- After an output-only capacity retry succeeds, new tool observations can use the released context space. Input ceilings learned from input reduction and cumulative Run limits remain enforced.
+- Accepted Host cancellation takes precedence when a model stream concurrently returns an error, EOF, or completion.
 - `doctor` validates model profile options through the same adapter construction as startup.
 - `file_edit` supports atomic batches of independent edits to one file.
 - OpenAI-compatible tool results default to a single string with typed metadata and verbatim fenced multiline fields, avoiding YAML presentation indentation in source text. Explicit JSON, YAML, and text-part array encodings remain available; encoding changes invalidate unfinished Run recovery identity.

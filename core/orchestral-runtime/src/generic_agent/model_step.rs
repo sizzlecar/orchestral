@@ -152,7 +152,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 remaining_input_tokens: remaining_input,
                 input_capacity_tokens: context_recovery
                     .as_ref()
-                    .map(|recovery| recovery.input_budget_tokens),
+                    .and_then(|recovery| recovery.input_capacity_tokens()),
                 input_compaction_target_tokens: context_recovery
                     .as_ref()
                     .and_then(|recovery| recovery.compaction_target_tokens()),
@@ -362,6 +362,13 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 }
                 item = model_stream.next() => item,
             };
+            // A Host stop may be accepted while polling the selected stream
+            // item. Give that committed stop precedence over a late provider
+            // error, EOF, or completion, as in the model-start failure path.
+            if cancellation.is_cancelled() {
+                emit_cancel(&inner, &request, &user_message);
+                return;
+            }
             let event = match item {
                 Some(Ok(event)) => event,
                 Some(Err(error)) => {

@@ -116,6 +116,7 @@ pub(super) fn commit_context_recovery(
         retry_number,
         input_budget_tokens,
         output_budget_tokens,
-        compact_input: reduced_output.is_none(),
+        compact_input: reduced_output.is_none()
+            || previous.is_some_and(|prior| prior.compact_input),
     })
 }

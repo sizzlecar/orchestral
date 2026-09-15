@@ -71,6 +71,12 @@ mod context_recovery;
 #[path = "generic_agent/queued_input.rs"]
 mod queued_input;
 
+#[path = "generic_agent/cancellation_race.rs"]
+mod cancellation_race;
+
+#[path = "generic_agent/output_recovery.rs"]
+mod output_recovery;
+
 struct ScriptedModel;
 
 struct BlockingModel;
