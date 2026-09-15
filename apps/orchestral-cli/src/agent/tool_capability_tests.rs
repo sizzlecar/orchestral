@@ -209,6 +209,28 @@ async fn cli_file_schema_projection_preserves_primary_and_additional_root_operat
             std::fs::read_to_string(target.join("same.txt")).unwrap(),
             "edited\n"
         );
+        let mut arguments = json!({"path":"same.txt", "edits":[
+            {"old_text":"edi", "new_text":"up"},
+            {"old_text":"ted", "new_text":"dated"}
+        ]});
+        if !additional.is_empty() {
+            arguments["workspace"] = json!(std::fs::canonicalize(target).unwrap());
+        }
+        let result = invoke("batch-edit", "file_edit", arguments).await;
+        assert!(
+            matches!(
+                result,
+                GuardedToolResult::Outcome {
+                    outcome: ToolOutcome::Completed { .. },
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("same.txt")).unwrap(),
+            "updated\n"
+        );
         assert_eq!(
             std::fs::read(untouched.join("same.txt")).unwrap(),
             untouched_before

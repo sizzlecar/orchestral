@@ -3,7 +3,7 @@
 use super::*;
 use tokio_util::sync::CancellationToken;
 
-/// Replaces one unique text occurrence in a Host-approved existing file.
+/// Atomically replaces unique text occurrences in a Host-approved existing file.
 #[derive(Debug, Clone)]
 pub struct GuardedFileEditExecutor {
     workspaces: MutationWorkspaceSet,
@@ -29,6 +29,10 @@ impl GuardedFileEditExecutor {
 
 struct FileEditRequest<'a> {
     path: PatchPath,
+    edits: Vec<TextEdit<'a>>,
+}
+
+struct TextEdit<'a> {
     old_text: &'a str,
     new_text: &'a str,
 }
@@ -36,13 +40,15 @@ struct FileEditRequest<'a> {
 impl<'a> FileEditRequest<'a> {
     fn parse(invocation: &'a ToolInvocation) -> Result<Self, ToolOutcome> {
         let invalid = || {
-            rejected("file_edit_invalid", "file_edit requires path, non-empty old_text and new_text strings, with only an optional exact workspace root")
+            rejected("file_edit_invalid", "file_edit requires path and either old_text/new_text or a non-empty edits array of old_text/new_text objects, with only an optional exact workspace root. Do not mix the two forms; old_text must be non-empty.")
         };
         let arguments = invocation.arguments.as_object().ok_or_else(invalid)?;
-        if arguments
-            .keys()
-            .any(|key| !matches!(key.as_str(), "path" | "old_text" | "new_text" | "workspace"))
-        {
+        if arguments.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "path" | "old_text" | "new_text" | "edits" | "workspace"
+            )
+        }) {
             return Err(invalid());
         }
         if let Some(workspace) = arguments.get("workspace") {
@@ -60,27 +66,70 @@ impl<'a> FileEditRequest<'a> {
         }
         let path = parse_path(path)
             .map_err(|error| rejected("file_edit_path_invalid", error.to_string()))?;
-        let old_text = arguments
-            .get("old_text")
-            .and_then(Value::as_str)
-            .ok_or_else(invalid)?;
-        let new_text = arguments
-            .get("new_text")
-            .and_then(Value::as_str)
-            .ok_or_else(invalid)?;
-        if old_text.is_empty() || old_text.contains('\0') || new_text.contains('\0') {
-            return Err(invalid());
-        }
-        for text in [old_text, new_text] {
-            if text.len() > MAX_RESULTING_FILE_BYTES {
-                return Err(file_too_large(path.display(), text.len()).into_outcome(0));
+        let parse_edit = |fields: &'a Map<String, Value>| {
+            let old_text = fields
+                .get("old_text")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?;
+            let new_text = fields
+                .get("new_text")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?;
+            if old_text.is_empty() || old_text.contains('\0') || new_text.contains('\0') {
+                return Err(invalid());
+            }
+            Ok(TextEdit { old_text, new_text })
+        };
+        let edits = if let Some(edits) = arguments.get("edits") {
+            if arguments.contains_key("old_text") || arguments.contains_key("new_text") {
+                return Err(invalid());
+            }
+            let edits = edits
+                .as_array()
+                .filter(|edits| !edits.is_empty())
+                .ok_or_else(invalid)?;
+            edits
+                .iter()
+                .map(|edit| {
+                    let fields = edit.as_object().ok_or_else(invalid)?;
+                    if fields
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "old_text" | "new_text"))
+                    {
+                        return Err(invalid());
+                    }
+                    parse_edit(fields)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![parse_edit(arguments)?]
+        };
+        // Disjoint matches cannot consume more than one input file, and the
+        // replacements themselves cannot exceed the resulting-file capacity.
+        // Check the totals before searching or allocating the new file.
+        let (mut old_bytes, mut new_bytes) = (0usize, 0usize);
+        for edit in &edits {
+            old_bytes = old_bytes.saturating_add(edit.old_text.len());
+            new_bytes = new_bytes.saturating_add(edit.new_text.len());
+            for bytes in [old_bytes, new_bytes] {
+                if bytes > MAX_RESULTING_FILE_BYTES {
+                    return Err(file_too_large(path.display(), bytes).into_outcome(0));
+                }
             }
         }
-        Ok(Self {
-            path,
-            old_text,
-            new_text,
-        })
+        Ok(Self { path, edits })
+    }
+
+    fn summary(&self, workspace: &str) -> String {
+        let action = if self.edits.len() == 1 {
+            "Edit one text occurrence".to_owned()
+        } else {
+            format!("Atomically edit {} text occurrences", self.edits.len())
+        };
+        format!(
+            "{action} in '{}' in workspace '{workspace}'",
+            self.path.display()
+        )
     }
 }
 
@@ -109,12 +158,7 @@ impl GuardedToolExecutor for GuardedFileEditExecutor {
         let Ok(workspace) = self.workspaces.select(invocation) else {
             return Vec::new();
         };
-        let (mut before, before_omitted) = added_content_preview(request.old_text);
-        for line in &mut before {
-            line.kind = ToolDiffLineKind::Deletion;
-        }
-        let (after, after_omitted) = added_content_preview(request.new_text);
-        before.extend(after);
+        let (diff, diff_omitted) = edit_activity_preview(&request.edits);
         vec![ToolActivityEvidence::File {
             operation: ToolFileActivityKind::Update,
             path: workspace
@@ -122,8 +166,8 @@ impl GuardedToolExecutor for GuardedFileEditExecutor {
                 .join(request.path.relative())
                 .to_string_lossy()
                 .into_owned(),
-            diff: before,
-            diff_omitted: before_omitted.saturating_add(after_omitted),
+            diff,
+            diff_omitted,
         }]
     }
 
@@ -149,11 +193,7 @@ impl GuardedToolExecutor for GuardedFileEditExecutor {
             required_capabilities,
             risk: ToolOperationRisk::Routine,
             session_approval_scope: None,
-            summary: format!(
-                "Edit one text occurrence in '{}' in workspace '{}'",
-                request.path.display(),
-                workspace.selector
-            ),
+            summary: request.summary(&workspace.selector),
         })
     }
 
@@ -161,11 +201,7 @@ impl GuardedToolExecutor for GuardedFileEditExecutor {
         FileEditRequest::parse(invocation)
             .and_then(|request| {
                 let workspace = self.workspaces.select(invocation)?;
-                Ok(format!(
-                    "Edit one text occurrence in '{}' in workspace '{}'",
-                    request.path.display(),
-                    workspace.selector
-                ))
+                Ok(request.summary(&workspace.selector))
             })
             .unwrap_or_else(|_| "Apply an invalid file_edit request".to_owned())
     }
@@ -217,36 +253,40 @@ fn prepare_edit(
             "file_edit does not edit files containing NUL bytes",
         ));
     }
-    let start = original.find(request.old_text).ok_or_else(|| {
-        MutationError::rejected(
-            "file_edit_no_match",
-            no_match_message(original, request.old_text),
-        )
-    })?;
-    // Advance one Unicode scalar, not the whole match: overlapping occurrences
-    // are ambiguous too (for example, replacing "aa" in "aaa").
-    let next = start
-        + request
-            .old_text
-            .chars()
-            .next()
-            .expect("validated non-empty old_text")
-            .len_utf8();
-    if original[next..].contains(request.old_text) {
-        return Err(MutationError::rejected(
-            "file_edit_ambiguous",
-            "old_text occurs more than once; include more unchanged context",
-        ));
+    let mut spans = Vec::with_capacity(request.edits.len());
+    for (index, edit) in request.edits.iter().enumerate() {
+        let start = unique_match(original, edit.old_text).map_err(|mut error| {
+            // Keep diagnostics for the legacy single-edit form unchanged.
+            if request.edits.len() > 1 {
+                error.message = format!("edits[{index}]: {}", error.message);
+            }
+            error
+        })?;
+        spans.push((start, start + edit.old_text.len(), edit.new_text, index));
     }
-    let end = start + request.old_text.len();
-    let after_len = before.len() - request.old_text.len() + request.new_text.len();
+    spans.sort_unstable_by_key(|span| span.0);
+    for pair in spans.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            return Err(MutationError::rejected(
+                "file_edit_overlap",
+                format!("edits[{}] and edits[{}] overlap in the original file; combine them into one replacement. No files changed.", pair[0].3, pair[1].3),
+            ));
+        }
+    }
+    let removed: usize = spans.iter().map(|span| span.1 - span.0).sum();
+    let inserted: usize = spans.iter().map(|span| span.2.len()).sum();
+    let after_len = before.len() - removed + inserted;
     if after_len > MAX_RESULTING_FILE_BYTES {
         return Err(file_too_large(request.path.display(), after_len));
     }
     let mut after = Vec::with_capacity(after_len);
-    after.extend_from_slice(&before[..start]);
-    after.extend_from_slice(request.new_text.as_bytes());
-    after.extend_from_slice(&before[end..]);
+    let mut cursor = 0;
+    for (start, end, replacement, _) in spans {
+        after.extend_from_slice(&before[cursor..start]);
+        after.extend_from_slice(replacement.as_bytes());
+        cursor = end;
+    }
+    after.extend_from_slice(&before[cursor..]);
     Ok(PreparedChange::Update {
         path: request.path,
         target,
@@ -254,6 +294,51 @@ fn prepare_edit(
         after,
         permissions,
     })
+}
+
+fn unique_match(original: &str, old_text: &str) -> Result<usize, MutationError> {
+    let start = original.find(old_text).ok_or_else(|| {
+        MutationError::rejected("file_edit_no_match", no_match_message(original, old_text))
+    })?;
+    // Advance one Unicode scalar, not the whole match: overlapping occurrences
+    // are ambiguous too (for example, replacing "aa" in "aaa").
+    let next = start
+        + old_text
+            .chars()
+            .next()
+            .expect("validated non-empty old_text")
+            .len_utf8();
+    if original[next..].contains(old_text) {
+        return Err(MutationError::rejected(
+            "file_edit_ambiguous",
+            "old_text occurs more than once; include more unchanged context",
+        ));
+    }
+    Ok(start)
+}
+
+fn edit_activity_preview(edits: &[TextEdit<'_>]) -> (Vec<ToolDiffLine>, u32) {
+    const MAX_LINES: usize = 32;
+    let mut diff = Vec::new();
+    let mut omitted = 0u32;
+    for edit in edits {
+        let (mut before, before_omitted) = added_content_preview(edit.old_text);
+        for line in &mut before {
+            line.kind = ToolDiffLineKind::Deletion;
+        }
+        let (after, after_omitted) = added_content_preview(edit.new_text);
+        omitted = omitted
+            .saturating_add(before_omitted)
+            .saturating_add(after_omitted);
+        for line in before.into_iter().chain(after) {
+            if diff.len() < MAX_LINES {
+                diff.push(line);
+            } else {
+                omitted = omitted.saturating_add(1);
+            }
+        }
+    }
+    (diff, omitted)
 }
 
 /// Diagnostic observations only: these candidates never reach PreparedChange.
@@ -421,26 +506,46 @@ fn finish_edit(
     }
 }
 
-/// Describes a single exact edit; Host policy supplies all filesystem authority.
+/// Describes atomic exact edits; Host policy supplies all filesystem authority.
 pub fn guarded_file_edit_descriptor(restriction: ToolRestriction) -> ToolDescriptor {
     ToolDescriptor {
         tool_id: ToolId::new("orchestral/file_edit/v1"),
         model_schema: ModelToolSchema {
             name: "file_edit".to_owned(),
             description: concat!(
-                "Replace one unique occurrence of old_text in a UTF-8 file. Copy it exactly, ",
-                "including whitespace and line endings; include only enough unchanged context ",
-                "to disambiguate. Empty new_text deletes it. No patch markers. ",
-                "Use normalized workspace-relative paths."
+                "Atomically replace exact text in one UTF-8 file. For multiple known changes, ",
+                "send one edits array of {old_text,new_text} objects. Each old_text must occur ",
+                "exactly once in the ORIGINAL file; matches must not overlap. All matches are ",
+                "checked before writing. Copy whitespace and line endings exactly, with only ",
+                "enough unchanged context to disambiguate. Empty new_text deletes a match. ",
+                "A single change may use top-level old_text/new_text instead of edits; never ",
+                "mix the forms. No patch markers. Use normalized workspace-relative paths."
             )
             .to_owned(),
             input_schema: json!({
                 "type": "object",
-                "required": ["path", "old_text", "new_text"],
+                "required": ["path"],
+                "oneOf": [
+                    {"required": ["old_text", "new_text"], "not": {"required": ["edits"]}},
+                    {"required": ["edits"], "not": {"anyOf": [
+                        {"required": ["old_text"]}, {"required": ["new_text"]}
+                    ]}}
+                ],
                 "properties": {
                     "path": { "type": "string", "minLength": 1 },
                     "old_text": { "type": "string", "minLength": 1, "maxLength": MAX_RESULTING_FILE_BYTES },
                     "new_text": { "type": "string", "maxLength": MAX_RESULTING_FILE_BYTES },
+                    "edits": {
+                        "type": "array", "minItems": 1,
+                        "items": {
+                            "type": "object", "required": ["old_text", "new_text"],
+                            "properties": {
+                                "old_text": {"type": "string", "minLength": 1, "maxLength": MAX_RESULTING_FILE_BYTES},
+                                "new_text": {"type": "string", "maxLength": MAX_RESULTING_FILE_BYTES}
+                            },
+                            "additionalProperties": false
+                        }
+                    },
                     "workspace": {
                         "type": "string", "minLength": 1,
                         "description": "Exact canonical Host workspace root; omit for primary."
@@ -480,12 +585,19 @@ mod tests {
             Self { root, workspaces }
         }
 
-        fn prepare(&self) -> PreparedChange {
+        fn prepare(&self, batch: bool) -> PreparedChange {
             let invocation = ToolInvocation {
                 run_id: RunId::new("prepare-run"),
                 call_id: ToolCallId::new("prepare-call"),
                 tool_id: ToolId::new("orchestral/file_edit/v1"),
-                arguments: json!({ "path": "source.rs", "old_text": "before", "new_text": "after" }),
+                arguments: if batch {
+                    json!({"path":"source.rs", "edits":[
+                        {"old_text":"be", "new_text":"af"},
+                        {"old_text":"fore", "new_text":"ter"}
+                    ]})
+                } else {
+                    json!({ "path": "source.rs", "old_text": "before", "new_text": "after" })
+                },
             };
             let roots = EffectiveRoots {
                 readable: vec![self.root.clone()],
@@ -508,40 +620,86 @@ mod tests {
 
     #[test]
     fn file_edit_changed_after_preparation_is_not_overwritten() {
-        let fixture = PreparedFixture::new();
-        let prepared = fixture.prepare();
-        std::fs::write(fixture.root.join("source.rs"), "external change").unwrap();
-        let outcome = finish_edit(
-            prepared,
-            &fixture.workspaces.primary().selector,
-            &CancellationToken::new(),
-        );
-        assert!(
-            matches!(outcome, ToolOutcome::Rejected { ref code, .. } if code == "patch_conflict")
-        );
-        assert_eq!(
-            std::fs::read_to_string(fixture.root.join("source.rs")).unwrap(),
-            "external change"
-        );
-        assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 1);
+        for batch in [false, true] {
+            let fixture = PreparedFixture::new();
+            let prepared = fixture.prepare(batch);
+            std::fs::write(fixture.root.join("source.rs"), "external change").unwrap();
+            let outcome = finish_edit(
+                prepared,
+                &fixture.workspaces.primary().selector,
+                &CancellationToken::new(),
+            );
+            assert!(
+                matches!(outcome, ToolOutcome::Rejected { ref code, .. } if code == "patch_conflict")
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("source.rs")).unwrap(),
+                "external change"
+            );
+            assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 1);
+        }
     }
 
     #[test]
     fn file_edit_cancelled_after_preparation_does_not_commit() {
-        let fixture = PreparedFixture::new();
-        let prepared = fixture.prepare();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let outcome = finish_edit(
-            prepared,
-            &fixture.workspaces.primary().selector,
-            &cancellation,
-        );
-        assert!(matches!(outcome, ToolOutcome::Cancelled));
+        for batch in [false, true] {
+            let fixture = PreparedFixture::new();
+            let prepared = fixture.prepare(batch);
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            let outcome = finish_edit(
+                prepared,
+                &fixture.workspaces.primary().selector,
+                &cancellation,
+            );
+            assert!(matches!(outcome, ToolOutcome::Cancelled));
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("source.rs")).unwrap(),
+                "before"
+            );
+            assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn batch_activity_preview_keeps_one_bounded_file_diff() {
+        let edits = [
+            TextEdit {
+                old_text: "left",
+                new_text: "first",
+            },
+            TextEdit {
+                old_text: "right",
+                new_text: "second",
+            },
+        ];
+        let (diff, omitted) = edit_activity_preview(&edits);
+        assert_eq!(omitted, 0);
         assert_eq!(
-            std::fs::read_to_string(fixture.root.join("source.rs")).unwrap(),
-            "before"
+            diff.iter()
+                .map(|line| (line.kind, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ToolDiffLineKind::Deletion, "left"),
+                (ToolDiffLineKind::Addition, "first"),
+                (ToolDiffLineKind::Deletion, "right"),
+                (ToolDiffLineKind::Addition, "second"),
+            ]
         );
-        assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 1);
+        let old = "old\n".repeat(30);
+        let new = "new\n".repeat(30);
+        let edits = [
+            TextEdit {
+                old_text: &old,
+                new_text: &new,
+            },
+            TextEdit {
+                old_text: "last",
+                new_text: "changed",
+            },
+        ];
+        let (diff, omitted) = edit_activity_preview(&edits);
+        assert_eq!(diff.len() + omitted as usize, 62);
+        assert!(diff.len() <= 32);
     }
 }

@@ -17,6 +17,9 @@ use orchestral_runtime::{
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+#[path = "file_edit_tool/batches.rs"]
+mod batches;
+
 const SIGNING_KEY: &[u8] = b"file-edit-test-signing-key-32bytes";
 type Runtime = GuardedToolRuntime<InMemoryApprovalCapabilityStore>;
 

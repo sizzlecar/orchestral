@@ -205,7 +205,10 @@ orchestral "修复当前 workspace 中失败的项目，运行测试，并报告
 ```
 
 内置文件 Tool 包括 `file_read`、有界路径查找 `file_search` 和内容查找 `text_search`。
-修改时，`file_edit` 替换一处精确且唯一的文本；`apply_patch` 处理结构化的 Add/Update/Delete；
+修改时，`file_edit` 替换精确且唯一的文本。同一文件的多处已知修改可放入
+`edits: [{old_text, new_text}, ...]`，所有匹配均以原文件为准，重叠匹配会被拒绝，
+全部检查通过后才一次提交。原有单处 `old_text`/`new_text` 写法继续支持，不能与
+`edits` 混用。`apply_patch` 处理结构化的 Add/Update/Delete；
 `file_write` 在相应版本前提下创建或替换完整文件。workspace 选择器只指向 Host 提供的工作区。
 文件 Tool、`exec_command` / `write_stdin`、Artifact/Session 读取和 MCP 调用均继续经过
 Host policy 与 Effect Journal。

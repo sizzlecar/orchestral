@@ -243,7 +243,11 @@ orchestral "Repair the failing project in this workspace, run its tests, and rep
 ```
 
 The built-in file tools include `file_read`, bounded path lookup with `file_search`, and content
-lookup with `text_search`. For changes, `file_edit` replaces one exact, unique text match;
+lookup with `text_search`. For changes, `file_edit` replaces exact, unique text matches.
+Batch known changes to one file with `edits: [{old_text, new_text}, ...]`; every match
+is resolved against the original file, overlapping matches are rejected, and all
+changes commit together. The single `old_text`/`new_text` form remains supported;
+do not combine it with `edits` in one call.
 `apply_patch` handles structured Add/Update/Delete changes; `file_write` creates or replaces a
 complete file with the applicable version preconditions. Workspace selectors refer to workspaces
 supplied by the Host. File tools, `exec_command` / `write_stdin`, Artifact/Session reads, and MCP
