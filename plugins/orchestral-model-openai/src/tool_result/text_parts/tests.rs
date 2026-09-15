@@ -82,6 +82,13 @@ fn assert_round_trip(result: &Value, is_error: bool) -> Value {
             json!({"result": result, "is_error": is_error})
         );
     }
+    let text = OpenAiToolResultFormat::Text
+        .encode(result, is_error)
+        .unwrap();
+    assert_eq!(
+        restore_envelope(text.as_str().expect("text format uses a string")),
+        json!({"result": result, "is_error": is_error})
+    );
     assert_eq!(result, &saved);
     parts
 }
@@ -182,6 +189,60 @@ fn text_parts_close_fence_lines_when_templates_concatenate_parts_directly() {
 }
 
 #[test]
+fn default_text_keeps_source_bytes_in_string_content_and_binds_recovery() {
+    assert_eq!(
+        OpenAiToolResultFormat::default(),
+        OpenAiToolResultFormat::Text
+    );
+    assert_eq!(
+        serde_json::from_value::<OpenAiToolResultFormat>(json!("text")).unwrap(),
+        OpenAiToolResultFormat::Text
+    );
+    let source = "fn sample() {\n    let value = \"literal\\n\";\n\tconsume(value);\n}\n";
+    let result = json!({"content": source, "path": "src/sample.rs", "eof": true});
+    let request = history(result.clone());
+    let saved = serde_json::to_vec(&request).unwrap();
+    let restored: ModelRequest = serde_json::from_slice(&saved).unwrap();
+    let adapter = backend();
+    let body = adapter.build_request_body(&restored).unwrap();
+    let tool = &body["messages"][2];
+    assert_eq!(tool["role"], "tool");
+    assert_eq!(tool["tool_call_id"], "native-call");
+    let text = tool["content"]
+        .as_str()
+        .expect("ordinary string tool content");
+    assert!(text.contains(source));
+    assert_eq!(
+        restore_envelope(text),
+        json!({"result": result, "is_error": false})
+    );
+    assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
+    let meter = adapter.meter_descriptor();
+    assert_eq!(
+        meter.strategy,
+        "openai-compatible/wire-json-text-tool-upper-bound"
+    );
+    assert_eq!(meter.version, "1");
+    assert_eq!(
+        adapter.descriptor().extensions["openai-compatible/tool-result-encoding"],
+        crate::tool_result::TEXT_ENCODING_IDENTITY
+    );
+    for format in [
+        OpenAiToolResultFormat::Json,
+        OpenAiToolResultFormat::Yaml,
+        OpenAiToolResultFormat::TextParts,
+    ] {
+        let other = backend().with_tool_result_format(format);
+        assert_ne!(other.descriptor(), adapter.descriptor());
+        assert_ne!(other.meter_descriptor(), meter);
+    }
+    let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::Text);
+    assert_eq!(resumed.build_request_body(&restored).unwrap(), body);
+    assert_eq!(resumed.descriptor(), adapter.descriptor());
+    assert_eq!(resumed.meter_descriptor(), meter);
+}
+
+#[test]
 fn text_parts_v3_preserves_canonical_history_and_changes_recovery_identity() {
     assert_eq!(
         serde_json::from_value::<OpenAiToolResultFormat>(json!("text_parts")).unwrap(),
@@ -250,6 +311,7 @@ fn text_parts_v3_preserves_canonical_history_and_changes_recovery_identity() {
 
     let mut costs = Vec::new();
     for format in [
+        OpenAiToolResultFormat::Text,
         OpenAiToolResultFormat::Json,
         OpenAiToolResultFormat::Yaml,
         OpenAiToolResultFormat::TextParts,

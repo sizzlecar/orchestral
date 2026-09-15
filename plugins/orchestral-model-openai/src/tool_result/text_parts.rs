@@ -44,20 +44,30 @@ impl<'a> ToolTextView<'a> {
 }
 
 pub(super) fn encode(result: &Value, is_error: bool) -> Value {
+    Value::Array(
+        render_parts(result, is_error)
+            .into_iter()
+            .map(|text| json!({"type": "text", "text": text}))
+            .collect(),
+    )
+}
+
+pub(super) fn encode_text(result: &Value, is_error: bool) -> String {
+    render_parts(result, is_error).concat()
+}
+
+fn render_parts(result: &Value, is_error: bool) -> Vec<String> {
     let view = ToolTextView::new(result, is_error);
     let mut parts = Vec::with_capacity(view.fields.len() + 1);
-    parts.push(json!({
-        "type": "text",
-        "text": format!("{}\n", view.metadata),
-    }));
+    parts.push(format!("{}\n", view.metadata));
     for (key, text) in view.fields {
         let label = match key {
             Some(key) => json!(key).to_string(),
             None => "Result text".to_owned(),
         };
-        parts.push(json!({"type": "text", "text": fenced_text(&label, text)}));
+        parts.push(fenced_text(&label, text));
     }
-    Value::Array(parts)
+    parts
 }
 
 fn fenced_text(label: &str, text: &str) -> String {

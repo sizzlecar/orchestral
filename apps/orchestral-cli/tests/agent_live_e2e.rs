@@ -3708,8 +3708,9 @@ fn model_tool_result_envelopes(body: &Value) -> Vec<Value> {
         .iter()
         .filter(|message| message["role"] == "tool")
         .map(|message| {
-            serde_yaml::from_str::<Value>(message["content"].as_str().expect("tool result text"))
-                .expect("complete JSON or YAML tool envelope")
+            tool_content::decode_tool_envelope(
+                message["content"].as_str().expect("tool result text"),
+            )
         })
         .collect()
 }
@@ -3736,9 +3737,8 @@ fn continue_exec_until_exit(request: &CapturedHttpRequest) -> Option<FixtureHttp
         .rev()
         .find(|message| message["role"] == "tool")
         .expect("exec observation in model history");
-    let payload: Value =
-        serde_yaml::from_str(message["content"].as_str().expect("tool result text"))
-            .expect("structured exec result");
+    let payload =
+        tool_content::decode_tool_envelope(message["content"].as_str().expect("tool result text"));
     assert_eq!(payload["is_error"], false, "{payload}");
     let result = &payload["result"];
     if result["alive"] == true {

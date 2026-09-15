@@ -35,6 +35,12 @@ orchestral --base-url https://your-gateway.example/v1 --api-key-env LOCAL_MODEL_
 在 YAML 中，无鉴权 provider 使用 `endpoint` 和 `config: { auth: none }`；默认鉴权模式
 是 `api_key`。编程操作还需要模型具备工具调用能力，仅接口兼容不代表模型一定支持。
 
+OpenAI 兼容工具结果默认使用 `text`：在一个字符串中呈现类型化元数据和带边界的多行
+原文，保留源码缩进、制表符和换行。模型 profile 可显式设置 `config.tool_result_format`
+为 `json`、`yaml` 或 `text_parts`；最后一种需要服务端聊天模板支持文本片段数组。
+这些格式不修改会话原始记录。改变格式会改变未完成 Run 的恢复身份；恢复旧 Run 时
+需要选择原先使用的格式。
+
 检查配置，或在不生成回答的情况下查询模型列表：
 
 ```sh

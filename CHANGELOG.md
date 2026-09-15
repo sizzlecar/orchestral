@@ -16,6 +16,7 @@ Pre-1.0 Agent Foundation release, replacing the workflow-first architecture in 0
 - Context-capacity recovery can reduce output reservation without discarding required first-turn instructions; the reduced budget survives checkpoint recovery.
 - `doctor` validates model profile options through the same adapter construction as startup.
 - `file_edit` supports atomic batches of independent edits to one file.
+- OpenAI-compatible tool results default to a single string with typed metadata and verbatim fenced multiline fields, avoiding YAML presentation indentation in source text. Explicit JSON, YAML, and text-part array encodings remain available; encoding changes invalidate unfinished Run recovery identity.
 - Generated configuration is published atomically and isolated by content, preventing concurrent terminals from reading partial configuration or overwriting each other's model connection.
 - Nested context compaction records the live source intervals it consumed, keeping checkpoint provenance disjoint when newer summaries have replaced older records.
 - Model discovery uses declared serving capacity to bound context planning. The TUI distinguishes estimated and reported input tokens, preserves unknown limits, and clears stale recovery and acceptance messages on progress.

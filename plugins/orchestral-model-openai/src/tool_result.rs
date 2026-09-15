@@ -7,6 +7,7 @@ mod text_parts;
 // Bump this identity if YAML rendering changes. It is included in both the
 // model descriptor and token-meter configuration bound by Run recovery.
 pub(crate) const YAML_ENCODING_IDENTITY: &str = "serde-yaml-0.9/tool-envelope/v1";
+pub(crate) const TEXT_ENCODING_IDENTITY: &str = "openai-compatible/text-tool-envelope/v1";
 pub(crate) const TEXT_PARTS_ENCODING_IDENTITY: &str =
     "openai-compatible/text-parts-tool-envelope/v3";
 
@@ -15,11 +16,15 @@ pub(crate) const TEXT_PARTS_ENCODING_IDENTITY: &str =
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAiToolResultFormat {
+    /// Typed JSON metadata followed by verbatim fenced multiline fields in a
+    /// single string. Source indentation is unchanged and text-part array
+    /// support is not required from the provider's chat template.
+    #[default]
+    Text,
     /// Explicitly retain the original JSON text encoding and recovery identity.
     Json,
     /// Encode the complete envelope as YAML. Ordinary multiline strings use
     /// literal blocks; special whitespace may require quoted escapes.
-    #[default]
     Yaml,
     /// Separate top-level strings containing LF or CR into verbatim fenced
     /// text parts. Other strings, including empty strings, and nested values
@@ -32,6 +37,7 @@ pub enum OpenAiToolResultFormat {
 impl OpenAiToolResultFormat {
     pub(crate) fn encode(self, result: &Value, is_error: bool) -> Result<Value, ModelError> {
         match self {
+            Self::Text => Ok(Value::String(text_parts::encode_text(result, is_error))),
             Self::Json => Ok(Value::String(
                 json!({"result": result, "is_error": is_error}).to_string(),
             )),
@@ -121,6 +127,9 @@ mod tests {
             CONTEXT_ESTIMATE_BYTES_PER_TOKEN,
         );
         let (legacy_version, version, legacy_config) = match format {
+            OpenAiToolResultFormat::Text => {
+                panic!("the text encoding has no pre-observation recovery identity")
+            }
             OpenAiToolResultFormat::Json => ("2", "3", serde_json::to_vec(&legacy_config).unwrap()),
             OpenAiToolResultFormat::Yaml => (
                 "1",
@@ -231,18 +240,14 @@ mod tests {
     }
 
     #[test]
-    fn default_yaml_preserves_wire_and_history_but_versions_observed_prefix_planning() {
-        assert_eq!(
-            OpenAiToolResultFormat::default(),
-            OpenAiToolResultFormat::Yaml
-        );
+    fn explicit_yaml_preserves_wire_and_history_but_versions_observed_prefix_planning() {
         let request =
             history(json!({"source": "let quoted = \"\\\"value\\\"\";\n".repeat(8), "eof": true}));
         let saved = serde_json::to_vec(&request).unwrap();
         let restored: ModelRequest = serde_json::from_slice(&saved).unwrap();
         let json_backend = backend().with_tool_result_format(OpenAiToolResultFormat::Json);
         let json_body = json_backend.build_request_body(&request).unwrap();
-        let yaml_backend = backend();
+        let yaml_backend = backend().with_tool_result_format(OpenAiToolResultFormat::Yaml);
         let body = yaml_backend.build_request_body(&restored).unwrap();
         assert_eq!(body, yaml_backend.build_request_body(&request).unwrap());
         assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
@@ -296,7 +301,7 @@ mod tests {
         assert_observed_prefix_planning_identity(&yaml_backend, OpenAiToolResultFormat::Yaml);
         // A fresh adapter with the same declared encoding reproduces the body
         // after restart. The runtime binds these descriptors for Run recovery.
-        let resumed = backend();
+        let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::Yaml);
         assert_eq!(resumed.build_request_body(&restored).unwrap(), body);
         assert_eq!(resumed.meter_descriptor(), yaml_backend.meter_descriptor());
     }

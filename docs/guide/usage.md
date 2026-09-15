@@ -41,6 +41,13 @@ selected. In YAML, use a provider `endpoint` with `config: { auth: none }` for a
 the default authentication mode is `api_key`. The model needs tool-calling support to perform
 coding actions; OpenAI-compatible HTTP alone does not guarantee a model has that capability.
 
+OpenAI-compatible tool results default to `text`: typed metadata followed by fenced multiline
+text in one string, preserving source indentation, tabs, and line endings. A model profile can
+explicitly select `config.tool_result_format: json`, `yaml`, or `text_parts`. The last option
+requires support for text-part arrays in the server's chat template. These encodings do not
+change canonical conversation history. Changing the encoding changes recovery identity for
+unfinished Runs; select the previous encoding when recovering one.
+
 Check configuration without starting a task, or query the model list without generating text:
 
 ```sh

@@ -2211,7 +2211,7 @@ mod entry_mode_tests {
     }
 
     #[test]
-    fn model_profile_tool_result_format_defaults_to_yaml_and_is_strict() {
+    fn model_profile_tool_result_format_defaults_to_text_and_is_strict() {
         let backend = serde_json::from_value(serde_json::json!({
             "name": "local", "kind": "openai", "endpoint": "http://127.0.0.1:1/v1",
             "config": {"auth": "none"},
@@ -2225,7 +2225,7 @@ mod entry_mode_tests {
             .unwrap()
         };
         for format in [
-            serde_json::json!("text"),
+            serde_json::json!("unsupported"),
             serde_json::json!(true),
             serde_json::Value::Null,
         ] {
@@ -2260,11 +2260,22 @@ mod entry_mode_tests {
         )
         .unwrap();
         assert_ne!(json_meter.meter_descriptor(), yaml_meter.meter_descriptor());
+        let (_, text_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            Some(&profile(serde_json::json!("text"))),
+            8,
+            None,
+        )
+        .unwrap();
+        assert_ne!(text_meter.meter_descriptor(), yaml_meter.meter_descriptor());
+        assert_ne!(text_meter.meter_descriptor(), json_meter.meter_descriptor());
         let (_, default_meter) =
             super::build_model_backend(&backend, "local-model", 0.6, None, 8, None).unwrap();
         assert_eq!(
             default_meter.meter_descriptor(),
-            yaml_meter.meter_descriptor()
+            text_meter.meter_descriptor()
         );
         let mut omitted_format = profile(serde_json::json!("json"));
         omitted_format
@@ -2283,7 +2294,7 @@ mod entry_mode_tests {
         .unwrap();
         assert_eq!(
             omitted_meter.meter_descriptor(),
-            yaml_meter.meter_descriptor()
+            text_meter.meter_descriptor()
         );
     }
 

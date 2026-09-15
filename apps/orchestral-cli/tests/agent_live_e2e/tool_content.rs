@@ -48,7 +48,55 @@ fn assert_native_continuations(request: &CapturedHttpRequest, expected: usize) {
     }
 }
 
-fn yaml_tool_messages(request: &CapturedHttpRequest) -> Vec<(&str, Value)> {
+// Decode the documented presentation independently of the adapter encoder.
+// Source bytes inside fences are never unescaped or dedented.
+pub(super) fn decode_tool_envelope(content: &str) -> Value {
+    let (metadata, mut rest) = content.split_once('\n').unwrap_or((content, ""));
+    let Ok(mut envelope) = serde_json::from_str::<Value>(metadata) else {
+        return serde_yaml::from_str(content).expect("explicit YAML tool envelope");
+    };
+    envelope
+        .as_object_mut()
+        .unwrap()
+        .entry("is_error")
+        .or_insert(json!(false));
+    while !rest.is_empty() {
+        let (header, body) = rest.split_once('\n').expect("field header");
+        let (opening, body) = body.split_once('\n').expect("opening fence");
+        let fence = opening.strip_suffix("text").expect("text fence");
+        assert!(fence.len() >= 3 && fence.bytes().all(|byte| byte == b'`'));
+        let closing = format!("\n{fence}\n");
+        let (source, following) = body.split_once(&closing).expect("closing fence");
+        let (label, source) = if let Some(label) = header.strip_suffix(" (final newline: yes)") {
+            (label, format!("{source}\n"))
+        } else {
+            (
+                header
+                    .strip_suffix(" (final newline: no)")
+                    .expect("newline boundary"),
+                source.to_owned(),
+            )
+        };
+        if label == "Result text" {
+            assert!(envelope
+                .as_object_mut()
+                .unwrap()
+                .insert("result".to_owned(), json!(source))
+                .is_none());
+        } else {
+            let key: String = serde_json::from_str(label).expect("field name");
+            assert!(envelope["result"]
+                .as_object_mut()
+                .unwrap()
+                .insert(key, json!(source))
+                .is_none());
+        }
+        rest = following;
+    }
+    envelope
+}
+
+fn rendered_tool_messages(request: &CapturedHttpRequest) -> Vec<(&str, Value)> {
     request.body["messages"]
         .as_array()
         .unwrap()
@@ -56,14 +104,14 @@ fn yaml_tool_messages(request: &CapturedHttpRequest) -> Vec<(&str, Value)> {
         .filter(|message| message["role"] == "tool")
         .map(|message| {
             let content = message["content"].as_str().unwrap();
-            let envelope = serde_yaml::from_str(content).expect("declared YAML tool content");
+            let envelope = decode_tool_envelope(content);
             (content, envelope)
         })
         .collect()
 }
 
 fn assert_source_observation(request: &CapturedHttpRequest) {
-    let messages = yaml_tool_messages(request);
+    let messages = rendered_tool_messages(request);
     let (text, envelope) = &messages[0];
     assert_eq!(envelope["is_error"], false);
     assert_eq!(envelope["result"]["path"], "src/newline.rs");
@@ -83,21 +131,27 @@ fn assert_source_observation(request: &CapturedHttpRequest) {
         );
     }
     assert!(!text.contains("ends_with('\\\\n')"), "{text}");
+    if text.starts_with('{') {
+        assert!(
+            text.contains(SOURCE),
+            "default text must preserve indentation: {text}"
+        );
+    }
 }
 
 #[test]
 fn yaml_tool_content_preserves_source_through_patch_and_session_restart() {
-    assert_source_edit_and_session_restart("apply_patch", true);
+    assert_source_edit_and_session_restart("apply_patch", true, Some("yaml"));
 }
 
 #[test]
 fn file_edit_preserves_source_through_cli_and_session_restart() {
-    assert_source_edit_and_session_restart("file_edit", false);
+    assert_source_edit_and_session_restart("file_edit", false, None);
 }
 
 #[test]
 fn file_replace_uses_observed_read_through_cli_and_session_restart() {
-    assert_source_edit_and_session_restart("file_write", true);
+    assert_source_edit_and_session_restart("file_write", true, None);
 }
 
 #[test]
@@ -141,18 +195,26 @@ fn length_with_native_reasoning_never_executes_partial_tool_arguments() {
     }
 }
 
-fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bool) {
+fn assert_source_edit_and_session_restart(
+    edit_tool: &'static str,
+    streaming: bool,
+    format: Option<&str>,
+) {
     let _guard = local_e2e_guard();
-    let workspace = TestWorkspace::new("yaml-tool-content");
+    let workspace = TestWorkspace::new("source-tool-content");
     fs::create_dir(workspace.path("src")).unwrap();
     fs::write(workspace.path("src/newline.rs"), SOURCE).unwrap();
     workspace.disable_exec();
     workspace.rewrite_config(|config| {
         config["agent"]["model_profile"] = serde_yaml::to_value("source-text").unwrap();
         config["providers"]["default_model"] = serde_yaml::to_value("source-text").unwrap();
+        let mut profile_config = json!({});
+        if let Some(format) = format {
+            profile_config["tool_result_format"] = json!(format);
+        }
         config["providers"]["models"] = serde_yaml::to_value(json!([{
             "name": "source-text", "backend": "openai", "model": "fixture-model",
-            "config": {"tool_result_format": "yaml"},
+            "config": profile_config,
         }]))
         .unwrap();
     });
@@ -192,7 +254,7 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
         }),
         Box::new(move |request| {
             assert_native_continuations(request, 2);
-            let messages = yaml_tool_messages(request);
+            let messages = rendered_tool_messages(request);
             assert_eq!(messages.len(), 2);
             assert_eq!(messages[1].1["is_error"], false);
             if streaming {
@@ -224,7 +286,7 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
                 delivered["reasoning_content"], NATIVE_REASONING,
                 "Stop commits the same message state as a Tool continuation"
             );
-            let messages = yaml_tool_messages(request);
+            let messages = rendered_tool_messages(request);
             assert_eq!(messages.len(), 2);
             assert_eq!(messages[1].1["is_error"], false);
             openai_text_response("The recorded change is available.")
@@ -262,8 +324,8 @@ fn assert_source_edit_and_session_restart(edit_tool: &'static str, streaming: bo
     }
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 4);
-    let observed_before = yaml_tool_messages(&requests[1]);
-    let observed_after = yaml_tool_messages(&requests[3]);
+    let observed_before = rendered_tool_messages(&requests[1]);
+    let observed_after = rendered_tool_messages(&requests[3]);
     assert_eq!(observed_before[0], observed_after[0]);
     let records = session_records(&workspace);
     let exchanges = tool_exchanges(&records);
