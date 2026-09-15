@@ -564,7 +564,7 @@ fn local_cli_creates_and_verifies_a_file_with_exec_disabled() {
             // This CLI has no format override: inspect its actual model wire,
             // including the complete source and its literal backslashes.
             assert!(serde_json::from_str::<Value>(text).is_err());
-            let envelope: Value = serde_yaml::from_str(text).unwrap();
+            let envelope = tool_content::decode_tool_envelope(text);
             assert_eq!(envelope["is_error"], false);
             assert_eq!(envelope["result"]["path"], "request.txt");
             assert_eq!(
