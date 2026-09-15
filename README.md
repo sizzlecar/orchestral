@@ -23,15 +23,20 @@ running tests concurrently.
 Ferrum is an optional local model server for this example, not an Orchestral
 dependency. Orchestral also connects to other OpenAI-compatible providers.
 
-On macOS or Linux, install the latest releases:
+On macOS (Apple Silicon) or Linux (x86_64), install the latest releases:
 
 ```sh
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 curl -fsSL https://orch.pandaailabs.com/install.sh | sh
 ```
 
-On Windows, follow the [Ferrum installation instructions](https://github.com/sizzlecar/ferrum-infer-rs#installation)
-and [Orchestral's Windows installation command](#install) below.
+On Windows (x86_64), use PowerShell:
+
+```powershell
+irm https://ferrum.pandaailabs.com/install.ps1 | iex
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
 Open a new terminal after installation, then start Ferrum:
 
 ```sh

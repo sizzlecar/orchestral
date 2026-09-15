@@ -22,15 +22,20 @@ Agents are the new processes. Orchestral is the runtime.
 Ferrum 只是这个示例可选的本地模型服务，不是 Orchestral 的依赖。
 Orchestral 也可以连接其他 OpenAI 兼容服务。
 
-在 macOS 或 Linux 上安装最新版本：
+在 macOS（Apple Silicon）或 Linux（x86_64）上安装最新版本：
 
 ```sh
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 curl -fsSL https://orch.pandaailabs.com/install.sh | sh
 ```
 
-Windows 请参阅 [Ferrum 安装说明](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#安装)
-和下方的 [Orchestral Windows 安装命令](#安装)。
+Windows（x86_64）使用 PowerShell：
+
+```powershell
+irm https://ferrum.pandaailabs.com/install.ps1 | iex
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
 安装后打开新终端，启动 Ferrum：
 
 ```sh
