@@ -1,7 +1,7 @@
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://release-assets.githubusercontent.com; media-src https://github.com https://release-assets.githubusercontent.com; connect-src 'self' https://api.github.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https://ferrum-downloads.pandaailabs.com; media-src https://ferrum-downloads.pandaailabs.com; connect-src 'self' https://api.github.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
 /install.sh
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300
