@@ -95,12 +95,12 @@ For a specific version or installation directory, download the script, inspect i
 
 ```sh
 curl -fsSL https://orch.pandaailabs.com/install.sh -o install.sh
-sh install.sh --version 0.3.0 --dir "$HOME/.local/bin" --no-modify-path
+sh install.sh --version 0.3.1 --dir "$HOME/.local/bin" --no-modify-path
 ```
 
 ```powershell
 Invoke-WebRequest https://orch.pandaailabs.com/install.ps1 -OutFile install.ps1
-& ./install.ps1 -Version 0.3.0 -InstallDir "$env:LOCALAPPDATA\Orchestral\bin" -NoModifyPath
+& ./install.ps1 -Version 0.3.1 -InstallDir "$env:LOCALAPPDATA\Orchestral\bin" -NoModifyPath
 ```
 
 If your PowerShell execution policy does not permit downloaded scripts, inspect the script
@@ -135,8 +135,8 @@ installers from `scripts/`. Never edit generated copies in `public/`.
 After the release commit is reviewed and merged, create and push its matching annotated tag:
 
 ```sh
-git tag -a v0.3.0 -m "Orchestral v0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.1 -m "Orchestral v0.3.1"
+git push origin v0.3.1
 ```
 
 The **Release** workflow verifies the tag/version/notes, runs the reusable CI workflow, and
@@ -186,10 +186,10 @@ host. Website deployment, live agent validation, and Host operations remain sepa
 Once those channels are actually published, users can install the release with:
 
 ```sh
-cargo install orchestral-cli --version 0.3.0 --locked
+cargo install orchestral-cli --version 0.3.1 --locked
 brew install sizzlecar/orchestral/orchestral
 ```
 
-Before the first 0.3.0 publication, do not advertise these as available 0.3.0 binaries. The public
+Before the first 0.3.1 publication, do not advertise these as available 0.3.1 binaries. The public
 registry already contains the older 0.1.0 and 0.2.0 packages; the absence of a GitHub Release does
 not mean crates.io is empty.
