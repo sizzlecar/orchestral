@@ -68,6 +68,9 @@ mod observed_prefix_recovery;
 #[path = "generic_agent/context_recovery.rs"]
 mod context_recovery;
 
+#[path = "generic_agent/queued_input.rs"]
+mod queued_input;
+
 struct ScriptedModel;
 
 struct BlockingModel;

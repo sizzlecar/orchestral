@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use orchestral_core::model_protocol::ModelError;
@@ -50,6 +50,26 @@ pub async fn discover_models(
     endpoint: &OpenAiEndpoint,
     api_key: &str,
 ) -> Result<Vec<String>, String> {
+    Ok(discover_model_metadata(endpoint, api_key)
+        .await?
+        .into_iter()
+        .map(|model| model.id)
+        .collect())
+}
+
+/// Model identity and optional serving capacity declared by an API endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub id: String,
+    /// Input plus output tokens. Absent when the server does not declare it.
+    pub max_context_tokens: Option<u64>,
+}
+
+/// Discover IDs and capacities without sending a generation request.
+pub async fn discover_model_metadata(
+    endpoint: &OpenAiEndpoint,
+    api_key: &str,
+) -> Result<Vec<DiscoveredModel>, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -89,23 +109,79 @@ pub async fn discover_models(
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
         "model discovery did not return JSON; check the API base or specify --model"
     })?;
+    parse_model_metadata(&value)
+}
+
+fn parse_model_metadata(value: &serde_json::Value) -> Result<Vec<DiscoveredModel>, String> {
     let data = value
         .get("data")
         .and_then(serde_json::Value::as_array)
         .ok_or("model discovery requires an OpenAI-compatible data array; specify --model")?;
-    Ok(data
-        .iter()
-        .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
-        .filter(|id| !id.trim().is_empty())
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
+    let mut models = BTreeMap::<String, Option<u64>>::new();
+    for model in data {
+        let Some(id) = model
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            continue;
+        };
+        // Optional OpenAI-compatible serving metadata, not a nominal model
+        // window inferred from its name. Older endpoints may omit this field.
+        let capacity = model
+            .get("max_model_len")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|tokens| *tokens > 0);
+        models
+            .entry(id.to_owned())
+            .and_modify(|existing| {
+                *existing = match (*existing, capacity) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            })
+            .or_insert(capacity);
+    }
+    Ok(models
         .into_iter()
+        .map(|(id, max_context_tokens)| DiscoveredModel {
+            id,
+            max_context_tokens,
+        })
         .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_preserves_unknown_capacity_and_uses_smallest_duplicate_declaration() {
+        let models = parse_model_metadata(&serde_json::json!({"data": [
+            {"id": "known", "max_model_len": 8192},
+            {"id": "known", "max_model_len": 4096},
+            {"id": "known"},
+            {"id": "unknown"},
+            {"id": "zero", "max_model_len": 0},
+            {"id": "invalid", "max_model_len": "131072"},
+            {"id": "negative", "max_model_len": -1},
+            {"id": "", "max_model_len": 4096}
+        ]}))
+        .unwrap();
+        assert_eq!(models.len(), 5);
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "known")
+                .unwrap()
+                .max_context_tokens,
+            Some(4096)
+        );
+        assert!(models
+            .iter()
+            .filter(|m| m.id != "known")
+            .all(|m| m.max_context_tokens.is_none()));
+    }
 
     #[test]
     fn endpoint_variants_preserve_api_prefix_and_use_one_resource_suffix() {

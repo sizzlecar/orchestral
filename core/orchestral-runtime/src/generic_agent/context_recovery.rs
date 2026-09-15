@@ -101,10 +101,10 @@ pub(super) fn commit_context_recovery(
             provider_seq: None,
             payload: AgentTelemetry::ProgressReported {
                 message: if let Some(output) = reduced_output {
-                    format!("Model rejected context capacity; reducing output reservation to {output} tokens (recovery {retry_number}/{})", inner.config.context_recovery.max_retries)
+                    format!("Context limit exceeded. Retrying with up to {output} output tokens ({retry_number}/{})", inner.config.context_recovery.max_retries)
                 } else {
                     format!(
-                "Model rejected context capacity; compacting toward {target_input_tokens} input tokens within a {input_budget_tokens}-token ceiling (recovery {retry_number}/{})",
+                "Context limit exceeded. Compacting history before retry ({retry_number}/{}; target {target_input_tokens} input tokens, ceiling {input_budget_tokens})",
                 inner.config.context_recovery.max_retries
             )
                 },

@@ -489,6 +489,57 @@ pub(super) fn model_context_trace(
     }
 }
 
+pub(super) fn publish_context_usage(
+    inner: &GenericInner,
+    run_id: &RunId,
+    request: &ModelRequest,
+    trace: &GenericModelContextTrace,
+    reported_input: Option<u64>,
+) {
+    use orchestral_core::agent_protocol::wire::ContextUsageReport;
+    use orchestral_core::model_protocol::ModelTokenAccounting;
+    let (input_tokens, input_tokens_estimated) = if let Some(tokens) = reported_input {
+        (tokens, false)
+    } else if let Some(estimate) = &trace.context_estimate {
+        (
+            estimate.tokens,
+            estimate.accounting != ModelTokenAccounting::Exact,
+        )
+    } else {
+        (trace.used_input_tokens, true)
+    };
+    let max_context_tokens = inner
+        .backend
+        .descriptor()
+        .capabilities
+        .max_context_tokens
+        .map(|capacity| capacity.min(inner.config.max_context_tokens));
+    publish_telemetry(
+        inner,
+        run_id,
+        AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!(
+                "{}-context-{}",
+                request.request_id.as_str(),
+                if reported_input.is_some() {
+                    "reported"
+                } else {
+                    "planned"
+                }
+            )),
+            run_id: run_id.clone(),
+            provider_seq: None,
+            payload: ContextUsageReport {
+                request_id: request.request_id.as_str().to_owned(),
+                input_tokens,
+                input_tokens_estimated,
+                max_context_tokens,
+            }
+            .into_telemetry(),
+        },
+    );
+}
+
 pub(super) fn model_request_for_round(
     request: &AgentStartRequest,
     round: u64,

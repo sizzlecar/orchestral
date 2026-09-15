@@ -56,3 +56,20 @@ let durable = controller.events(&execution.run_id, 0).await?;
 - Provider 必须先声明 capability；不支持的 limit、resource、control 或 output schema 返回
   结构化 `UnsupportedCapability`，不能静默忽略。
 - recovery 必须继续同一 Execution；`OutcomeUnknown` 不能通过创建新 Run 绕过。
+
+## 可协商的输入队列与上下文用量扩展
+
+Generic Provider 在 descriptor 的 `extensions["orchestral/input-queue.v1"]` 声明
+`{"version":1}`。Host 只向声明支持的 Provider 发送带同名命名空间的 Steer command；
+扩展值为 `{"operation":"enqueue"}`、`{"operation":"replace","target":"原 command_id"}`
+或 `{"operation":"withdraw","target":"原 command_id"}`。普通 Steer 的立即控制语义保留。
+排队消息在下一次模型调用边界接收；修改保留队列位置，以新 command_id 取代旧身份。
+修改与撤回仅适用于仍在队列中的消息，和消费使用同一个运行时锁决定先后。
+`Accepted` 表示操作已记入 WAL，`InputCommitted` 才表示输入已接收。
+重放接受、修改、撤回和消费记录恢复队列，不重发已接收内容。
+
+上下文显示使用 `AgentTelemetry::Extension`，namespace 为
+`orchestral/context-usage.v1`，payload 为 `ContextUsageReport`。其中 `request_id` 绑定最近
+模型请求，`input_tokens` 表示本次输入，`input_tokens_estimated` 区分估算与实报，
+`max_context_tokens` 缺省表示未声明上限。它不代表累计计费量或实时 KV 占用。
+以上扩展沿用 v1 的命令、遥测和摘要规则，不增加未知 core variant。

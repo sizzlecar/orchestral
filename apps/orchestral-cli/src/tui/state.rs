@@ -166,6 +166,12 @@ pub(crate) enum UiEffect {
         run_id: String,
         input: String,
     },
+    QueueInput {
+        run_id: String,
+        command_id: String,
+        input: String,
+        operation: orchestral_core::agent_protocol::wire::QueuedInputOperation,
+    },
     ResolveInput {
         run_id: String,
         request_id: String,
@@ -207,6 +213,7 @@ pub(crate) enum UiMsg {
     ToggleInput,
     FollowOutput,
     Submit,
+    SubmitImmediately,
     SelectApproval(ApprovalChoice),
     ScrollApproval(usize),
     Approval(ApprovalChoice),
@@ -292,9 +299,13 @@ pub(crate) enum UiMsg {
 pub(crate) struct UiState {
     pub session_id: String,
     pub project: String,
+    pub workspace_path: String,
     pub session_title: String,
     pub model: String,
     pub context_budget: Option<u64>,
+    /// Latest model input tokens and whether the count is estimated.
+    pub context_input_tokens: Option<(u64, bool)>,
+    pub input_queue: super::input_queue::InputQueueState,
     pub terminal_size: (u16, u16),
     pub phase: UiPhase,
     pub run_id: Option<String>,
@@ -344,8 +355,11 @@ impl UiState {
             session_title: session_id.clone(),
             session_id,
             project: "workspace".to_owned(),
+            workspace_path: String::new(),
             model: model.into(),
             context_budget: None,
+            context_input_tokens: None,
+            input_queue: Default::default(),
             terminal_size: (80, 24),
             phase: UiPhase::Idle,
             run_id: None,
@@ -605,8 +619,20 @@ impl UiState {
 
 pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
     state.transcript_dirty_from = state.transcript_dirty_from.min(state.transcript.len());
+    if matches!(
+        msg,
+        UiMsg::RunStarted { .. }
+            | UiMsg::StreamDelta { .. }
+            | UiMsg::ToolActivity { .. }
+            | UiMsg::Completed { .. }
+            | UiMsg::Failed { .. }
+            | UiMsg::Cancelled { .. }
+            | UiMsg::Incomplete { .. }
+    ) {
+        state.ui_notice = None;
+    }
     if state.menu.is_none() {
-        if matches!(msg, UiMsg::Submit)
+        if matches!(msg, UiMsg::Submit | UiMsg::SubmitImmediately)
             && state.composer_origin == ComposerOrigin::RestoredQuestionDraft
             && !state.composer.is_empty()
         {
@@ -647,8 +673,21 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
     ) {
         state.transcript_revision = state.transcript_revision.wrapping_add(1);
     }
+    if matches!(msg, UiMsg::Escape) && state.menu.is_none() && state.input_queue.editing.is_some() {
+        super::input_queue::finish_edit(state);
+        return Vec::new();
+    }
     if let Some(effects) = super::interaction::route(state, &msg) {
         return effects;
+    }
+    if matches!(
+        msg,
+        UiMsg::Completed { .. }
+            | UiMsg::Failed { .. }
+            | UiMsg::Cancelled { .. }
+            | UiMsg::Incomplete { .. }
+    ) {
+        super::input_queue::detach_edit(state);
     }
     match msg {
         UiMsg::OpenMenu(menu) => {
@@ -701,7 +740,15 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         | UiMsg::MoveCursorEnd
         | UiMsg::Edit(_)
         | UiMsg::History { .. } => {}
-        UiMsg::Submit => return submit(state),
+        UiMsg::Submit => return submit(state, false),
+        UiMsg::SubmitImmediately => {
+            if state.input_queue.editing.is_some() {
+                state.ui_notice =
+                    Some("Enter updates the queued message; Esc cancels editing".into());
+                return Vec::new();
+            }
+            return submit(state, true);
+        }
         UiMsg::ToggleHelp => {
             state.menu = if state.menu.is_some() {
                 None
@@ -769,6 +816,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::RunStarted { run_id } => {
             if state.run_id.as_deref() != Some(run_id.as_str()) {
+                state.context_input_tokens = None;
+                state.working_detail = None;
                 state.request_submission = None;
                 state.resolved_requests.clear();
                 state.working_elapsed = Duration::ZERO;
@@ -786,6 +835,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             order,
             text,
         } => {
+            state.working_detail = None;
             if state.stream_output_id.as_deref() != Some(output_id.as_str()) {
                 state.clear_stream();
                 state.stream_output_id = Some(output_id);
@@ -802,6 +852,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state: activity_state,
             evidence,
         } => {
+            state.working_detail = None;
             let projection =
                 state
                     .activity_reducer
@@ -1009,7 +1060,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
     Vec::new()
 }
 
-fn submit(state: &mut UiState) -> Vec<UiEffect> {
+fn submit(state: &mut UiState, immediately: bool) -> Vec<UiEffect> {
     if state.request_submission_pending() {
         state.ui_notice = Some("Response submitted; waiting for confirmation".to_owned());
         return Vec::new();
@@ -1083,11 +1134,26 @@ fn submit(state: &mut UiState) -> Vec<UiEffect> {
         let Some(input) = state.take_composer() else {
             return Vec::new();
         };
-        let mut entry = TranscriptEntry::user(input.clone());
-        entry.continuation = true;
-        state.transcript.push(entry);
-        state.viewport.follow();
-        return vec![UiEffect::Steer { run_id, input }];
+        if immediately {
+            let mut entry = TranscriptEntry::user(input.clone());
+            entry.continuation = true;
+            state.transcript.push(entry);
+            state.transcript_revision = state.transcript_revision.wrapping_add(1);
+            state.viewport.follow();
+            return vec![UiEffect::Steer { run_id, input }];
+        }
+        let operation = state.input_queue.editing.as_ref().map_or(
+            orchestral_core::agent_protocol::wire::QueuedInputOperation::Enqueue,
+            |id| orchestral_core::agent_protocol::wire::QueuedInputOperation::Replace {
+                target: orchestral_core::agent_protocol::wire::CommandId::new(id),
+            },
+        );
+        return vec![UiEffect::QueueInput {
+            run_id,
+            command_id: super::input_queue::command_id(),
+            input,
+            operation,
+        }];
     }
 
     if state.phase == UiPhase::WaitingInput {
@@ -1185,11 +1251,22 @@ mod tests {
                 run_id: "run-a".to_owned(),
             },
         );
+        assert!(matches!(
+            type_and_submit(&mut state, "also inspect tests").as_slice(),
+            [UiEffect::QueueInput { run_id, input, operation:
+                orchestral_core::agent_protocol::wire::QueuedInputOperation::Enqueue, .. }]
+            if run_id == "run-a" && input == "also inspect tests"
+        ));
+        assert!(!state
+            .transcript
+            .iter()
+            .any(|entry| entry.text == "also inspect tests"));
+        update(&mut state, UiMsg::InsertText("change direction now".into()));
         assert_eq!(
-            type_and_submit(&mut state, "also inspect tests"),
+            update(&mut state, UiMsg::SubmitImmediately),
             vec![UiEffect::Steer {
-                run_id: "run-a".to_owned(),
-                input: "also inspect tests".to_owned(),
+                run_id: "run-a".into(),
+                input: "change direction now".into(),
             }]
         );
 

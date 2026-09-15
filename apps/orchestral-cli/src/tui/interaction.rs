@@ -146,7 +146,7 @@ pub(crate) fn route(state: &mut UiState, msg: &UiMsg) -> Option<Vec<UiEffect>> {
                 };
                 return Some(Vec::new());
             }
-            UiMsg::Submit | UiMsg::Complete => {
+            UiMsg::Submit | UiMsg::SubmitImmediately | UiMsg::Complete => {
                 let Some(choice) = menu.selected().cloned() else {
                     return Some(Vec::new());
                 };
@@ -184,7 +184,7 @@ pub(crate) fn route(state: &mut UiState, msg: &UiMsg) -> Option<Vec<UiEffect>> {
             };
             Some(Vec::new())
         }
-        UiMsg::Complete | UiMsg::Submit => {
+        UiMsg::Complete | UiMsg::Submit | UiMsg::SubmitImmediately => {
             let choice = menu.selected().cloned()?;
             if menu.kind == MenuKind::Commands {
                 if state.composer == "/" {
@@ -196,7 +196,7 @@ pub(crate) fn route(state: &mut UiState, msg: &UiMsg) -> Option<Vec<UiEffect>> {
                             return_to: Some(Box::new(menu)),
                         }]);
                     }
-                    if matches!(msg, UiMsg::Submit) {
+                    if matches!(msg, UiMsg::Submit | UiMsg::SubmitImmediately) {
                         if choice.value == "/quit" {
                             return Some(super::state::update(state, UiMsg::Quit));
                         }
@@ -206,12 +206,14 @@ pub(crate) fn route(state: &mut UiState, msg: &UiMsg) -> Option<Vec<UiEffect>> {
                     }
                 }
                 // Unknown slash commands require explicit Tab selection; Enter preserves the error.
-                if matches!(msg, UiMsg::Submit) && state.composer != choice.value {
+                if matches!(msg, UiMsg::Submit | UiMsg::SubmitImmediately)
+                    && state.composer != choice.value
+                {
                     return None;
                 }
                 state.composer = choice.value;
                 state.composer_cursor = state.composer.len();
-                if matches!(msg, UiMsg::Submit) {
+                if matches!(msg, UiMsg::Submit | UiMsg::SubmitImmediately) {
                     None
                 } else {
                     Some(Vec::new())

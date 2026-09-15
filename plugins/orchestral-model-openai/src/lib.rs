@@ -2,7 +2,7 @@
 
 mod continuation;
 mod endpoint;
-pub use endpoint::{discover_models, OpenAiEndpoint};
+pub use endpoint::{discover_model_metadata, discover_models, DiscoveredModel, OpenAiEndpoint};
 mod sampling;
 pub use sampling::OpenAiSamplingConfig;
 mod tool_result;

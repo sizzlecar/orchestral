@@ -41,7 +41,7 @@ pub(super) fn reconstruct_recovery_commands(
         })
         .collect::<BTreeSet<_>>();
     let mut commands = BTreeMap::new();
-    let mut queued_steers = VecDeque::new();
+    let mut queued_steers: VecDeque<QueuedSteer> = VecDeque::new();
     let mut pending_resolutions = BTreeMap::new();
     for record in records {
         let GenericCheckpointEvent::CommandCommitted {
@@ -62,6 +62,37 @@ pub(super) fn reconstruct_recovery_commands(
         if outcome != &ProviderCommandOutcome::Accepted {
             continue;
         }
+        use orchestral_core::agent_protocol::wire::QueuedInputOperation;
+        let queue_operation = QueuedInputOperation::from_command(command)?;
+        if let Some(
+            QueuedInputOperation::Replace { target } | QueuedInputOperation::Withdraw { target },
+        ) = &queue_operation
+        {
+            let Some(index) = queued_steers
+                .iter()
+                .position(|steer| steer.deferred && &steer.command_id == target)
+            else {
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::InvalidDigest,
+                    "accepted queue edit has no pending target in its durable prefix",
+                ));
+            };
+            if matches!(
+                &queue_operation,
+                Some(QueuedInputOperation::Withdraw { .. })
+            ) || applied_commands.contains(&command.command_id)
+            {
+                queued_steers.remove(index);
+            } else if let AgentCommand::Steer { content } = &command.payload {
+                queued_steers[index] = QueuedSteer {
+                    command_id: command.command_id.clone(),
+                    content: content.clone(),
+                    message: agent_content_message(content)?,
+                    deferred: true,
+                };
+            }
+            continue;
+        }
         match &command.payload {
             AgentCommand::Cancel { .. } => {
                 return Err(AgentProtocolError::new(
@@ -78,6 +109,7 @@ pub(super) fn reconstruct_recovery_commands(
                     command_id: command.command_id.clone(),
                     content: content.clone(),
                     message: agent_content_message(content)?,
+                    deferred: queue_operation.is_some(),
                 })
             }
             AgentCommand::ResolveRequest { response }
@@ -189,4 +221,98 @@ pub(super) fn record_command_with_approval(
     );
     run.durable_events.push(durable_disposition);
     Ok(disposition)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use crate::generic_agent_checkpoint::GenericCheckpointRecord;
+    use orchestral_core::agent_protocol::wire::QueuedInputOperation;
+
+    #[test]
+    fn queue_recovery_replays_edits_withdrawals_and_consumption_once() {
+        let run_id = RunId::new("queue-recovery");
+        let operations = [
+            ("a", QueuedInputOperation::Enqueue),
+            ("b", QueuedInputOperation::Enqueue),
+            (
+                "a2",
+                QueuedInputOperation::Replace {
+                    target: CommandId::new("a"),
+                },
+            ),
+            (
+                "a3",
+                QueuedInputOperation::Replace {
+                    target: CommandId::new("a2"),
+                },
+            ),
+            (
+                "withdraw-b",
+                QueuedInputOperation::Withdraw {
+                    target: CommandId::new("b"),
+                },
+            ),
+            ("c", QueuedInputOperation::Enqueue),
+        ];
+        let records = operations
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, operation))| {
+                GenericCheckpointRecord::seal(
+                    GenericCheckpointDraft {
+                        event_id: GenericCheckpointEventId::new(id),
+                        run_id: run_id.clone(),
+                        payload: GenericCheckpointEvent::CommandCommitted {
+                            command: operation
+                                .command(
+                                    CommandId::new(id),
+                                    run_id.clone(),
+                                    vec![Content::text(id)],
+                                )
+                                .unwrap(),
+                            outcome: ProviderCommandOutcome::Accepted,
+                            approval_capability: None,
+                        },
+                    },
+                    index as u64 + 1,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let records: Vec<GenericCheckpointRecord> =
+            serde_json::from_slice(&serde_json::to_vec(&records).unwrap()).unwrap();
+        let (commands, pending, _) = reconstruct_recovery_commands(&records, &[]).unwrap();
+        assert_eq!(commands.len(), 6);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|item| item.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a3", "c"]
+        );
+        assert!(pending.iter().all(|item| item.deferred));
+        let applied = ["a3", "c"]
+            .into_iter()
+            .map(|id| AgentEventDraft {
+                event_id: AgentEventId::new(format!("consumed-{id}")),
+                run_id: run_id.clone(),
+                causation_id: Some(CommandId::new(id)),
+                source_fingerprint: None,
+                payload: AgentEvent::InputCommitted {
+                    content: vec![Content::text(id)],
+                },
+            })
+            .collect::<Vec<_>>();
+        let (_, pending, _) = reconstruct_recovery_commands(&records, &applied[..1]).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|item| item.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        let (_, pending, _) = reconstruct_recovery_commands(&records, &applied).unwrap();
+        assert!(pending.is_empty());
+    }
 }

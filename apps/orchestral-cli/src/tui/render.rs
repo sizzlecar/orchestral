@@ -29,6 +29,8 @@ const DARK_BORDER: Color = Color::Rgb(85, 91, 107);
 const CONTENT_PADDING: u16 = 2;
 const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+mod welcome;
+
 #[derive(Default)]
 pub(crate) struct RenderCache {
     key: Option<(String, u16, bool)>,
@@ -81,18 +83,31 @@ pub(crate) fn render_cached(
     let composer_height = composer_height(state, area.width)
         .min((area.height / if state.input_expanded { 2 } else { 3 }).max(2))
         .min(body_height.saturating_sub(pending_height));
+    let queue_height =
+        if area.height >= 12 && !state.input_queue.pending.is_empty() && menu.is_none() {
+            1 + u16::try_from(state.input_queue.pending.len().min(2)).unwrap_or(2)
+        } else {
+            0
+        };
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(status_height),
         Constraint::Length(pending_height),
+        Constraint::Length(queue_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
     .split(area);
 
     render_header(frame, rows[0], state);
-    let anchor = render_transcript(frame, rows[1], state, cache);
+    let anchor =
+        if state.phase == UiPhase::Idle && state.transcript.is_empty() && state.run_id.is_none() {
+            welcome::render(frame, rows[1], state);
+            None
+        } else {
+            render_transcript(frame, rows[1], state, cache)
+        };
     render_working_status(frame, rows[2], state);
     if let Some(menu) = menu {
         render_menu(frame, rows[3], menu);
@@ -105,8 +120,9 @@ pub(crate) fn render_cached(
             state.approval_scroll,
         );
     }
-    render_composer(frame, rows[4], state);
-    render_footer(frame, rows[5], state);
+    render_input_queue(frame, rows[4], state);
+    render_composer(frame, rows[5], state);
+    render_footer(frame, rows[6], state);
     apply_theme(frame, state);
     anchor
 }
@@ -175,6 +191,49 @@ fn apply_theme(frame: &mut Frame<'_>, state: &UiState) {
             }
         }
     }
+}
+
+fn render_input_queue(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    if area.is_empty() {
+        return;
+    }
+    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let queued = state
+        .input_queue
+        .pending
+        .iter()
+        .filter(|message| super::input_queue::is_active(state, message))
+        .count();
+    let unsent = state.input_queue.pending.len() - queued;
+    let mut lines = vec![Line::styled(
+        format!("Queued {queued} · unsent {unsent} · /queue"),
+        ACCENT,
+    )];
+    for (index, message) in state.input_queue.pending.iter().take(2).enumerate() {
+        let preview = message
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(Line::styled(
+            compact_label(
+                &format!(
+                    "{}  {}{preview}",
+                    index + 1,
+                    if super::input_queue::is_active(state, message) {
+                        ""
+                    } else {
+                        "Unsent: "
+                    }
+                ),
+                inner.width as usize,
+            ),
+            MUTED,
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_menu(frame: &mut Frame<'_>, area: Rect, menu: &super::menu::Menu) {
@@ -1151,7 +1210,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         match state.phase {
             UiPhase::WaitingApproval => ("↑↓ select · a/d · enter confirm", "↑↓ a/d · enter"),
             UiPhase::WaitingInput => ("enter answer · ctrl+c stop", "enter · ^C stop"),
-            UiPhase::Running => ("enter steer · ctrl+c stop", "enter · ^C stop"),
+            UiPhase::Running if state.input_queue.editing.is_some() => {
+                ("enter update · esc discard edit", "enter · esc back")
+            }
+            UiPhase::Running => (
+                "enter queue · alt+enter interrupt · ctrl+c stop",
+                "enter · ^C stop",
+            ),
             UiPhase::Cancelling => ("stopping…", "stopping…"),
             _ => ("enter send · / commands · f1 help", "enter · / · F1"),
         }
@@ -1166,7 +1231,20 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         );
         return;
     }
-    let hint = if hint.width() <= usize::from(inner.width) {
+    let input = state.context_input_tokens.map_or_else(
+        || "unknown".to_owned(),
+        |(tokens, estimated)| format!("{}{tokens}", if estimated { "≈" } else { "" }),
+    );
+    let capacity = state
+        .context_budget
+        .map_or_else(|| "unknown".to_owned(), |budget| budget.to_string());
+    let stats = format!("last input: {input} · limit: {capacity}");
+    let metadata_min_width = if area.width >= 64 {
+        stats.width() + 16
+    } else {
+        0
+    };
+    let hint = if hint.width() + metadata_min_width <= usize::from(inner.width) {
         hint
     } else {
         compact_hint
@@ -1180,11 +1258,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         Constraint::Length(u16::try_from(hint.width()).unwrap_or(inner.width)),
     ])
     .split(inner);
-    let context = state
-        .context_budget
-        .map_or_else(|| "—".to_owned(), |budget| format!("—/{budget}"));
+    let model_width = (columns[0].width.saturating_sub(5) as usize).saturating_sub(stats.width());
+    let model = compact_label(&state.model, model_width);
     let metadata = compact_label(
-        &format!("{} · context: {context}", state.model),
+        &format!("{model} · {stats}"),
         columns[0].width.saturating_sub(2) as usize,
     );
     frame.render_widget(Paragraph::new(metadata).style(MUTED), columns[0]);

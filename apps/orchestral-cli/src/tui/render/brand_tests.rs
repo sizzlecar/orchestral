@@ -9,6 +9,107 @@ use crate::tui::menu::{Choice, Menu, MenuKind};
 use crate::tui::{update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
 
 #[test]
+fn welcome_identifies_the_running_build_and_disappears_into_the_conversation() {
+    let mut state = UiState::new("session", "local-model");
+    state.workspace_path = "/work/project".into();
+    let text = render_to_string(&state, 100, 28);
+    for label in [
+        "ORCHESTRAL",
+        env!("CARGO_PKG_VERSION"),
+        "A runtime for reliable, interactive AI agents.",
+        "local-model",
+        "/work/project",
+        "Type a task below.",
+    ] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    update(&mut state, UiMsg::InsertText("Inspect the project".into()));
+    update(&mut state, UiMsg::Submit);
+    update(
+        &mut state,
+        UiMsg::RunStarted {
+            run_id: "run".into(),
+        },
+    );
+    let text = render_to_string(&state, 100, 28);
+    assert!(text.contains("Inspect the project"), "{text}");
+    assert!(!text.contains("Type a task below."), "{text}");
+}
+
+#[test]
+fn footer_distinguishes_last_input_estimates_and_unknown_capacity() {
+    let mut state = UiState::new("session", "model");
+    state.context_input_tokens = Some((9000, true));
+    let text = render_to_string(&state, 140, 24);
+    assert!(
+        text.contains("last input: ≈9000 · limit: unknown"),
+        "{text}"
+    );
+    state.context_input_tokens = Some((8194, false));
+    state.context_budget = Some(12288);
+    let text = render_to_string(&state, 140, 24);
+    assert!(text.contains("last input: 8194 · limit: 12288"), "{text}");
+    update(
+        &mut state,
+        UiMsg::RunStarted {
+            run_id: "run".into(),
+        },
+    );
+    state.model = "a-long-provider/model-name".repeat(8);
+    state.context_input_tokens = Some((8194, false));
+    for width in [64, 80, 100] {
+        let text = render_to_string(&state, width, 24);
+        assert!(text.contains("last input: 8194 · limit: 12288"), "{text}");
+        assert!(text.lines().last().unwrap().contains("stop"), "{text}");
+    }
+}
+
+#[test]
+fn model_or_tool_progress_replaces_a_stale_recovery_notice() {
+    let mut state = UiState::new("session", "model");
+    update(
+        &mut state,
+        UiMsg::RunStarted {
+            run_id: "run".into(),
+        },
+    );
+    update(
+        &mut state,
+        UiMsg::ProgressReported {
+            summary: "Retrying after context rejection".into(),
+        },
+    );
+    update(
+        &mut state,
+        UiMsg::StreamDelta {
+            delta_id: "delta".into(),
+            output_id: "output".into(),
+            order: 1,
+            text: "Hello".into(),
+        },
+    );
+    assert!(state.working_detail.is_none());
+    state.ui_notice = Some("queued input accepted".into());
+    update(
+        &mut state,
+        UiMsg::ProgressReported {
+            summary: "Retrying after context rejection".into(),
+        },
+    );
+    update(
+        &mut state,
+        UiMsg::ToolActivity {
+            activity_id: "read".into(),
+            tool_name: "file_read".into(),
+            state: orchestral_core::agent_protocol::wire::ToolActivityState::Running,
+            evidence: vec![],
+        },
+    );
+    assert!(state.working_detail.is_none());
+    assert!(state.ui_notice.is_none());
+}
+
+#[test]
 fn minimum_terminal_approval_keeps_operation_and_each_choice_visible() {
     let mut state = UiState::new("session", "local-model");
     update(
@@ -189,7 +290,7 @@ fn brand_palette_keeps_conversation_clean_and_panel_boundaries_visible() {
     let buffer = terminal.backend().buffer();
     assert_eq!(buffer[(2, 0)].symbol(), "_");
     assert_eq!(buffer[(2, 0)].bg, Color::Rgb(131, 255, 107));
-    assert_eq!(buffer[(2, 1)].fg, Color::Rgb(245, 240, 207));
+    assert_eq!(buffer[(2, 1)].fg, Color::Rgb(131, 255, 107));
     assert_eq!(buffer[(2, 1)].bg, Color::Rgb(29, 32, 39));
     assert!(buffer
         .content

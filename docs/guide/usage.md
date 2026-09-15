@@ -21,6 +21,14 @@ orchestral --base-url http://127.0.0.1:8000/v1 --model your-model-id
 Explicit command-line values take precedence. An explicit `--backend` or `--model-profile`
 takes precedence over the URL environment variable.
 
+For custom endpoints, model discovery also reads the optional serving capacity
+`max_model_len`. The effective context budget is the smaller of this capacity and
+the configured Host/backend budgets. Explicit `--model` selection probes the same
+metadata with a two-second deadline; if discovery is unavailable, the configured
+model remains usable and an undeclared capacity is shown as unknown. For an
+endpoint that should not be probed, set backend `config.discover_model_capabilities:
+false` and select a model explicitly.
+
 Custom URLs default to **no authentication** and do not inherit your cloud key. For an
 authenticated local service or gateway, select its credential environment variable:
 
@@ -66,7 +74,12 @@ deterministic:
 | `printf 'fix the bug' \| orchestral` | One-turn Headless |
 
 Headless stdout contains only the final Delivery, so it is safe to pipe into another command;
-progress and errors use stderr. In the TUI, Enter sends, steers, or answers the current question.
+progress and errors use stderr. In the TUI, Enter starts a task or answers the current question.
+During a running task, Enter queues an additional message for the next model call without
+interrupting generation or dispatched tools. Alt+Enter explicitly interrupts generation to steer.
+The pending queue is separate from received conversation input; `/queue` edits or withdraws
+messages until the runtime consumes them. If consumption wins an edit race, the draft is
+preserved and the edit is rejected. Unconsumed messages from a stopped task remain marked unsent.
 Ctrl+J inserts a newline (Shift+Enter also works in supporting terminals). Up/Down edits lines,
 then navigates session input history while preserving your draft. Paste supports CJK, combining
 characters, and emoji; input over 20 lines shows a bounded preview with Ctrl+P to expand.
@@ -78,7 +91,15 @@ file menu is open, including newly created and renamed files. `/model`, `/new`, 
 models or sessions while idle; session drafts survive switching within the current process.
 The `/resume` panel includes “Current session details” for storage and reported usage.
 `/context` scopes skill load records to the current or latest request and shows instruction
-sources loaded for the process and session compaction records. Unknown context usage remains `—`.
+sources loaded for the process and session compaction records. The footer reports
+the latest model request's input tokens, with `≈` for a planning estimate; a provider
+usage event replaces the estimate when available. This is neither accumulated
+session usage nor live KV-cache occupancy. `limit` is the declared context capacity
+intersected with the Host budget; absent metadata remains `unknown`.
+
+An empty TUI session opens with the Orchestral logo, the running build's version,
+selected model and workspace. Sending the first task opens the conversation view.
+Restoring a conversation shows its history instead of the welcome screen.
 
 Ctrl+O expands tool records in the conversation; PgUp/PgDn reads history or the focused panel,
 and End follows new output. Native terminal text selection is retained; `/copy` copies the last
@@ -98,7 +119,10 @@ is restored; edit it or move the cursor before sending so an extra Enter cannot 
 
 The CLI discovers `.orchestral/config.yaml`, `.orchestral/config.yml`,
 `configs/orchestral.cli.yaml`, then `orchestral.yaml`; if none exists it creates
-`.orchestral/generated/default.agent.yaml`. Use `--config`, `--backend`, `--model-profile`, or `--model` for
+an immutable configuration cache under `.orchestral/generated/`. Generated defaults and
+CLI overrides are published atomically and identified by content, so concurrent terminals
+cannot read a partial file or replace another terminal's connection settings.
+Use `--config`, `--backend`, `--model-profile`, or `--model` for
 explicit selection. For example:
 
 ```bash

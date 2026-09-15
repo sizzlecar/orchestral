@@ -230,6 +230,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             return;
         }
         let model_cancellation = cancellation.child_token();
+        publish_context_usage(&inner, &run_id, &model_request, &context_trace, None);
         let started = match tokio::select! {
             _ = cancellation.cancelled() => {
                 emit_cancel(&inner, &request, &user_message);
@@ -312,6 +313,15 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         let mut response = String::new();
         let mut continuation = BTreeMap::new();
         let mut round_usage = started.usage;
+        if let Some(input_tokens) = round_usage.as_ref().and_then(|usage| usage.input_tokens) {
+            publish_context_usage(
+                &inner,
+                &run_id,
+                &model_request,
+                &context_trace,
+                Some(input_tokens),
+            );
+        }
         let mut tool_calls = Vec::<PendingModelToolCall>::new();
         loop {
             let item = tokio::select! {
@@ -464,7 +474,18 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                     };
                     call.ended = true;
                 }
-                ModelEvent::Usage { usage: observed } => round_usage = Some(observed),
+                ModelEvent::Usage { usage: observed } => {
+                    if observed.input_tokens.is_some() {
+                        publish_context_usage(
+                            &inner,
+                            &run_id,
+                            &model_request,
+                            &context_trace,
+                            observed.input_tokens,
+                        );
+                    }
+                    round_usage = Some(observed);
+                }
                 ModelEvent::Finish { reason } => {
                     let committed_usage = round_usage.take();
                     let observation = GenericModelObservation {

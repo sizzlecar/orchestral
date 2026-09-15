@@ -345,6 +345,7 @@ struct QueuedSteer {
     command_id: CommandId,
     content: Vec<Content>,
     message: ModelMessage,
+    deferred: bool,
 }
 
 struct PendingInput {

@@ -3858,6 +3858,8 @@ fn journal_files(workspace: &TestWorkspace, prefix: &str) -> Vec<PathBuf> {
 }
 
 struct CapturedHttpRequest {
+    method: String,
+    path: String,
     headers: std::collections::BTreeMap<String, String>,
     body: Value,
 }
@@ -3911,6 +3913,20 @@ fn spawn_fixture_http_server(
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .expect("bound fixture write timeout");
                 let request = read_http_fixture_request(&mut stream);
+                // These fixtures implement generation/MCP, not discovery.
+                // Optional capability probes must not consume a scripted POST.
+                if request.method == "GET" && request.path.ends_with("/models") {
+                    write_http_fixture_response(
+                        &mut stream,
+                        FixtureHttpResponse {
+                            status: "404 Not Found",
+                            content_type: "application/json",
+                            body: b"{}".to_vec(),
+                            repeat_handler: false,
+                        },
+                    );
+                    continue;
+                }
                 let response = handler(&request);
                 let repeat = response.repeat_handler;
                 write_http_fixture_response(&mut stream, response);
@@ -3942,6 +3958,9 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         }
     };
     let header_text = std::str::from_utf8(&bytes[..header_end]).expect("HTTP headers are UTF-8");
+    let mut request_line = header_text.lines().next().unwrap().split_whitespace();
+    let method = request_line.next().unwrap().to_owned();
+    let path = request_line.next().unwrap().to_owned();
     let headers = header_text
         .lines()
         .skip(1)
@@ -3950,7 +3969,8 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         .collect::<std::collections::BTreeMap<_, _>>();
     let content_length = headers
         .get("content-length")
-        .expect("HTTP fixture request has Content-Length")
+        .map(String::as_str)
+        .unwrap_or("0")
         .parse::<usize>()
         .expect("HTTP fixture Content-Length is valid");
     while bytes.len() < header_end + content_length {
@@ -3959,9 +3979,15 @@ fn read_http_fixture_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         bytes.extend_from_slice(&buffer[..count]);
     }
     CapturedHttpRequest {
+        method,
+        path,
         headers,
-        body: serde_json::from_slice(&bytes[header_end..header_end + content_length])
-            .expect("HTTP fixture request body is JSON"),
+        body: if content_length == 0 {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                .expect("HTTP fixture request body is JSON")
+        },
     }
 }
 
