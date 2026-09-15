@@ -45,7 +45,24 @@ pub(super) fn commit_context_recovery(
     let rejected_input_tokens = trace.input_budget_tokens.min(planned_input);
     // The retry must be smaller, but halving a hard ceiling can exclude the
     // immutable task itself. Keep half as the preferred compaction target.
-    let input_budget_tokens = rejected_input_tokens.saturating_sub(1);
+    let reduced_output = inner
+        .config
+        .context_recovery
+        .minimum_output_tokens
+        .map(|floor| {
+            floor
+                .get()
+                .max(inner.config.minimum_output_reserve_tokens.unwrap_or(0))
+        })
+        .zip(model_request.max_output_tokens)
+        .and_then(|(floor, output)| (output > floor).then(|| (output / 2).max(floor)));
+    let output_budget_tokens =
+        reduced_output.or_else(|| previous.and_then(|prior| prior.output_budget_tokens));
+    let input_budget_tokens = if reduced_output.is_some() {
+        trace.input_budget_tokens
+    } else {
+        rejected_input_tokens.saturating_sub(1)
+    };
     let target_input_tokens = rejected_input_tokens / 2;
     let Some(retry_number) = retry_number.filter(|number| {
         *number <= inner.config.context_recovery.max_retries && input_budget_tokens > 0
@@ -68,25 +85,37 @@ pub(super) fn commit_context_recovery(
             request_id: model_request.request_id.clone(),
             retry_number,
             input_budget_tokens,
+            output_budget_tokens,
             error,
         },
     )?;
-    publish_telemetry(inner, run_id, AgentTelemetryEnvelope {
-        telemetry_id: TelemetryId::new(format!(
-            "generic-{}-context-recovery-{round}", run_id.as_str()
-        )),
-        run_id: run_id.clone(),
-        provider_seq: None,
-        payload: AgentTelemetry::ProgressReported {
-            message: format!(
+    publish_telemetry(
+        inner,
+        run_id,
+        AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!(
+                "generic-{}-context-recovery-{round}",
+                run_id.as_str()
+            )),
+            run_id: run_id.clone(),
+            provider_seq: None,
+            payload: AgentTelemetry::ProgressReported {
+                message: if let Some(output) = reduced_output {
+                    format!("Model rejected context capacity; reducing output reservation to {output} tokens (recovery {retry_number}/{})", inner.config.context_recovery.max_retries)
+                } else {
+                    format!(
                 "Model rejected context capacity; compacting toward {target_input_tokens} input tokens within a {input_budget_tokens}-token ceiling (recovery {retry_number}/{})",
                 inner.config.context_recovery.max_retries
-            ),
-            fraction: None,
+            )
+                },
+                fraction: None,
+            },
         },
-    });
+    );
     Ok(GenericContextRecovery {
         retry_number,
         input_budget_tokens,
+        output_budget_tokens,
+        compact_input: reduced_output.is_none(),
     })
 }

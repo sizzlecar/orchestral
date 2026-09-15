@@ -195,11 +195,8 @@ pub(super) fn model_dispatch_budget(
     }
 
     let mut output_cap = output_reserve_tokens;
-    // Elastic context planning must set the wire cap explicitly. Otherwise
-    // the backend's configured default could consume the room just reclaimed
-    // from the preferred output reservation.
-    let mut bounded_output = request.run.spec.limits.max_output_tokens.is_some()
-        || config.minimum_output_reserve_tokens.is_some();
+    // Every projection reserves response room, including unconstrained Runs.
+    // Send that same cap: an adapter default may exceed the planned capacity.
     if let Some(ceiling) = &request.run.spec.limits.max_cost {
         let policy = config
             .model_cost_policy
@@ -221,12 +218,11 @@ pub(super) fn model_dispatch_budget(
         if output_cap == 0 {
             return Err(RunLimitKind::Cost);
         }
-        bounded_output = true;
     }
 
     Ok(ModelDispatchBudget {
         projected_input_tokens,
-        max_output_tokens: bounded_output.then_some(output_cap),
+        max_output_tokens: Some(output_cap),
     })
 }
 

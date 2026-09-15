@@ -137,6 +137,10 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 return;
             }
         };
+        let output_reserve = context_recovery
+            .as_ref()
+            .and_then(|recovery| recovery.output_budget_tokens)
+            .map_or(output_reserve, |cap| output_reserve.min(cap));
         let model_context = match project_model_context(
             &inner,
             &request,
@@ -153,7 +157,11 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                     .as_ref()
                     .and_then(|recovery| recovery.compaction_target_tokens()),
                 reserved_output_tokens: Some(
-                    if inner.config.minimum_output_reserve_tokens.is_some() {
+                    if inner.config.minimum_output_reserve_tokens.is_some()
+                        || context_recovery
+                            .as_ref()
+                            .is_some_and(|recovery| recovery.output_budget_tokens.is_some())
+                    {
                         output_reserve
                     } else {
                         inner.config.reserved_output_tokens

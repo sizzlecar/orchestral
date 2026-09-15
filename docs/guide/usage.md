@@ -145,7 +145,11 @@ use the Controller's existing checkpoint recovery contract: pending input and
 approval remain interactive, unobserved model attempts become `Incomplete`, and
 committed Tool effects are not repeated. Uncertain effects remain `UnknownEffect`;
 incompatible recovery identities fail explicitly. Each filesystem journal permits
-one Host writer, while read-only browsing can run concurrently.
+one Host writer. Local CLI sessions use separate directories under
+`journal.root_dir/sessions`, so multiple terminals can work in the same project.
+The same session can only be controlled by one terminal at a time. Browsing and
+resume include both these sessions and legacy journals; `serve` keeps its shared
+Host journal and writer lease.
 
 Long conversations retain their original records through repeated compaction.
 The compactor follows journal references back to original exchanges, avoiding

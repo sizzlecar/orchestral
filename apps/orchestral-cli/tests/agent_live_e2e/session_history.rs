@@ -1,5 +1,104 @@
 use super::*;
 
+#[test]
+fn three_default_tuis_share_a_workspace_and_recover_first_turn_capacity() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("concurrent-default-tuis");
+    fs::remove_file(workspace.path("orchestral.yaml")).unwrap();
+    fs::write(workspace.path("note.txt"), "Shared workspace evidence").unwrap();
+    // The existing serve Host must remain protected while new local sessions run.
+    let _legacy_writer = orchestral_agent_journal_fs::FileAgentJournalStore::open_single_writer(
+        workspace.path(".orchestral/agent-journal"),
+    )
+    .unwrap();
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(move |request| {
+        let count = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let output_cap = request.body["max_tokens"].as_u64().unwrap();
+        assert!(
+            output_cap <= 4096,
+            "wire output must fit the default Host reservation"
+        );
+        let mut response = if output_cap > 2048 {
+            FixtureHttpResponse {
+                status: "400 Bad Request", content_type: "application/json", repeat_handler: false,
+                body: serde_json::to_vec(&json!({"error":{"code":"context_length_exceeded", "message":"input plus output exceeds capacity"}})).unwrap(),
+            }
+        } else if model_tool_result_envelopes(&request.body).is_empty() {
+            openai_tool_response("read-note", "file_read", json!({"path":"note.txt"}))
+        } else {
+            assert!(request.body["messages"]
+                .to_string()
+                .contains("Shared workspace evidence"));
+            openai_text_response("The shared workspace note was read.")
+        };
+        response.repeat_handler = count < 9;
+        response
+    })]);
+    let mut windows = Vec::new();
+    for _ in 0..3 {
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
+        command.cwd(&workspace.root);
+        command.args([
+            "--base-url",
+            &endpoint,
+            "--model",
+            "fixture-model",
+            "--no-auth",
+        ]);
+        windows.push(PtyHarness::spawn(command));
+    }
+    for tui in &mut windows {
+        tui.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+        tui.send_paste("Read note.txt and report what it contains.");
+    }
+    for tui in &mut windows {
+        tui.wait_for_text("The shared workspace note was read.", LOCAL_PROCESS_TIMEOUT);
+        tui.wait_for_text("○ replied", LOCAL_PROCESS_TIMEOUT);
+    }
+    let mut browse_command = Command::new(env!("CARGO_BIN_EXE_orchestral"));
+    browse_command
+        .current_dir(&workspace.root)
+        .args(["sessions", "list", "--json"]);
+    let output = run_to_completion(browse_command, LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = page["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 3);
+    for session in sessions {
+        assert_eq!(session["status"], "delivered");
+    }
+    for tui in windows {
+        exit_tui(tui);
+    }
+    assert_eq!(server.join().unwrap().len(), 9);
+}
+
+#[test]
+fn doctor_rejects_the_same_invalid_profile_format_as_startup() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("invalid-profile-doctor");
+    workspace.configure_local_openai("http://127.0.0.1:1");
+    workspace.rewrite_config(|config| {
+        config["providers"]["models"][0]["config"]["tool_result_format"] =
+            serde_yaml::to_value("text_parts_v3").unwrap();
+        let name = config["providers"]["models"][0]["name"].clone();
+        config["agent"]["model_profile"] = name;
+    });
+    let mut command = base_command(&workspace);
+    command
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--backend", "openai", "doctor", "--json"]);
+    let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
+    assert!(!output.status.success());
+    assert!(
+        output.stdout_text().contains("config.tool_result_format"),
+        "{} {}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+}
+
 struct LegacyModel;
 
 #[async_trait::async_trait]

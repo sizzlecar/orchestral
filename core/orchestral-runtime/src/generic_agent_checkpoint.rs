@@ -314,12 +314,14 @@ pub enum GenericCheckpointEvent {
     },
     /// A definite capacity rejection, before any model usage or content.
     /// This closes the attempt without executing tools and durably reserves
-    /// a smaller input budget for a new model round, including after restart.
+    /// a smaller input or output budget, including after restart.
     ModelContextRejected {
         round: u64,
         request_id: ModelRequestId,
         retry_number: u32,
         input_budget_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget_tokens: Option<u64>,
         error: orchestral_core::model_protocol::ModelError,
     },
     /// A retry within an open logical attempt, before any non-usage event was
@@ -365,6 +367,7 @@ impl GenericCheckpointEvent {
                 request_id,
                 retry_number,
                 input_budget_tokens,
+                output_budget_tokens,
                 error,
             } => {
                 if *round == 0
@@ -372,6 +375,7 @@ impl GenericCheckpointEvent {
                     || request_id.is_empty()
                     || *retry_number == 0
                     || *input_budget_tokens == 0
+                    || *output_budget_tokens == Some(0)
                     || error.code
                         != orchestral_core::model_protocol::ModelErrorCode::ContextLengthExceeded
                 {
@@ -712,13 +716,15 @@ pub struct GenericContextRecovery {
     /// the learned per-request ceiling remains in force for this Run.
     pub retry_number: u32,
     pub input_budget_tokens: u64,
+    pub output_budget_tokens: Option<u64>,
+    pub compact_input: bool,
 }
 
 impl GenericContextRecovery {
     /// The ceiling is one token below the rejected input; rounding its half
     /// upward recovers half the original rejected input without overflowing.
     pub(crate) fn compaction_target_tokens(&self) -> Option<u64> {
-        (self.retry_number > 0).then(|| self.input_budget_tokens.div_ceil(2))
+        (self.retry_number > 0 && self.compact_input).then(|| self.input_budget_tokens.div_ceil(2))
     }
 
     pub(crate) fn generation_observed(&mut self) {
@@ -779,6 +785,7 @@ pub fn replay_generic_agent_checkpoint(
                 request_id,
                 retry_number,
                 input_budget_tokens,
+                output_budget_tokens,
                 ..
             } => {
                 let GenericCheckpointPhase::ModelAttemptOpen {
@@ -792,14 +799,9 @@ pub fn replay_generic_agent_checkpoint(
                         "context rejection must close an open model attempt".to_owned(),
                     ));
                 };
-                let trace = &started_context
-                    .as_ref()
-                    .ok_or_else(|| {
-                        GenericCheckpointError::InvalidData(
-                            "missing rejected context trace".to_owned(),
-                        )
-                    })?
-                    .0;
+                let (trace, rejected_output) = &started_context.as_ref().ok_or_else(|| {
+                    GenericCheckpointError::InvalidData("missing rejected context trace".to_owned())
+                })?;
                 let planned_input = trace
                     .context_estimate
                     .as_ref()
@@ -810,11 +812,16 @@ pub fn replay_generic_agent_checkpoint(
                         .as_ref()
                         .map_or(Some(1), |prior| prior.retry_number.checked_add(1))
                         != Some(*retry_number)
-                    || *input_budget_tokens >= trace.input_budget_tokens
-                    || *input_budget_tokens >= planned_input
+                    || *input_budget_tokens > trace.input_budget_tokens
+                    || output_budget_tokens
+                        .is_some_and(|output| rejected_output.is_none_or(|prior| output > prior))
+                    || !(*input_budget_tokens < planned_input
+                        || output_budget_tokens.is_some_and(|output| {
+                            rejected_output.is_some_and(|prior| output < prior)
+                        }))
                 {
                     return Err(GenericCheckpointError::InvalidData(
-                        "context recovery must advance its rejection count and reduce the rejected input budget".to_owned(),
+                        "context recovery must advance its rejection count and reduce the rejected input or output budget".to_owned(),
                     ));
                 }
                 let mut next = boundary.clone();
@@ -827,6 +834,8 @@ pub fn replay_generic_agent_checkpoint(
                 context_recovery = Some(GenericContextRecovery {
                     retry_number: *retry_number,
                     input_budget_tokens: *input_budget_tokens,
+                    output_budget_tokens: *output_budget_tokens,
+                    compact_input: *input_budget_tokens < planned_input,
                 });
             }
             GenericCheckpointEvent::ModelRetryScheduled {

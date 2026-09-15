@@ -207,7 +207,16 @@ pub(crate) async fn run_tui(
                         state.context_budget = Some(host.metadata.context_budget);
                         state.ui_notice = Some("Model selected for the next request".to_owned());
                     }
-                    Ok(super::services::Response::Session { client: next, history, run }) => {
+                    Ok(super::services::Response::Session { host: next_host, options: next_options, client: next, history, run }) => {
+                        if !Arc::ptr_eq(host, &next_host) {
+                            let old = std::mem::replace(host, next_host);
+                            service_tasks.cleanup.push(tokio::spawn(async move { old.shutdown().await; }));
+                        }
+                        options = *next_options;
+                        approval_broker = host.approvals.clone();
+                        process_supervisor = host.process_supervisor.clone();
+                        process_events = process_supervisor.subscribe();
+                        process_events_open = true;
                         drafts.insert(state.session_id.clone(), (state.composer.clone(), state.composer_cursor, state.references.clone()));
                         let mut next_state = UiState::new(next.session_id().as_str(), host.model.clone());
                         next_state.terminal_size = state.terminal_size;

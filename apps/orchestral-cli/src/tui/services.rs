@@ -193,7 +193,9 @@ impl Tasks {
             if let Err(error) =
                 tx.send((generation, response.map_err(|error| format!("{error:#}"))))
             {
-                if let Ok(Response::Model { host, .. }) = error.0 .1 {
+                if let Ok(Response::Model { host, .. } | Response::Session { host, .. }) =
+                    error.0 .1
+                {
                     host.shutdown().await;
                 }
             }
@@ -244,6 +246,8 @@ pub(crate) enum Response {
         options: AgentRunOptions,
     },
     Session {
+        host: Arc<AgentHost>,
+        options: Box<AgentRunOptions>,
         client: AgentClient,
         history: Option<SessionHistory>,
         run: Option<AgentRunHandle>,
@@ -293,7 +297,7 @@ async fn local_action(host: &AgentHost, session: &str, action: LocalAction) -> R
 
 pub(crate) async fn command(
     host: Arc<AgentHost>,
-    options: AgentRunOptions,
+    mut options: AgentRunOptions,
     session: String,
     name: String,
     copy: Option<String>,
@@ -362,14 +366,18 @@ pub(crate) async fn command(
                 choices,
             )))
         }
-        "/new" => Ok(Response::Session {
-            client: host.client(AgentSessionId::new(format!(
-                "cli-session-{}",
-                uuid::Uuid::new_v4()
-            ))),
-            history: None,
-            run: None,
-        }),
+        "/new" => {
+            let id = AgentSessionId::new(format!("cli-session-{}", uuid::Uuid::new_v4()));
+            options.session_id = Some(id.as_str().to_owned());
+            let next = Arc::new(host.switch_session(&options).await?);
+            Ok(Response::Session {
+                client: next.client(id),
+                host: next,
+                options: Box::new(options),
+                history: None,
+                run: None,
+            })
+        }
         "/context" => {
             let history = host
                 .session_history
@@ -437,10 +445,18 @@ pub(crate) async fn choose(
                 &history,
                 &host.workspace_root.display().to_string(),
             )?;
-            let client = host.client(id);
+            let next = if options.session_id.as_deref() == Some(id.as_str()) {
+                host.clone()
+            } else {
+                options.session_id = Some(id.as_str().to_owned());
+                Arc::new(host.switch_session(&options).await?)
+            };
+            let client = next.client(id);
             let run = crate::agent::resume_unfinished(&client, Some(&history)).await?;
-            let history = host.session_history.read(client.session_id()).await?;
+            let history = next.session_history.read(client.session_id()).await?;
             Ok(Response::Session {
+                host: next,
+                options: Box::new(options),
                 client,
                 history,
                 run,

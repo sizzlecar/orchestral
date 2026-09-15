@@ -3829,9 +3829,24 @@ fn run_payload_count(workspace: &TestWorkspace, kind: &str) -> usize {
 
 fn journal_files(workspace: &TestWorkspace, prefix: &str) -> Vec<PathBuf> {
     let directory = workspace.path(".orchestral/agent-journal");
-    let mut files = fs::read_dir(&directory)
-        .unwrap_or_else(|error| panic!("read journal directory '{}': {error}", directory.display()))
-        .map(|entry| entry.expect("journal entry").path())
+    let mut directories = vec![directory.clone()];
+    if let Ok(entries) = fs::read_dir(directory.join("sessions")) {
+        directories.extend(
+            entries
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_dir())
+                .map(|entry| entry.path()),
+        );
+    }
+    let mut files = directories
+        .iter()
+        .flat_map(|directory| {
+            fs::read_dir(directory)
+                .unwrap_or_else(|error| {
+                    panic!("read journal directory '{}': {error}", directory.display())
+                })
+                .map(|entry| entry.expect("journal entry").path())
+        })
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())

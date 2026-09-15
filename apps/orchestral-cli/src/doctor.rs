@@ -63,6 +63,26 @@ impl DoctorCommand {
             "missing"
         };
         let mut problems = Vec::new();
+        // Construct the same adapter as startup. This parses provider/profile
+        // options and validates capabilities without sending a model request.
+        if let Err(error) = crate::agent::build_model_backend(
+            &backend,
+            config
+                .agent
+                .model
+                .as_deref()
+                .or_else(|| profile.as_ref().map(|profile| profile.model.as_str()))
+                .unwrap_or("auto"),
+            profile
+                .as_ref()
+                .and_then(|profile| profile.temperature)
+                .unwrap_or(0.7),
+            profile.as_ref(),
+            config.agent.stream_buffer,
+            options.credential_file.as_deref(),
+        ) {
+            problems.push(format!("{error:#}"));
+        }
         if authentication == "missing" {
             problems.push("Configure your provider key, or use --base-url http://127.0.0.1:8000/v1 for a local server.".to_owned());
         }

@@ -236,7 +236,7 @@ pub struct AgentHost {
     pub model: String,
     pub workspace_root: PathBuf,
     pub execution_profile: AgentSessionExecutionProfile,
-    pub session_history: JournalSessionHistory,
+    pub session_history: crate::local_sessions::LocalSessionHistory,
     session_origin: SessionOrigin,
     pub(crate) skill_manager: SkillManager,
     controller: Arc<AgentController>,
@@ -262,7 +262,19 @@ impl AgentHost {
         )
         .await?;
         next.metadata.journal_location = self.metadata.journal_location.clone();
+        next.session_history = self.session_history.clone();
         Ok(next)
+    }
+
+    pub(crate) async fn switch_session(&self, options: &AgentRunOptions) -> anyhow::Result<Self> {
+        if matches!(
+            self.session_history,
+            crate::local_sessions::LocalSessionHistory::Single(_)
+        ) {
+            self.reconfigure(options).await
+        } else {
+            build_agent_host_with_journals(options, None, self.local_input_available).await
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -347,6 +359,18 @@ async fn build_agent_host_with_journals(
         workspaces.primary.display(),
         workspace_context
     ));
+    let base_journal_root = std::path::PathBuf::from(&config.journal.root_dir);
+    let journal_root = if local_input_available.is_some()
+        && matches!(config.journal.backend.as_str(), "fs" | "filesystem")
+    {
+        let id = options
+            .session_id
+            .as_deref()
+            .context("local Agent requires a session identity before opening storage")?;
+        crate::local_sessions::writer_root(&base_journal_root, &AgentSessionId::new(id)).await?
+    } else {
+        base_journal_root.clone()
+    };
     let journals = if let Some(shared) = shared {
         shared
     } else {
@@ -358,10 +382,10 @@ async fn build_agent_host_with_journals(
                 checkpoint: Arc::new(InMemoryGenericAgentCheckpointStore::default()),
             },
             "filesystem" | "fs" => {
-                let root = config.journal.root_dir.as_str();
+                let root = &journal_root;
                 let store = Arc::new(
                     FileAgentJournalStore::open_single_writer(root)
-                        .with_context(|| format!("open Agent Journal at '{root}'"))?,
+                        .with_context(|| format!("open Agent Journal at '{}'; if resuming, close the other terminal controlling this session", root.display()))?,
                 );
                 CliJournalStores {
                     run: store.clone(),
@@ -382,18 +406,22 @@ async fn build_agent_host_with_journals(
     let metadata = HostMetadata {
         context_budget: config.agent.max_context_tokens,
         workspaces: std::iter::once(workspaces.primary.clone()).chain(workspaces.additional.clone()).collect(),
-        journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&config.journal.root_dir)?.display().to_string() },
+        journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&journal_root)?.display().to_string() },
         context: format!("Context budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
             config.agent.max_context_tokens, config.agent.reserved_output_tokens,
             if config.agent.compaction.enabled { "automatic" } else { "disabled" },
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
         models: config.providers.models.clone(),
     };
-    let session_history = JournalSessionHistory::new(
-        run_journal.clone(),
-        session_journal.clone(),
-        ProviderBindingRef::new(crate::local_sessions::GENERIC_BINDING),
-    );
+    let session_history = if matches!(config.journal.backend.as_str(), "fs" | "filesystem") {
+        crate::local_sessions::LocalSessionHistory::Directory(base_journal_root)
+    } else {
+        crate::local_sessions::LocalSessionHistory::Single(JournalSessionHistory::new(
+            run_journal.clone(),
+            session_journal.clone(),
+            ProviderBindingRef::new(crate::local_sessions::GENERIC_BINDING),
+        ))
+    };
     let mcp_configs = if options.no_mcp {
         Vec::new()
     } else {
@@ -564,7 +592,13 @@ async fn build_agent_host_with_journals(
     })
 }
 
-pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
+pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
+    let session_id = AgentSessionId::new(
+        options
+            .session_id
+            .get_or_insert_with(|| unique_id("cli-session", 0))
+            .clone(),
+    );
     let stdin_is_terminal = io::stdin().is_terminal();
     let entry_mode = select_entry_mode(
         options.input.clone(),
@@ -576,12 +610,6 @@ pub async fn run(options: AgentRunOptions) -> anyhow::Result<()> {
         build_agent_host_with_journals(&options, None, Some(local_input_available)).await?,
     );
     let tui_options = options.clone();
-    let session_id = AgentSessionId::new(
-        options
-            .session_id
-            .clone()
-            .unwrap_or_else(|| unique_id("cli-session", 0)),
-    );
     let client = host.client(session_id.clone());
 
     let result = async {
@@ -1591,7 +1619,7 @@ async fn resolve_model(
     Ok((backend, profile, model, temperature))
 }
 
-fn build_model_backend(
+pub(crate) fn build_model_backend(
     backend: &BackendSpec,
     model: &str,
     temperature: f32,

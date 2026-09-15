@@ -16,6 +16,10 @@ use orchestral_runtime::session_history::JournalSessionHistory;
 use crate::agent::AgentRunOptions;
 use crate::runtime::client::resolve_runtime_config_path;
 
+mod storage;
+pub(crate) use storage::writer_root;
+pub use storage::LocalSessionHistory;
+
 pub(crate) const GENERIC_BINDING: &str = "orchestral/generic-agent";
 
 #[derive(Debug, Args)]
@@ -44,24 +48,17 @@ pub(crate) fn workspace(cwd: Option<&Path>) -> anyhow::Result<String> {
         .context("session workspace is not UTF-8")
 }
 
-pub(crate) fn open_history(config_path: Option<PathBuf>) -> anyhow::Result<JournalSessionHistory> {
+pub(crate) fn open_history(config_path: Option<PathBuf>) -> anyhow::Result<LocalSessionHistory> {
     let config = load_config(&resolve_runtime_config_path(config_path)?)?;
     match config.journal.backend.as_str() {
-        "fs" | "filesystem" if Path::new(&config.journal.root_dir).exists() => {
-            let store = Arc::new(FileAgentJournalStore::open_read_only(
-                &config.journal.root_dir,
-            )?);
-            Ok(JournalSessionHistory::new(
-                store.clone(),
-                store,
-                ProviderBindingRef::new(GENERIC_BINDING),
-            ))
-        }
-        "fs" | "filesystem" | "memory" => Ok(JournalSessionHistory::new(
+        "fs" | "filesystem" => Ok(LocalSessionHistory::Directory(
+            config.journal.root_dir.into(),
+        )),
+        "memory" => Ok(LocalSessionHistory::Single(JournalSessionHistory::new(
             Arc::new(InMemoryAgentJournalStore::default()),
             Arc::new(InMemoryAgentSessionJournalStore::default()),
             ProviderBindingRef::new(GENERIC_BINDING),
-        )),
+        ))),
         backend => bail!("unsupported session journal backend: {backend}"),
     }
 }
