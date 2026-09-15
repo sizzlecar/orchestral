@@ -116,7 +116,7 @@ pub struct GenericModelContextTrace {
 }
 
 impl GenericModelContextTrace {
-    fn validate(&self) -> Result<(), GenericCheckpointError> {
+    pub(crate) fn validate(&self) -> Result<(), GenericCheckpointError> {
         if self.planning.as_ref().is_some_and(|planning| {
             !planning.input.validate()
                 || planning.input.raw_estimate_tokens > self.used_input_tokens
