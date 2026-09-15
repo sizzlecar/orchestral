@@ -754,7 +754,10 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
     );
     assert!(!list.contains("DESCRIPTION_END"));
     assert!(!list.contains("SKILL.md"));
-    assert!(!list.contains(workspace.root.to_str().unwrap()));
+    // The welcome view above the menu intentionally shows the workspace.
+    // Skill source paths belong in details, not in the catalog itself.
+    let catalog = list.split_once("Skills · this workspace").unwrap().1;
+    assert!(!catalog.contains(workspace.root.to_str().unwrap()));
     let description_row = list
         .lines()
         .position(|line| line.contains("Prepare reports."))
@@ -821,7 +824,14 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
     tui.wait_for_screen(|s| s.contains("Filter: report"), LOCAL_PROCESS_TIMEOUT);
     tui.send(b"\x1b");
     let closed = tui.wait_for_screen(
-        |s| s.contains("Ask Orchestral") && !s.contains("Filter:"),
+        // PTY reads can split the redraw after the filter has cleared but
+        // before the remaining catalog rows are erased.
+        |s| {
+            s.contains("Ask Orchestral")
+                && !s.contains("Filter:")
+                && !s.contains("Prepare reports.")
+                && !s.contains("report-builder")
+        },
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(!closed.contains("Prepare reports."));
