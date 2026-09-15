@@ -81,15 +81,15 @@ function run(args, cwd, extraEnv = {}) {
     assert.deepEqual(requests.map(req => req.url), ['/v1/models', '/v1/chat/completions']);
     assert.ok(requests.every(req => req.auth === undefined));
   });
-  await scenario('full endpoint and explicit model skip discovery', async cwd => {
+  await scenario('full endpoint and explicit model discover capacity', async cwd => {
     const result = await run(['--base-url', `${base}/proxy/v1/chat/completions`, '--model', 'local-test', ...prompt], cwd);
     assert.equal(result.code, 0, result.stderr);
-    assert.deepEqual(requests.map(req => req.url), ['/proxy/v1/chat/completions']);
+    assert.deepEqual(requests.map(req => req.url), ['/proxy/v1/models', '/proxy/v1/chat/completions']);
   });
   await scenario('environment URL and model work without YAML', async cwd => {
     const result = await run(prompt, cwd, { OPENAI_BASE_URL: `${base}/v1`, OPENAI_MODEL: 'local-test' });
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(requests.length, 1);
+    assert.deepEqual(requests.map(req => req.url), ['/v1/models', '/v1/chat/completions']);
   });
   await scenario('explicit key is sent only when selected', async cwd => {
     const result = await run(['--base-url', base, '--api-key-env', 'LOCAL_TEST_API_KEY', ...prompt], cwd, { LOCAL_TEST_API_KEY: 'local-only' });
@@ -177,7 +177,8 @@ function run(args, cwd, extraEnv = {}) {
       assert.equal(page.status, 200);
       assert.match(await page.text(), /orchestral-web/);
       assert.equal((await fetch(`${origin}/api/v1/sessions`)).status, 401);
-      assert.equal(requests.length, 0, 'starting the server must not generate model output');
+      assert.deepEqual(requests.map(req => req.url), ['/v1/models'], 'startup only discovers model capacity');
+      assert.ok(requests.every(req => req.body === undefined), 'starting the server must not generate model output');
     } finally {
       child.kill();
       await exited;
