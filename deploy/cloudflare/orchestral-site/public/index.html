@@ -41,6 +41,16 @@
         <p class="terminal-caption">ILLUSTRATIVE SESSION · RESPONSES VARY</p>
       </div>
     </section>
+    <section id="demo" class="section wrap" aria-labelledby="demo-heading">
+      <div class="section-heading"><p class="eyebrow">LOCAL DEMO</p><h2 id="demo-heading">One local model.<br>Three working terminals.</h2><p>Ferrum serves the model in the upper left. Three native Orchestral sessions inspect code, make changes, and run tests at the same time.</p></div>
+      <figure class="demo-recording">
+        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.png">
+          <source src="https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4" type="video/mp4">
+          <a href="https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4">Download the terminal demo</a>.
+        </video>
+        <figcaption id="demo-caption">Three concurrent coding sessions, with all repairs independently tested. M1 Max · Qwen3.5-9B Q4_K_M. Authentic terminal replay · 8× speed. <a href="https://github.com/sizzlecar/orchestral#see-it-in-action">Try it locally ↗</a> · <a href="https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-demo-notes.md">Recording details ↗</a></figcaption>
+      </figure>
+    </section>
     <section class="principles wrap" aria-label="Why Orchestral">
       <article><span class="index">[01]</span><h2>Work in your project</h2><p>Read and edit files, run commands, and bring in project instructions, skills and MCP tools.</p></article>
       <article><span class="index">[02]</span><h2>Keep the context</h2><p>Resume a recorded session. Original messages and tool records remain available through compaction.</p></article>
@@ -81,7 +91,7 @@ cargo install --locked --path apps/orchestral-cli</code></pre><button class="cop
         <article class="guide"><span class="tag">CLOUD API</span><h3>Bring your API key</h3><p>For OpenAI, set a key and launch Orchestral. Keys stay in your environment.</p><p class="code-label">macOS / Linux</p><div class="command"><pre><code id="cloud-unix">export OPENAI_API_KEY="your-api-key"
 orchestral</code></pre><button class="copy" data-copy="cloud-unix" aria-label="Copy Shell cloud setup">Copy</button></div><p class="code-label">PowerShell</p><div class="command"><pre><code id="cloud-windows">$env:OPENAI_API_KEY="your-api-key"
 orchestral</code></pre><button class="copy" data-copy="cloud-windows" aria-label="Copy PowerShell cloud setup">Copy</button></div></article>
-        <article class="guide"><span class="tag">LOCAL API</span><h3>Connect to Ferrum</h3><p>With Ferrum serving a tool-capable model on port 8000, connect directly. Other OpenAI-compatible servers work through the same endpoint option.</p><div class="command"><pre><code id="local-command">orchestral --base-url http://127.0.0.1:8000/v1</code></pre><button class="copy" data-copy="local-command" aria-label="Copy local API command">Copy</button></div><p>A single available model is selected automatically. With several models, add <code>--model your-model-id</code>. Custom URLs default to no authentication; a protected server can use <code>--api-key-env YOUR_KEY_VARIABLE</code>.</p><p class="code-label">Check the connection without generating a response</p><div class="command"><pre><code id="doctor-command">orchestral --base-url http://127.0.0.1:8000/v1 doctor --check-connection</code></pre><button class="copy" data-copy="doctor-command" aria-label="Copy connection check command">Copy</button></div></article>
+        <article class="guide"><span class="tag">LOCAL API</span><h3>Connect a local model</h3><p>Connect to an OpenAI-compatible server running a tool-capable model on port 8000. Ferrum is the optional local example above, not an Orchestral dependency.</p><div class="command"><pre><code id="local-command">orchestral --base-url http://127.0.0.1:8000/v1</code></pre><button class="copy" data-copy="local-command" aria-label="Copy local API command">Copy</button></div><p>A single available model is selected automatically. With several models, add <code>--model your-model-id</code>. Custom URLs default to no authentication; a protected server can use <code>--api-key-env YOUR_KEY_VARIABLE</code>.</p><p class="code-label">Check the connection without generating a response</p><div class="command"><pre><code id="doctor-command">orchestral --base-url http://127.0.0.1:8000/v1 doctor --check-connection</code></pre><button class="copy" data-copy="doctor-command" aria-label="Copy connection check command">Copy</button></div></article>
       </div>
       <p class="footnote">The local API shortcut and connection check are part of the v0.3.1 release in preparation. Your server and model must support tool calling to perform coding actions.</p>
     </section>
