@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 
+use dioxus::dioxus_core::Task;
 use dioxus::html::FileData;
-use dioxus::prelude::{spawn, ReadableExt, Signal, WritableExt};
+use dioxus::prelude::{ReadableExt, Signal, WritableExt};
 use futures_util::{stream, StreamExt};
 use gloo_timers::future::TimeoutFuture;
 use serde_json::{json, Value};
@@ -21,6 +23,7 @@ use crate::state::{
     is_terminal, AgentSessionListState, AgentSessionReconcileCoordinator, AppState, AuthStatus,
     ConnectorsState, LoadStatus, Notice, SessionsState,
 };
+use crate::tasks::AppTaskScope;
 
 const AGENT_HISTORY_PAGE_LIMIT: u32 = 100;
 const AGENT_SESSION_LIST_PAGE_LIMIT: u32 = 25;
@@ -129,6 +132,7 @@ pub struct LiveTransportControls {
 
 #[derive(Clone, Copy)]
 pub struct AppController {
+    task_scope: AppTaskScope,
     pub state: Signal<AppState>,
     pub token: Signal<Option<ApiCredential>>,
     pub pairing_secret: Signal<Option<String>>,
@@ -143,7 +147,8 @@ pub struct AppController {
 }
 
 impl AppController {
-    pub fn new(
+    pub(crate) fn new(
+        task_scope: AppTaskScope,
         state: Signal<AppState>,
         token: Signal<Option<ApiCredential>>,
         pairing_secret: Signal<Option<String>>,
@@ -152,6 +157,7 @@ impl AppController {
         install_event: Signal<Option<JsValue>>,
     ) -> Self {
         Self {
+            task_scope,
             state,
             token,
             pairing_secret,
@@ -164,6 +170,12 @@ impl AppController {
             install_event,
             api: ApiClient,
         }
+    }
+
+    /// Run a session operation independently of the dialog or request card
+    /// that initiated it. Only App-owned state may be captured by the task.
+    pub fn spawn(self, future: impl Future<Output = ()> + 'static) -> Task {
+        self.task_scope.spawn(future)
     }
 
     pub async fn bootstrap(mut self) {
@@ -789,7 +801,7 @@ impl AppController {
         };
         if still_selected {
             let controller = self;
-            spawn(async move {
+            self.spawn(async move {
                 // Let Dioxus commit the newly projected timeline before
                 // measuring its scroll height.
                 TimeoutFuture::new(0).await;
@@ -978,7 +990,7 @@ impl AppController {
                     .flatten();
                 self.state.write().prepend_agent_session_history(detail);
                 if let Some(anchor) = anchor {
-                    spawn(async move {
+                    self.spawn(async move {
                         TimeoutFuture::new(0).await;
                         platform::restore_timeline_scroll_anchor(anchor);
                     });
@@ -1398,7 +1410,7 @@ impl AppController {
                     native_anchor_id.clone(),
                 );
             self.state.write().ui.timeline_scrolled_away = false;
-            spawn(async move {
+            self.spawn(async move {
                 TimeoutFuture::new(0).await;
                 platform::scroll_timeline_to_end();
             });
@@ -1421,7 +1433,7 @@ impl AppController {
                     Ok(_) => {
                         let outbox_id = outbox.id.clone();
                         let controller = self;
-                        spawn(async move {
+                        self.spawn(async move {
                             if let Err(error) = storage::delete_outbox(&outbox_id).await {
                                 controller.notice(
                                     &format!("已发送，但清理本地 Outbox 失败：{error}"),
@@ -1459,7 +1471,7 @@ impl AppController {
                 }
             };
             self.set_busy(false);
-            spawn(async move {
+            self.spawn(async move {
                 self.flush_outbox().await;
             });
             return accepted;
@@ -1507,7 +1519,7 @@ impl AppController {
             .optimistic_start_input(display_input.clone(), now, native_anchor_id.clone());
         self.state.write().ui.timeline_scrolled_away = false;
         self.stop_stream();
-        spawn(async move {
+        self.spawn(async move {
             TimeoutFuture::new(0).await;
             platform::scroll_timeline_to_end();
         });
@@ -1554,7 +1566,7 @@ impl AppController {
                 // or attachments visible in the input field.
                 let outbox_id = outbox.id.clone();
                 let controller = self;
-                spawn(async move {
+                self.spawn(async move {
                     if let Err(error) = storage::delete_outbox(&outbox_id).await {
                         controller.notice(
                             &format!("已发送，但清理本地 Outbox 失败：{error}"),
@@ -1598,7 +1610,7 @@ impl AppController {
             }
         };
         self.set_busy(false);
-        spawn(async move {
+        self.spawn(async move {
             self.flush_outbox().await;
         });
         accepted
@@ -1999,7 +2011,7 @@ impl AppController {
                 state.connection.error = None;
             }
         }
-        spawn(async move {
+        self.spawn(async move {
             self.follow_agent_session_observer(
                 target,
                 session_state,
@@ -2199,7 +2211,7 @@ impl AppController {
         if !should_start {
             return;
         }
-        spawn(async move {
+        self.spawn(async move {
             loop {
                 // Let a native notification burst settle before reconciling.
                 // Normal item/turn changes continue to apply immediately while
@@ -2425,7 +2437,7 @@ impl AppController {
         self.stream_abort.set(Some(controller.clone()));
         let generation = self.stream_generation.read().saturating_add(1);
         self.stream_generation.set(generation);
-        spawn(async move {
+        self.spawn(async move {
             self.follow_stream(run_id, controller, generation).await;
         });
     }
@@ -2638,7 +2650,7 @@ impl AppController {
         if resolve_recovery {
             let controller = self;
             let run_id = run_id.to_owned();
-            spawn(async move {
+            self.spawn(async move {
                 // Let the Host supervisor publish its disposition first. The
                 // explicit endpoint is still authoritative if this client is
                 // the first observer after continuity loss.
@@ -2715,7 +2727,7 @@ impl AppController {
             let mut controller = self;
             controller.state.write().connection.online = true;
             let refresh = controller;
-            spawn(async move { refresh.load_workspace().await });
+            self.spawn(async move { refresh.load_workspace().await });
         }) {
             listeners.push(listener);
         }
@@ -2723,7 +2735,7 @@ impl AppController {
             if let Ok(listener) = platform::add_window_listener(event_name, move |_| {
                 if platform::is_document_visible() && platform::is_online() {
                     self.resume_live_transport_for_selection(0);
-                    spawn(async move {
+                    self.spawn(async move {
                         self.flush_outbox().await;
                     });
                 }
@@ -2779,7 +2791,7 @@ impl AppController {
     }
 
     fn follow_timeline_after_render(self) {
-        spawn(async move {
+        self.spawn(async move {
             TimeoutFuture::new(0).await;
             if !self.state.read().ui.timeline_scrolled_away {
                 platform::scroll_timeline_to_end();
@@ -2807,7 +2819,7 @@ impl AppController {
         });
         let timeout_ms = if tone == "error" { 10_000 } else { 5_000 };
         let mut state = self.state;
-        spawn(async move {
+        self.spawn(async move {
             TimeoutFuture::new(timeout_ms).await;
             state.write().ui.dismiss_notice(id);
         });

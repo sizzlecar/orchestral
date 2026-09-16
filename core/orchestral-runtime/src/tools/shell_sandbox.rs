@@ -1321,17 +1321,31 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn run_loopback_probe(command: &mut std::process::Command) -> (u32, std::process::Output) {
+        let child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("launch loopback probe");
+        let pid = child.id();
+        let output = child.wait_with_output().expect("collect loopback probe");
+        (pid, output)
+    }
+
+    #[cfg(target_os = "macos")]
     fn probe_loopback_callback(phase: &str) {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
+        let pid = std::process::id();
         eprintln!(
-            "loopback phase={phase} executable={:?}",
+            "loopback phase={phase} pid={pid} executable={:?}",
             std::env::current_exe().expect("resolve probe executable")
         );
-        let stage = |name: &str| eprintln!("loopback phase={phase} stage={name}");
+        let stage = |name: &str| eprintln!("loopback phase={phase} pid={pid} stage={name}");
         stage("runtime");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1342,12 +1356,21 @@ mod tests {
             stage("socket");
             let socket = TcpSocket::new_v4().expect("create IPv4 loopback socket");
             stage("bind");
-            socket
-                .bind(([127, 0, 0, 1], 0).into())
-                .expect("bind IPv4 loopback socket");
+            let bind_address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+            eprintln!(
+                "loopback phase={phase} pid={pid} bind_family=AF_INET bind_address={bind_address} fd={}",
+                socket.as_raw_fd()
+            );
+            socket.bind(bind_address).unwrap_or_else(|error| {
+                panic!(
+                    "bind IPv4 loopback socket: phase={phase} pid={pid} requested={bind_address} error={error:?} errno={:?} local_address_after_failure={:?}",
+                    error.raw_os_error(),
+                    socket.local_addr(),
+                )
+            });
             stage("getsockname");
             let address = socket.local_addr().expect("read bound loopback address");
-            eprintln!("loopback phase={phase} bound_address={address}");
+            eprintln!("loopback phase={phase} pid={pid} bound_address={address}");
             assert!(address.ip().is_loopback());
             assert_ne!(address.port(), 0);
             // TcpSocket::listen combines the syscall with reactor registration.
@@ -1377,7 +1400,7 @@ mod tests {
                 .await
                 .expect("loopback accept timed out")
                 .expect("accept loopback callback");
-            eprintln!("loopback phase={phase} peer_address={peer}");
+            eprintln!("loopback phase={phase} pid={pid} peer_address={peer}");
             assert!(peer.ip().is_loopback());
             stage("send");
             tokio::time::timeout(timeout, client.write_all(b"X"))
@@ -1447,17 +1470,23 @@ mod tests {
         command
             .env
             .insert(CHILD_PHASE.to_owned(), "sandbox".to_owned());
-        let control = std::process::Command::new(&executable)
-            .args(args)
-            .env_clear()
-            .envs(&command.env)
-            .env(CHILD_PHASE, "control")
-            .current_dir(&workspace)
-            .output()
-            .expect("launch unsandboxed loopback control");
-        let output = run_sandboxed(command, &workspace);
+        let (control_pid, control) = run_loopback_probe(
+            std::process::Command::new(&executable)
+                .args(args)
+                .env_clear()
+                .envs(&command.env)
+                .env(CHILD_PHASE, "control")
+                .current_dir(&workspace),
+        );
+        let (sandbox_pid, output) = run_loopback_probe(
+            std::process::Command::new(&command.program)
+                .args(&command.args)
+                .env_clear()
+                .envs(&command.env)
+                .current_dir(&workspace),
+        );
         let diagnostics = format!(
-            "executable={executable:?}\ncontrol status={}\ncontrol stdout={}\ncontrol stderr={}\nsandbox status={}\nsandbox stdout={}\nsandbox stderr={}\nprofile={profile}",
+            "executable={executable:?}\ncontrol pid={control_pid} status={}\ncontrol stdout={}\ncontrol stderr={}\nsandbox pid={sandbox_pid} status={}\nsandbox stdout={}\nsandbox stderr={}\nprofile={profile}",
             control.status,
             String::from_utf8_lossy(&control.stdout),
             String::from_utf8_lossy(&control.stderr),

@@ -58,7 +58,7 @@ pub fn NewSessionPanel() -> Element {
                     r#type: "button",
                     disabled,
                     onclick: move |_| {
-                        spawn(async move {
+                        controller.spawn(async move {
                             if controller.create_session().await.is_some() {
                                 controller.state.write().ui.new_session_open = false;
                             }
@@ -146,7 +146,7 @@ fn AgentSessionCreateCard(
                     None
                 };
                 let connector = connector_for_submit.clone();
-                spawn(async move {
+                controller.spawn(async move {
                     controller
                         .create_agent_session(connector, cwd, options)
                         .await;
@@ -329,7 +329,7 @@ fn ActionCard(
                 let connector_id = connector_id.clone();
                 let session_id = session_id.clone();
                 let action_id = action_id.clone();
-                spawn(async move {
+                controller.spawn(async move {
                     controller
                         .invoke_session_action(
                             connector_id,

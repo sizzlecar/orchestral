@@ -4,6 +4,8 @@
 //! session ID and remain strictly scoped to the owning Agent Run.
 
 mod lifecycle;
+#[cfg(test)]
+mod pipe_tests;
 
 pub use lifecycle::{ExecSessionEvent, ExecSessionSnapshot, ExecSessionStatus};
 
@@ -62,6 +64,8 @@ pub struct ExecPollResult {
     pub stdout: String,
     pub stderr: String,
     pub dropped_bytes: u64,
+    /// The session still needs observation, including final pipe drainage
+    /// after its direct process has exited.
     pub alive: bool,
     pub exit_code: Option<i32>,
     pub wall_time_seconds: f64,
@@ -194,6 +198,20 @@ impl SharedOutput {
         let dropped = std::mem::take(&mut state.dropped_bytes);
         Ok((String::from_utf8_lossy(&raw).into_owned(), dropped))
     }
+
+    async fn wait_closed(&self) -> Result<(), ExecProcessError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Register before inspection: EOF between inspecting and awaiting
+            // must not leave the completion waiter asleep forever.
+            changed.as_mut().enable();
+            if self.snapshot()?.1 {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
 }
 
 struct PipeSession {
@@ -201,6 +219,7 @@ struct PipeSession {
     stdin: AsyncMutex<Option<ChildStdin>>,
     stdout: Arc<SharedOutput>,
     stderr: Arc<SharedOutput>,
+    stop_readers: CancellationToken,
     process_group_id: Option<u32>,
     #[cfg(windows)]
     job: crate::windows_process_job::ProcessJob,
@@ -253,13 +272,15 @@ impl PipeSession {
             .ok_or_else(|| ExecProcessError::Io("exec stderr pipe was not created".to_owned()))?;
         let stdout_buffer = SharedOutput::new(max_output_bytes);
         let stderr_buffer = SharedOutput::new(max_output_bytes);
-        spawn_reader(stdout, stdout_buffer.clone());
-        spawn_reader(stderr, stderr_buffer.clone());
+        let stop_readers = CancellationToken::new();
+        spawn_reader(stdout, stdout_buffer.clone(), stop_readers.clone());
+        spawn_reader(stderr, stderr_buffer.clone(), stop_readers.clone());
         Ok(Arc::new(Self {
             child: AsyncMutex::new(child),
             stdin: AsyncMutex::new(stdin),
             stdout: stdout_buffer,
             stderr: stderr_buffer,
+            stop_readers,
             process_group_id,
             #[cfg(windows)]
             job,
@@ -291,63 +312,15 @@ impl PipeSession {
         options: &ExecWaitOptions,
         cancellation: &CancellationToken,
     ) -> Result<ExecPollResult, ExecProcessError> {
-        let wait = options.duration;
-        let started = Instant::now();
-        let settle = Duration::from_millis(50).min(wait);
-        let mut observed = (u64::MAX, u64::MAX);
-        let mut last_change = Instant::now();
-        let exit_code = loop {
-            if cancellation.is_cancelled() {
-                return Err(ExecProcessError::Cancelled);
-            }
-            let status = lifecycle.status()?;
-            let exit_code = match &status {
-                ExecSessionStatus::Running => None,
-                ExecSessionStatus::Exited { exit_code } => Some(*exit_code),
-                ExecSessionStatus::Terminated => return Err(ExecProcessError::Cancelled),
-                ExecSessionStatus::Failed { message } => {
-                    return Err(ExecProcessError::Io(message.clone()))
-                }
-            };
-            let stdout = self.stdout.snapshot()?;
-            let stderr = self.stderr.snapshot()?;
-            let generation = (stdout.0, stderr.0);
-            if generation != observed {
-                observed = generation;
-                last_change = Instant::now();
-            }
-            if exit_code.is_some() && ((stdout.1 && stderr.1) || last_change.elapsed() >= settle) {
-                break exit_code;
-            }
-            if options.yield_requested.is_cancelled()
-                || started.elapsed() >= wait
-                || (options.mode == ExecWaitMode::Output
-                    && (stdout.2 || stderr.2)
-                    && last_change.elapsed() >= settle)
-            {
-                break exit_code;
-            }
-            let remaining = wait.saturating_sub(started.elapsed());
-            let pause = remaining.min(Duration::from_millis(20));
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(ExecProcessError::Cancelled),
-                _ = options.yield_requested.cancelled() => {},
-                _ = self.stdout.changed.notified() => {},
-                _ = self.stderr.changed.notified() => {},
-                _ = lifecycle.changed.notified() => {},
-                _ = tokio::time::sleep(pause) => {},
-            }
-        };
-        let (stdout, stdout_dropped) = self.stdout.drain()?;
-        let (stderr, stderr_dropped) = self.stderr.drain()?;
-        Ok(ExecPollResult {
-            stdout,
-            stderr,
-            dropped_bytes: stdout_dropped.saturating_add(stderr_dropped),
-            alive: exit_code.is_none(),
-            exit_code,
-            wall_time_seconds: started_at.elapsed().as_secs_f64(),
-        })
+        poll_pipe_output(
+            &self.stdout,
+            &self.stderr,
+            lifecycle,
+            started_at,
+            options,
+            cancellation,
+        )
+        .await
     }
 
     async fn terminate(&self) {
@@ -358,17 +331,102 @@ impl PipeSession {
         self.job.terminate();
         let _ = child.start_kill();
         let _ = child.wait().await;
+        self.stop_readers.cancel();
+        let _ = tokio::join!(self.stdout.wait_closed(), self.stderr.wait_closed());
     }
 }
 
-fn spawn_reader<R>(mut reader: R, output: Arc<SharedOutput>)
+impl Drop for PipeSession {
+    fn drop(&mut self) {
+        // Reader tasks must not outlive their owning session and retain pipe
+        // handles when the supervisor itself is dropped.
+        self.stop_readers.cancel();
+    }
+}
+
+async fn poll_pipe_output(
+    stdout: &SharedOutput,
+    stderr: &SharedOutput,
+    lifecycle: &SessionLifecycle,
+    started_at: Instant,
+    options: &ExecWaitOptions,
+    cancellation: &CancellationToken,
+) -> Result<ExecPollResult, ExecProcessError> {
+    let wait = options.duration;
+    let started = Instant::now();
+    let settle = Duration::from_millis(50).min(wait);
+    let mut observed = (u64::MAX, u64::MAX);
+    let mut last_change = Instant::now();
+    let exit_code = loop {
+        if cancellation.is_cancelled() {
+            return Err(ExecProcessError::Cancelled);
+        }
+        let status = lifecycle.status()?;
+        let exit_code = match &status {
+            ExecSessionStatus::Running => None,
+            ExecSessionStatus::Exited { exit_code } => Some(*exit_code),
+            ExecSessionStatus::Terminated => return Err(ExecProcessError::Cancelled),
+            ExecSessionStatus::Failed { message } => {
+                return Err(ExecProcessError::Io(message.clone()))
+            }
+        };
+        let stdout_state = stdout.snapshot()?;
+        let stderr_state = stderr.snapshot()?;
+        let generation = (stdout_state.0, stderr_state.0);
+        if generation != observed {
+            observed = generation;
+            last_change = Instant::now();
+        }
+        if exit_code.is_some() && stdout_state.1 && stderr_state.1 {
+            break exit_code;
+        }
+        if options.yield_requested.is_cancelled()
+            || started.elapsed() >= wait
+            || (options.mode == ExecWaitMode::Output
+                && (stdout_state.2 || stderr_state.2)
+                && last_change.elapsed() >= settle)
+        {
+            // Exit alone is not a terminal observation: stdout/stderr
+            // readers may still own bytes that have not reached the buffers.
+            // Keep this session addressable across deadlines and yields.
+            break None;
+        }
+        let remaining = wait.saturating_sub(started.elapsed());
+        let pause = remaining.min(Duration::from_millis(20));
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(ExecProcessError::Cancelled),
+            _ = options.yield_requested.cancelled() => {},
+            _ = stdout.changed.notified() => {},
+            _ = stderr.changed.notified() => {},
+            _ = lifecycle.changed.notified() => {},
+            _ = tokio::time::sleep(pause) => {},
+        }
+    };
+    let (stdout, stdout_dropped) = stdout.drain()?;
+    let (stderr, stderr_dropped) = stderr.drain()?;
+    Ok(ExecPollResult {
+        stdout,
+        stderr,
+        dropped_bytes: stdout_dropped.saturating_add(stderr_dropped),
+        alive: exit_code.is_none(),
+        exit_code,
+        wall_time_seconds: started_at.elapsed().as_secs_f64(),
+    })
+}
+
+fn spawn_reader<R>(mut reader: R, output: Arc<SharedOutput>, stop: CancellationToken)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut chunk = [0_u8; 8192];
         loop {
-            match reader.read(&mut chunk).await {
+            let read = tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                read = reader.read(&mut chunk) => read,
+            };
+            match read {
                 Ok(0) => break,
                 Ok(count) => output.push(&chunk[..count]),
                 Err(_) => break,

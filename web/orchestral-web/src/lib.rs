@@ -10,6 +10,9 @@ pub mod presentation;
 pub mod sse;
 pub mod state;
 
+#[cfg(any(feature = "web", test))]
+mod tasks;
+
 #[cfg(feature = "web")]
 pub mod app;
 #[cfg(feature = "web")]

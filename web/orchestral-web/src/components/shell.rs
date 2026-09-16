@@ -68,7 +68,7 @@ pub fn AuthScreen() -> Element {
                     class: "auth-screen__button",
                     r#type: "button",
                     onclick: move |_| {
-                        spawn(async move { controller.bootstrap().await });
+                        controller.spawn(async move { controller.bootstrap().await });
                     },
                     "重试"
                 }
