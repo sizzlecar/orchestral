@@ -213,6 +213,11 @@ pub struct RunState {
     /// projection. This is presentation state only: the synthetic history Run
     /// must never become a command target for steer, cancel, or recovery.
     pub history_latest_turn_status: Option<String>,
+    pub history_latest_turn_id: Option<String>,
+    pub history_observed_turn_ids: BTreeSet<String>,
+    /// Terminal Host failures already followed by an observed new native
+    /// turn. This affects only the session footer, never durable Run history.
+    pub history_superseded_failures: BTreeMap<String, (u64, Value)>,
     pub progress: Option<Progress>,
     pub delivery: Option<Value>,
     pub partial_delivery: Option<Value>,
@@ -259,6 +264,9 @@ impl RunState {
             history_live_turn_starts: Vec::new(),
             history_live_turn_ids: BTreeMap::new(),
             history_latest_turn_status: None,
+            history_latest_turn_id: None,
+            history_observed_turn_ids: BTreeSet::new(),
+            history_superseded_failures: BTreeMap::new(),
             progress: None,
             delivery: None,
             partial_delivery: None,
@@ -1344,6 +1352,9 @@ impl AppState {
         }
         let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
         let run_id = format!("agent-history:{connector_id}:{session_id}");
+        if let Some(turn) = detail.turns.last() {
+            self.observe_native_turn(&run_id, &turn.turn_id);
+        }
         let projection_time = detail.summary.updated_at_unix_ms.unwrap_or_default() as f64;
         let latest_turn_status = detail.turns.last().map(|turn| turn.status.clone());
         let latest_turn_failure = detail.turns.last().and_then(|turn| turn.failure.clone());
@@ -1408,6 +1419,9 @@ impl AppState {
         let run = self.ensure_run_source(&run_id, Some(session_id), Some(connector_id.clone()));
         run.status = "delivered".to_owned();
         run.history_latest_turn_status = latest_turn_status;
+        run.history_latest_turn_id = detail.turns.last().map(|turn| turn.turn_id.clone());
+        run.history_observed_turn_ids
+            .extend(detail.turns.iter().map(|turn| turn.turn_id.clone()));
         run.failure = latest_turn_failure;
         run.error = None;
         run.commands.clear();
@@ -1445,6 +1459,47 @@ impl AppState {
             != self.agent_session_timeline_snapshot(&connector_id, &detail.summary.session_id)
     }
 
+    fn observe_native_turn(&mut self, history_id: &str, turn_id: &str) {
+        let Some(history) = self.runs.get(history_id) else {
+            return;
+        };
+        if history
+            .history_latest_turn_id
+            .as_deref()
+            .is_none_or(|previous| previous == turn_id)
+            || history.history_observed_turn_ids.contains(turn_id)
+        {
+            return;
+        }
+        // Only a new turn observed after the terminal error proves that the
+        // conversation moved on. Initial snapshots, same-turn activity and
+        // replayed older turns cannot dismiss an uncorrelated failure.
+        let superseded = self
+            .sessions
+            .items
+            .iter()
+            .find(|session| session.history_run_id().as_deref() == Some(history_id))
+            .into_iter()
+            .flat_map(|session| session.run_ids.iter())
+            .filter(|run_id| run_id.as_str() != history_id)
+            .filter_map(|run_id| {
+                let run = self.runs.get(run_id)?;
+                is_terminal(&run.status)
+                    .then(|| {
+                        run.failure.clone().map(|failure| {
+                            (run_id.clone(), (run.cursor.max(run.server_cursor), failure))
+                        })
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        self.runs
+            .get_mut(history_id)
+            .expect("history was inspected above")
+            .history_superseded_failures
+            .extend(superseded);
+    }
+
     /// Applies one provider-neutral live mutation without rebuilding the
     /// bounded session page. Stable activity ids make retries idempotent and
     /// preserve an existing item's presentation order.
@@ -1479,6 +1534,20 @@ impl AppState {
         let sequence = change.sequence;
         let timeline_before = self.agent_session_timeline_snapshot(&connector_id, &session_id);
         let run_id = format!("agent-history:{connector_id}:{session_id}");
+
+        match &change.change {
+            AgentSessionChangeKindView::TurnStatus {
+                turn_id, status, ..
+            } if matches!(status.as_str(), "active" | "running" | "in_progress") => {
+                self.observe_native_turn(&run_id, turn_id);
+            }
+            AgentSessionChangeKindView::ActivityUpsert {
+                turn_id, activity, ..
+            } if activity.kind == "user_message" => {
+                self.observe_native_turn(&run_id, turn_id);
+            }
+            _ => {}
+        }
 
         match change.change {
             AgentSessionChangeKindView::RefreshRequired { .. } => return false,
@@ -1519,7 +1588,9 @@ impl AppState {
                 }
             }
             AgentSessionChangeKindView::TurnStatus {
-                status, failure, ..
+                turn_id,
+                status,
+                failure,
             } => {
                 if let Some(session) = self.sessions.items.iter_mut().find(|session| {
                     session.id == session_id
@@ -1535,6 +1606,8 @@ impl AppState {
                     Some(connector_id.clone()),
                 );
                 run.history_latest_turn_status = Some(status);
+                run.history_observed_turn_ids.insert(turn_id.clone());
+                run.history_latest_turn_id = Some(turn_id);
                 run.failure = failure;
                 run.error = None;
             }
@@ -1562,6 +1635,8 @@ impl AppState {
                 );
                 run.status = "delivered".to_owned();
                 run.history_latest_turn_status = Some(turn_status);
+                run.history_observed_turn_ids.insert(turn_id.clone());
+                run.history_latest_turn_id = Some(turn_id.clone());
                 run.failure = None;
                 run.error = None;
                 let activity_id = activity.activity_id.clone();
@@ -1620,13 +1695,13 @@ impl AppState {
         &self,
         connector_id: &str,
         session_id: &str,
-    ) -> Vec<AgentSessionTimelineSnapshot> {
+    ) -> (Vec<AgentSessionTimelineSnapshot>, Option<SessionRunIssue>) {
         let Some(session) = self.sessions.items.iter().find(|session| {
             session.id == session_id && session.connector_id.as_deref() == Some(connector_id)
         }) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
-        timeline_run_ids_for_session(self, session)
+        let runs = timeline_run_ids_for_session(self, session)
             .into_iter()
             .filter_map(|run_id| {
                 let run = self.runs.get(&run_id)?;
@@ -1638,7 +1713,8 @@ impl AppState {
                     error: run.error.clone(),
                 })
             })
-            .collect()
+            .collect();
+        (runs, latest_session_run_issue(self, session))
     }
 
     /// Prepends one older Agent transcript page without replacing the latest
@@ -2232,10 +2308,29 @@ pub fn latest_session_run_issue(
     state: &AppState,
     session: &SessionView,
 ) -> Option<SessionRunIssue> {
-    let run = timeline_run_ids_for_session(state, session)
-        .into_iter()
+    // Content deduplication must not move the live edge backwards: the latest
+    // controlled Run may already be represented by native history while an
+    // older failed mirror still contributes an unmatched user message.
+    let latest = session
+        .run_ids
+        .iter()
         .rev()
-        .find_map(|run_id| state.runs.get(&run_id))?;
+        .find_map(|run_id| state.runs.get(run_id))?;
+    let visible_runs = timeline_run_ids_for_session(state, session);
+    let history = session.history_run_id().and_then(|id| state.runs.get(&id));
+    let superseded = history.is_some_and(|history| {
+        latest.failure.as_ref().is_some_and(|failure| {
+            history.history_superseded_failures.get(&latest.id)
+                == Some(&(latest.cursor.max(latest.server_cursor), failure.clone()))
+        })
+    });
+    let run = if !superseded
+        && (visible_runs.contains(&latest.id) || latest.failure.is_some() || latest.error.is_some())
+    {
+        latest
+    } else {
+        history?
+    };
     run.failure
         .clone()
         .map(SessionRunIssue::Failure)
@@ -4737,6 +4832,102 @@ mod tests {
     }
 
     #[test]
+    fn represented_latest_run_never_reveals_an_older_cancelled_footer() {
+        let old_failure = serde_json::json!({
+            "code": "cancelled",
+            "message": "Host requested a safe stop"
+        });
+        let native_failure = serde_json::json!({
+            "code": "provider_unavailable",
+            "message": "latest native turn failed"
+        });
+        for (native_status, failure) in [
+            ("active", None),
+            ("completed", None),
+            ("failed", Some(native_failure.clone())),
+        ] {
+            let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+                "summary": {
+                    "connector_id": "fixture/local",
+                    "session_id": "thread-1",
+                    "state": "active"
+                },
+                "turns": [{
+                    "turn_id": "latest-turn",
+                    "status": native_status,
+                    "failure": failure,
+                    "activities": [{
+                        "activity_id": "native-latest-input",
+                        "kind": "user_message",
+                        "status": "completed",
+                        "content": [{"body": {"kind": "inline", "value": "try again"}}],
+                        "details": {"clientId": "orchestral:latest-run:sha256:digest"}
+                    }]
+                }]
+            }))
+            .unwrap();
+            let mut state = AppState::new(true);
+            state.project_agent_session(detail);
+            let old = state.ensure_run_source(
+                "old-run",
+                Some("thread-1".to_owned()),
+                Some("fixture/local".to_owned()),
+            );
+            old.status = "cancelled".to_owned();
+            old.failure = Some(old_failure.clone());
+            state
+                .ensure_run_source(
+                    "latest-run",
+                    Some("thread-1".to_owned()),
+                    Some("fixture/local".to_owned()),
+                )
+                .status = "running".to_owned();
+            state.sessions.items[0]
+                .run_ids
+                .extend(["old-run".to_owned(), "latest-run".to_owned()]);
+
+            let session = &state.sessions.items[0];
+            assert_eq!(
+                timeline_run_ids_for_session(&state, session),
+                vec!["agent-history:fixture/local:thread-1", "old-run"],
+                "the old mirror can remain visible after the latest one is deduplicated"
+            );
+            assert_eq!(
+                latest_session_run_issue(&state, session),
+                failure.map(SessionRunIssue::Failure),
+                "only the authoritative live turn owns the footer"
+            );
+            assert_eq!(state.runs["old-run"].failure, Some(old_failure.clone()));
+
+            // A native echo proves the input arrived, not that a later Host
+            // control failure recovered in this same turn.
+            let latest = state.runs.get_mut("latest-run").unwrap();
+            latest.status = "cancelled".to_owned();
+            latest.failure = Some(old_failure.clone());
+            assert_eq!(
+                latest_session_run_issue(&state, &state.sessions.items[0]),
+                Some(SessionRunIssue::Failure(old_failure.clone()))
+            );
+
+            let new_failure = serde_json::json!({
+                "code": "submission_failed",
+                "message": "new input was not accepted"
+            });
+            let newest = state.ensure_run("unrepresented-run", Some("thread-1".to_owned()));
+            newest.status = "failed".to_owned();
+            newest.failure = Some(new_failure.clone());
+            state.sessions.items[0]
+                .run_ids
+                .push("unrepresented-run".to_owned());
+            assert_eq!(
+                latest_session_run_issue(&state, &state.sessions.items[0]),
+                Some(SessionRunIssue::Failure(new_failure)),
+                "a newer unrepresented failure must not be hidden by native history"
+            );
+        }
+    }
+
+    #[test]
     fn native_turn_failure_is_visible_and_cleared_by_the_next_turn() {
         let failure = serde_json::json!({
             "code": "agent_transport_unavailable",
@@ -4790,6 +4981,60 @@ mod tests {
         assert_eq!(
             history.history_latest_turn_status.as_deref(),
             Some("active")
+        );
+    }
+
+    #[test]
+    fn a_new_native_turn_supersedes_only_the_terminal_failure_observed_before_it() {
+        let mut state = AppState::new(true);
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local", "session_id": "thread-1", "state": "idle"
+            },
+            "turns": [{"turn_id": "old-turn", "status": "completed", "activities": []}],
+            "stream_cursor": 1
+        }))
+        .unwrap();
+        state.project_agent_session(detail);
+        let failure = serde_json::json!({"code": "cancelled", "message": "safe stop"});
+        let run = state.ensure_run("old-run", Some("thread-1".to_owned()));
+        run.status = "cancelled".to_owned();
+        run.failure = Some(failure.clone());
+        run.cursor = 8;
+        state.sessions.items[0].run_ids.push("old-run".to_owned());
+        let change = |sequence, turn, status| {
+            serde_json::from_value::<AgentSessionChangeView>(serde_json::json!({
+                "connector_id": "fixture/local", "session_id": "thread-1",
+                "sequence": sequence,
+                "change": {"type": "turn_status", "turn_id": turn, "status": status}
+            }))
+            .unwrap()
+        };
+        state.apply_agent_session_change(change(2, "old-turn", "active"), 2);
+        assert_eq!(
+            latest_session_run_issue(&state, &state.sessions.items[0]),
+            Some(SessionRunIssue::Failure(failure.clone())),
+            "same-turn activity is not proof of recovery"
+        );
+        assert!(state.apply_agent_session_change(change(3, "new-turn", "active"), 3));
+        assert_eq!(
+            latest_session_run_issue(&state, &state.sessions.items[0]),
+            None
+        );
+        assert_eq!(state.runs["old-run"].failure, Some(failure.clone()));
+        assert_eq!(
+            state.sessions.items[0].run_ids.len(),
+            2,
+            "no new Host Run was required"
+        );
+
+        state.runs.get_mut("old-run").unwrap().cursor = 9;
+        state.apply_agent_session_change(change(4, "old-turn", "active"), 4);
+        state.apply_agent_session_change(change(5, "new-turn", "active"), 5);
+        assert_eq!(
+            latest_session_run_issue(&state, &state.sessions.items[0]),
+            Some(SessionRunIssue::Failure(failure)),
+            "an updated issue or a replayed old turn must not inherit supersession"
         );
     }
 

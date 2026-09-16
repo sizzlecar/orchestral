@@ -15,6 +15,10 @@ const createdSessionChanges = [];
 let createdSession = false;
 let sessionActionCompleted = false;
 let lifecycleSnapshotReads = 0;
+const recoveryChanges = [];
+let recoveryPhase = "cancelled";
+let recoveryEventReads = 0;
+const recoveryFailure = { code: "provider_unavailable", message: "当前回合连接失败" };
 const content = (text) => [{ body: { kind: "inline", value: text } }];
 const approval = {
   request_id: "native-approval",
@@ -69,7 +73,7 @@ records.push({
 const summary = (id) => ({
   connector_id: "fixture/local",
   session_id: id,
-  title: id === "a" ? "同步验证会话" : id === "created" ? "新建实时会话" : "另一个会话",
+  title: id === "a" ? "同步验证会话" : id === "created" ? "新建实时会话" : id === "recovery" ? "运行恢复验证" : "另一个会话",
   state: "active",
   created_at_unix_ms: now - 60000,
   updated_at_unix_ms: now - 30000,
@@ -82,7 +86,42 @@ const view = () => ({
   pending_requests: hostPending,
   input: content("检查当前工作区"),
 });
-const history = (id) => ({
+const cancelledRun = () => ({
+  execution: { run_id: "recovery-old", session_id: "recovery" },
+  state: { state: "cancelled" },
+  last_run_seq: 1,
+  input: content("保留旧回合的输入记录"),
+  created_at_unix_ms: now - 5000,
+  after_activity_id: "recovery-context",
+});
+const recoveryHistory = () => ({
+  summary: summary("recovery"),
+  stream_cursor: recoveryChanges.length,
+  turns: [{
+    turn_id: "recovery-native-turn",
+    status: recoveryPhase === "failed" ? "failed" : "active",
+    failure: recoveryPhase === "failed" ? recoveryFailure : null,
+    activities: [
+      { activity_id: "recovery-context", kind: "agent_message", status: "completed", content: content("已有会话上下文") },
+      ...(recoveryPhase === "cancelled" ? [] : [{
+        activity_id: "recovery-input", kind: "user_message", status: "completed",
+        content: content("继续新的正常回合"),
+        details: { clientId: "orchestral:recovery-latest:sha256:fixture" },
+      }]),
+    ],
+  }],
+  controlled_runs: [cancelledRun(), ...(recoveryPhase === "cancelled" ? [] : [{
+    execution: { run_id: "recovery-latest", session_id: "recovery" },
+    state: { state: "running" },
+    last_run_seq: 0,
+    input: content("继续新的正常回合"),
+    created_at_unix_ms: now - 1000,
+    after_activity_id: "recovery-context",
+  }])],
+  pending_requests: [],
+  next_cursor: null,
+});
+const history = (id) => id === "recovery" ? recoveryHistory() : ({
   summary: summary(id),
   stream_cursor: id === "created" ? createdSessionChanges.length : sequence,
   turns: id === "created" ? [{
@@ -155,6 +194,17 @@ const publishCreatedSessionMessage = (text) => {
   for (const [res, sessionId] of sessionStreams)
     if (sessionId === "created") writeSessionChange(res, change);
 };
+const publishRecoveryChange = (change) => {
+  const event = {
+    connector_id: "fixture/local",
+    session_id: "recovery",
+    sequence: recoveryChanges.length + 1,
+    change,
+  };
+  recoveryChanges.push(event);
+  for (const [res, sessionId] of sessionStreams)
+    if (sessionId === "recovery") writeSessionChange(res, event);
+};
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   if (url.pathname.startsWith("/api/v1/")) {
@@ -190,7 +240,7 @@ const server = http.createServer(async (req, res) => {
         createdSession = true;
         return json(res, summary("created"));
       }
-      return json(res, { sessions: [summary("a"), summary("b"), ...(createdSession ? [summary("created")] : [])] });
+      return json(res, { sessions: [summary("a"), summary("b"), summary("recovery"), ...(createdSession ? [summary("created")] : [])] });
     }
     if (route === "/agent-session/actions") {
       assert.equal(body.session_id, "created");
@@ -215,6 +265,16 @@ const server = http.createServer(async (req, res) => {
       return json(res, history(url.searchParams.get("session_id")));
     }
     if (route === "/runs/owner") return json(res, view());
+    if (route === "/runs/recovery-old") return json(res, cancelledRun());
+    if (route === "/runs/recovery-old/events") {
+      recoveryEventReads++;
+      const after = Number(url.searchParams.get("after") || 0);
+      return json(res, { after, next: 1, records: after < 1 ? [{ event: {
+        run_seq: 1,
+        event_id: "recovery-cancelled",
+        payload: { type: "run_cancelled", reason: "旧回合被 watchdog 安全停止" },
+      } }] : [] });
+    }
     if (route === "/runs/owner/events")
       return json(res, {
         records: records.filter(
@@ -233,6 +293,10 @@ const server = http.createServer(async (req, res) => {
         sessionStreams.set(res, sessionId);
         if (sessionId === "created")
           for (const change of createdSessionChanges)
+            if (change.sequence > Number(url.searchParams.get("after") || 0))
+              writeSessionChange(res, change);
+        if (sessionId === "recovery")
+          for (const change of recoveryChanges)
             if (change.sequence > Number(url.searchParams.get("after") || 0))
               writeSessionChange(res, change);
       }
@@ -414,6 +478,24 @@ const server = http.createServer(async (req, res) => {
     publishCreatedSessionMessage("操作弹窗关闭后实时消息仍然到达");
     await page.getByText("操作弹窗关闭后实时消息仍然到达", { exact: true }).waitFor();
     assert.equal(documentLoads, lifecycleDocumentLoads, "session creation and actions must not require a page reload");
+
+    await page.getByRole("button", { name: "打开会话列表" }).click();
+    await page.locator(".thread-button").filter({ hasText: "运行恢复验证" }).click();
+    const oldFailure = page.locator(".run-failure").filter({ hasText: "cancelled" });
+    await oldFailure.filter({ hasText: "旧回合被 watchdog 安全停止" }).waitFor();
+    const recoveryDocumentLoads = documentLoads;
+    recoveryPhase = "running";
+    publishRecoveryChange({ type: "refresh_required", reason: "new_controlled_run" });
+    await page.locator(".message--user .message__content").filter({ hasText: "继续新的正常回合" }).waitFor();
+    await oldFailure.waitFor({ state: "detached" });
+    assert.equal(await page.locator(".message--user .message__content").filter({ hasText: "继续新的正常回合" }).count(), 1,
+      "native client identity must deduplicate the latest Host mirror");
+    await page.locator(".message--user .message__content").filter({ hasText: "保留旧回合的输入记录" }).waitFor();
+    recoveryPhase = "failed";
+    publishRecoveryChange({ type: "turn_status", turn_id: "recovery-native-turn", status: "failed", failure: recoveryFailure });
+    await page.locator(".run-failure").filter({ hasText: "provider_unavailable" }).filter({ hasText: "当前回合连接失败" }).waitFor();
+    assert.equal(await oldFailure.count(), 0, "current failure must not revive a cancelled historical footer");
+    assert.equal(documentLoads, recoveryDocumentLoads, "recovery and current failure must update without a page reload");
 
     await openSession("同步验证会话");
     await page
@@ -630,6 +712,9 @@ const server = http.createServer(async (req, res) => {
           "new session live updates after dialog unmount",
           "session action snapshot after dialog unmount",
           "session action live updates without reload",
+          "recovered native turn supersedes old cancelled footer",
+          "latest Host mirror deduplicates without reviving old failure",
+          "current native failure remains visible without reload",
           "union of pending requests",
           "session drafts",
           "IME enter",
@@ -670,6 +755,9 @@ const server = http.createServer(async (req, res) => {
       lifecycleSnapshotReads,
       activeSessionStreams: [...sessionStreams.values()],
       publishedSessionChanges: createdSessionChanges.length,
+      recoveryPhase,
+      recoveryEventReads,
+      publishedRecoveryChanges: recoveryChanges.length,
       documentLoads,
     });
     if (testWorker)
