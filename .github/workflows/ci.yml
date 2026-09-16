@@ -89,10 +89,20 @@ jobs:
         run: cargo test --locked -p orchestral-runtime --test windows_exec -- --nocapture --test-threads=1
 
       - name: Test
+        id: rust_tests
         # Preserve full-suite evidence even when the earlier native diagnostic fails.
         # The failed diagnostic remains a job failure; it is never tolerated.
         if: ${{ !cancelled() && (success() || steps.windows_exec.conclusion == 'failure') }}
         run: cargo test --locked --workspace --all-targets
+
+      - name: Capture macOS sandbox denials after a test failure
+        if: ${{ failure() && runner.os == 'macOS' && steps.rust_tests.conclusion == 'failure' }}
+        timeout-minutes: 1
+        # Correlate kernel denials with the probe PIDs printed by the tests.
+        # This is diagnostics only: the failed Test step remains a failure.
+        run: >-
+          sudo /usr/bin/log show --last 5m --style compact --info --debug
+          --predicate '(subsystem == "com.apple.sandbox" OR eventMessage CONTAINS[c] "Sandbox:")'
 
       - name: Check SDK documentation examples
         run: cargo test --locked --workspace --doc
