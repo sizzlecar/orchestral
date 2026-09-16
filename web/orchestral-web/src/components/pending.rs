@@ -92,7 +92,7 @@ fn PendingCard(run: RunState, request: Value, can_resolve: bool) -> Element {
                             if text.trim().is_empty() { return; }
                             let run_id = submit_run.clone();
                             let request_id = submit_request.clone();
-                            spawn(async move {
+                            controller.spawn(async move {
                                 controller.resolve_input(run_id, request_id, text).await;
                             });
                         },
@@ -218,7 +218,7 @@ fn ApprovalButton(
             onclick: move |_| {
                 let run_id = run_id.clone();
                 let request_id = request_id.clone();
-                spawn(async move {
+                controller.spawn(async move {
                     controller
                         .resolve_approval(run_id, request_id, decision.to_owned())
                         .await;

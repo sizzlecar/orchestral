@@ -7,6 +7,7 @@ use crate::browser::controller::{AppController, LiveTransportControls};
 use crate::browser::{platform, storage};
 use crate::components::{AuthScreen, Workspace};
 use crate::state::{AgentSessionReconcileCoordinator, AppState, AuthStatus};
+use crate::tasks::AppTaskScope;
 
 const CSS: Asset = asset!("/assets/styles.css");
 
@@ -27,8 +28,10 @@ pub fn App() -> Element {
     let agent_session_stream_generation = use_signal(|| 0_u64);
     let agent_session_reconcile = use_signal(AgentSessionReconcileCoordinator::default);
     let install_event = use_signal(|| None::<wasm_bindgen::JsValue>);
+    let task_scope = use_hook(AppTaskScope::current);
     let controller = use_context_provider(|| {
         AppController::new(
+            task_scope,
             state,
             token,
             pairing_secret,

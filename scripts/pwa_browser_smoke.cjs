@@ -10,6 +10,11 @@ const now = Date.now();
 const testWorker = process.env.PWA_SMOKE_SW === "1";
 let workerRevision = 0;
 const workerRequests = [];
+const sessionStreams = new Map();
+const createdSessionChanges = [];
+let createdSession = false;
+let sessionActionCompleted = false;
+let lifecycleSnapshotReads = 0;
 const content = (text) => [{ body: { kind: "inline", value: text } }];
 const approval = {
   request_id: "native-approval",
@@ -64,7 +69,7 @@ records.push({
 const summary = (id) => ({
   connector_id: "fixture/local",
   session_id: id,
-  title: id === "a" ? "同步验证会话" : "另一个会话",
+  title: id === "a" ? "同步验证会话" : id === "created" ? "新建实时会话" : "另一个会话",
   state: "active",
   created_at_unix_ms: now - 60000,
   updated_at_unix_ms: now - 30000,
@@ -79,8 +84,20 @@ const view = () => ({
 });
 const history = (id) => ({
   summary: summary(id),
-  stream_cursor: sequence,
-  turns: [
+  stream_cursor: id === "created" ? createdSessionChanges.length : sequence,
+  turns: id === "created" ? [{
+    turn_id: "created-turn",
+    status: "active",
+    activities: [
+      ...createdSessionChanges.map(change => change.change.activity),
+      ...(sessionActionCompleted ? [{
+        activity_id: "action-snapshot",
+        kind: "agent_message",
+        status: "completed",
+        content: content("会话操作后的快照已同步"),
+      }] : []),
+    ],
+  }] : [
     {
       turn_id: "native-turn",
       status: "active",
@@ -114,6 +131,30 @@ const json = (res, data, status = 200) => {
   });
   res.end(JSON.stringify(data));
 };
+const writeSessionChange = (res, change) => {
+  res.write(`id: ${change.sequence}\nevent: session_changed\ndata: ${JSON.stringify(change)}\n\n`);
+};
+const publishCreatedSessionMessage = (text) => {
+  const change = {
+    connector_id: "fixture/local",
+    session_id: "created",
+    sequence: createdSessionChanges.length + 1,
+    change: {
+      type: "activity_upsert",
+      turn_id: "created-turn",
+      turn_status: "active",
+      activity: {
+        activity_id: `live-${createdSessionChanges.length + 1}`,
+        kind: "agent_message",
+        status: "completed",
+        content: content(text),
+      },
+    },
+  };
+  createdSessionChanges.push(change);
+  for (const [res, sessionId] of sessionStreams)
+    if (sessionId === "created") writeSessionChange(res, change);
+};
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   if (url.pathname.startsWith("/api/v1/")) {
@@ -135,11 +176,35 @@ const server = http.createServer(async (req, res) => {
             create: true,
             resolve_requests: true,
           },
+          actions: [{
+            action_id: "session.refresh",
+            title: "更新会话配置",
+            description: "验证对话框关闭后的快照与实时更新",
+            execution: "immediate",
+          }],
         },
       ]);
-    if (route === "/agent-sessions")
-      return json(res, { sessions: [summary("a"), summary("b")] });
+    if (route === "/agent-sessions") {
+      if (req.method === "POST") {
+        assert.equal(body.connector_id, "fixture/local");
+        createdSession = true;
+        return json(res, summary("created"));
+      }
+      return json(res, { sessions: [summary("a"), summary("b"), ...(createdSession ? [summary("created")] : [])] });
+    }
+    if (route === "/agent-session/actions") {
+      assert.equal(body.session_id, "created");
+      assert.equal(body.action_id, "session.refresh");
+      sessionActionCompleted = true;
+      return json(res, { status: { state: "completed" }, session: summary("created") });
+    }
     if (route === "/agent-session") {
+      if (url.searchParams.get("session_id") === "created") {
+        lifecycleSnapshotReads++;
+        // The response must arrive after the action dialog has unmounted.
+        // A task owned by that dialog would be cancelled during this await.
+        if (sessionActionCompleted) await new Promise(resolve => setTimeout(resolve, 200));
+      }
       if (url.searchParams.get("limit") === "1") {
         requestRouteReads++;
         if (failNextRequestRouteRead) {
@@ -163,10 +228,19 @@ const server = http.createServer(async (req, res) => {
       });
       res.write(": ready\n\n");
       sockets.add(res);
+      if (route === "/agent-session/stream") {
+        const sessionId = url.searchParams.get("session_id");
+        sessionStreams.set(res, sessionId);
+        if (sessionId === "created")
+          for (const change of createdSessionChanges)
+            if (change.sequence > Number(url.searchParams.get("after") || 0))
+              writeSessionChange(res, change);
+      }
       const timer = setInterval(() => res.write(": keep-alive\n\n"), 1000);
       res.on("close", () => {
         clearInterval(timer);
         sockets.delete(res);
+        sessionStreams.delete(res);
       });
       return;
     }
@@ -286,6 +360,10 @@ const server = http.createServer(async (req, res) => {
     serviceWorkers: testWorker ? "allow" : "block",
   });
   const page = await context.newPage();
+  let documentLoads = 0;
+  page.on("framenavigated", frame => {
+    if (frame === page.mainFrame()) documentLoads++;
+  });
   let errors = [];
   page.on("pageerror", (e) => errors.push(e.stack || e.message));
   page.on("console", (message) => {
@@ -294,16 +372,49 @@ const server = http.createServer(async (req, res) => {
   });
   page.setDefaultTimeout(12000);
   const openSession = async (title) => {
+    const sessionId = title === "同步验证会话" ? "a" : "b";
+    // A loaded session uses its latest user message as the display title;
+    // live updates also reorder the list. Select by its fixture content,
+    // never by a fixed list position or only its initial summary title.
+    const displayTitles = new RegExp(`^(?:${[
+      title,
+      ...(sessionId === "a" ? ["检查当前工作区", ...effects.values()] : ["历史任务 7"]),
+    ].map(value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`);
     await page.getByRole("button", { name: "打开会话列表" }).click();
     await page.getByRole("tab", { name: /Test Agent/ }).click();
-    await page
-      .locator(".thread-button")
-      .nth(title === "同步验证会话" ? 0 : 1)
-      .click();
+    await Promise.all([
+      page.waitForResponse(response => {
+        const url = new URL(response.url());
+        return url.pathname === "/api/v1/agent-session" && url.searchParams.get("session_id") === sessionId;
+      }),
+      page.locator(".thread-button")
+        .filter({ has: page.locator(".thread-button__title", { hasText: displayTitles }) })
+        .click(),
+    ]);
+    await page.getByRole("heading", { name: displayTitles }).waitFor();
     await page.locator(".message-input").waitFor();
   };
   try {
     await page.goto("http://127.0.0.1:" + server.address().port);
+    await page.getByRole("button", { name: "新建会话", exact: true }).click();
+    await page.locator(".session-create-card").filter({ hasText: "Test Agent" })
+      .getByRole("button", { name: "创建会话", exact: true }).click();
+    await page.getByRole("button", { name: "关闭新建会话" }).waitFor({ state: "detached" });
+    const lifecycleDocumentLoads = documentLoads;
+    publishCreatedSessionMessage("创建弹窗关闭后实时消息仍然到达");
+    await page.getByText("创建弹窗关闭后实时消息仍然到达", { exact: true }).waitFor();
+    assert.equal(lifecycleSnapshotReads, 0, "new session message must arrive through the live stream");
+
+    await page.getByRole("button", { name: "打开会话操作" }).click();
+    await page.locator(".session-action-card").filter({ hasText: "更新会话配置" })
+      .getByRole("button", { name: "执行", exact: true }).click();
+    await page.getByRole("button", { name: "关闭会话操作" }).waitFor({ state: "detached" });
+    await page.getByText("会话操作后的快照已同步", { exact: true }).waitFor();
+    assert.ok(lifecycleSnapshotReads > 0, "session action must finish the delayed snapshot refresh");
+    publishCreatedSessionMessage("操作弹窗关闭后实时消息仍然到达");
+    await page.getByText("操作弹窗关闭后实时消息仍然到达", { exact: true }).waitFor();
+    assert.equal(documentLoads, lifecycleDocumentLoads, "session creation and actions must not require a page reload");
+
     await openSession("同步验证会话");
     await page
       .locator(".pending-card")
@@ -516,6 +627,9 @@ const server = http.createServer(async (req, res) => {
         passed: true,
         checks: [
           `${width}px layout`,
+          "new session live updates after dialog unmount",
+          "session action snapshot after dialog unmount",
+          "session action live updates without reload",
           "union of pending requests",
           "session drafts",
           "IME enter",
@@ -550,6 +664,14 @@ const server = http.createServer(async (req, res) => {
     console.error(error);
     console.error("Browser errors:", errors);
     console.error("Worker requests:", workerRequests);
+    console.error("Lifecycle state:", {
+      createdSession,
+      sessionActionCompleted,
+      lifecycleSnapshotReads,
+      activeSessionStreams: [...sessionStreams.values()],
+      publishedSessionChanges: createdSessionChanges.length,
+      documentLoads,
+    });
     if (testWorker)
       console.error(
         "Worker state:",
