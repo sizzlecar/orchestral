@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased]
+
+### Model selection and reasoning controls
+
+- `/model` discovers model IDs from the configured service API while preserving its
+  endpoint, authentication, and protocol settings. Explicit profile selection remains
+  available through `/model profiles`; model and reasoning switches retain session history.
+- `/reasoning`, `--reasoning`, and model profiles support provider-defined effort names
+  without a client release, preserving their spelling through discovery and requests.
+  Missing capability metadata no longer produces an invented menu of supported efforts;
+  explicit values can still be submitted for the service to validate.
+- Default omits reasoning controls, `none` requests an explicit effort, and `on`/`off`
+  control binary thinking. Use `effort:on`, `effort:off`, or `effort:default` for literal
+  provider efforts that share those names.
+- Native Codex choices follow its model catalog and configured defaults. Unknown effort
+  names remain intact, and missing catalog metadata leaves optional controls for native
+  validation rather than selecting fixed fallback models or effort levels.
+- Web forms can clear optional model and reasoning selections back to the provider default
+  without weakening required sandbox or approval settings.
+
+### Runtime and Web reliability
+
+- Live session updates and reconciliation continue after the dialog that started them
+  closes. A recovered session clears superseded error messages while retaining genuinely
+  new failures and the original history.
+- Process sessions wait for both stdout and stderr readers to finish before reporting
+  completion. Poll deadlines preserve unread output, and session cleanup stops its readers.
+
+### Distribution and compatibility
+
+- Published-release checks exercise public installers and startup of the installed CLI,
+  including onboarding against a local fixture service without paid model calls.
+- The SDK adds optional `AgentConfig.reasoning` and extensible reasoning preference types.
+  Direct `AgentConfig` struct literals need the new field or a `Default` update; existing
+  serialized configuration remains valid. Explicit reasoning controls participate in request
+  and unfinished-run recovery identity; an omitted control preserves the default identity.
+- OpenAI discovery adds `DiscoveredModel.reasoning`. Downstream code constructing this public
+  struct directly must supply `reasoning: None` when capabilities are unknown, or provide the
+  declared capabilities. Existing model IDs and context-capacity metadata retain their meanings.
+- Agent Protocol remains v1. Native Codex validates model/effort combinations; an HTTP effort
+  named `ultra` does not imply Codex's native preset or multi-agent behavior.
+
 ## [0.3.1]
 
 The v0.3.0 tag remains an unpublished candidate; v0.3.1 includes the changes below.

@@ -1,5 +1,6 @@
 mod formula;
 mod registry;
+mod version;
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,6 +22,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Prepare a new stable version and promote nonempty Unreleased notes.
+    PrepareVersion {
+        #[arg(long)]
+        version: String,
+    },
     /// Validate Cargo publication metadata and extract reviewed release notes.
     Prepare {
         #[arg(long)]
@@ -67,6 +73,10 @@ fn main() -> Result<()> {
     let root = args.workspace.canonicalize().context("workspace path")?;
     let inventory = inventory(&root)?;
     match args.command {
+        Action::PrepareVersion { version } => {
+            version::prepare(&root, &inventory.version, &version)?;
+            println!("{version}");
+        }
         Action::Prepare { output, tag } => {
             if let Some(tag) = tag {
                 ensure!(
@@ -126,23 +136,7 @@ fn inventory(root: &Path) -> Result<Inventory> {
         .context("workspace version")?
         .to_owned();
     validate_version(&version)?;
-    let metadata = Command::new("cargo")
-        .args([
-            "metadata",
-            "--locked",
-            "--offline",
-            "--no-deps",
-            "--format-version",
-            "1",
-        ])
-        .current_dir(root)
-        .output()?;
-    ensure!(
-        metadata.status.success(),
-        "Cargo metadata failed: {}",
-        String::from_utf8_lossy(&metadata.stderr)
-    );
-    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout)?;
+    let metadata = cargo_metadata(root)?;
     let members = metadata["workspace_members"]
         .as_array()
         .context("workspace members")?;
@@ -188,6 +182,26 @@ fn inventory(root: &Path) -> Result<Inventory> {
             .into(),
         packages,
     })
+}
+
+fn cargo_metadata(root: &Path) -> Result<serde_json::Value> {
+    let metadata = Command::new("cargo")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(root)
+        .output()?;
+    ensure!(
+        metadata.status.success(),
+        "Cargo metadata failed: {}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    Ok(serde_json::from_slice(&metadata.stdout)?)
 }
 
 fn validate_version(version: &str) -> Result<()> {

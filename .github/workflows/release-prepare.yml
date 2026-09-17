@@ -1,0 +1,99 @@
+name: Prepare release
+run-name: Prepare Orchestral v${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable MAJOR.MINOR.PATCH version to prepare from Unreleased notes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  version-pr:
+    if: github.repository == 'sizzlecar/orchestral'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Require main and a release PR credential
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo 'Prepare release must be dispatched on main.' >&2
+            exit 1
+          fi
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo 'RELEASE_GITHUB_TOKEN needs contents and pull request write access to this repository.' >&2
+            exit 1
+          fi
+      # Use a PAT or App token for both push and PR creation so ordinary required
+      # CI starts automatically. Do not fall back to the workflow GITHUB_TOKEN.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-tools
+      - name: Prepare coordinated versions and release notes
+        run: |
+          cargo run --locked -p orchestral-release -- prepare-version --version "$RELEASE_VERSION"
+          git diff --check
+          if git show-ref --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
+            echo 'The requested release tag already exists; no release branch will be changed.' >&2
+            exit 1
+          fi
+          git config user.name orchestral-release
+          git config user.email orchestral-release@users.noreply.github.com
+          git switch -c "release/v$RELEASE_VERSION"
+          git add -- Cargo.toml Cargo.lock CHANGELOG.md
+          # A preparer change outside its declared files must not be omitted.
+          git diff --exit-code
+          if git diff --cached --quiet; then
+            echo 'The release preparer produced no version changes.' >&2
+            exit 1
+          fi
+          # A retry can follow a successful push but a failed PR API request.
+          # Reuse identical content; never overwrite a different release proposal.
+          if git show-ref --verify --quiet "refs/remotes/origin/release/v$RELEASE_VERSION"; then
+            if [ "$(git write-tree)" != "$(git rev-parse "origin/release/v$RELEASE_VERSION^{tree}")" ]; then
+              echo 'The existing release branch differs from this proposal; review it before retrying.' >&2
+              exit 1
+            fi
+          else
+            git commit -m "chore: prepare v$RELEASE_VERSION"
+            git push origin "HEAD:refs/heads/release/v$RELEASE_VERSION"
+          fi
+      - name: Open or reuse the release PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          body="$RUNNER_TEMP/release-pr.md"
+          printf 'Prepare Orchestral v%s with coordinated workspace/internal dependency versions, Cargo.lock, and the reviewed Unreleased notes.\n\nNormal PR CI must pass and this change must be reviewed before merge. After merge, push the matching annotated tag to run the existing Release workflow; it creates a draft for review before public distribution.\n' "$RELEASE_VERSION" > "$body"
+          pr=$(gh pr list --head "release/v$RELEASE_VERSION" --base main --state open --json url --jq '.[0].url // empty')
+          if [ -z "$pr" ]; then
+            pr=$(gh pr create --head "release/v$RELEASE_VERSION" --base main \
+              --title "chore: prepare v$RELEASE_VERSION" --body-file "$body")
+          fi
+          test -n "$pr"
+          printf 'Release PR: %s\n\nReview and merge after its required CI passes. Tagging and public distribution remain separate.\n' "$pr" >> "$GITHUB_STEP_SUMMARY"
