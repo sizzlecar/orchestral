@@ -116,6 +116,7 @@ fn merge_model_overrides(requested: &ModelOverrides, automatic: &ModelOverrides)
             .or_else(|| automatic.model_profile.clone()),
         model: requested.model.clone().or_else(|| automatic.model.clone()),
         temperature: requested.temperature.or(automatic.temperature),
+        reasoning: requested.reasoning.or(automatic.reasoning),
         base_url: requested.base_url.clone(),
         api_key_env: requested.api_key_env.clone(),
         no_auth: requested.no_auth,
@@ -209,6 +210,9 @@ fn apply_model_overrides_to_yaml(
             "temperature",
             serde_yaml::to_value(temperature).context("serialize temperature")?,
         );
+    }
+    if let Some(reasoning) = overrides.reasoning {
+        set_yaml_key(agent, "reasoning", serde_yaml::to_value(reasoning)?);
     }
     if overrides.base_url.is_some() || overrides.api_key_env.is_some() || overrides.no_auth {
         apply_connection_overrides(root, config, overrides)?;
@@ -542,6 +546,39 @@ mod tests {
             }
         });
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reasoning_override_survives_config_roundtrip_and_explicit_default_is_not_absence() {
+        use orchestral_core::config::ReasoningPreference;
+        let raw = embedded_default_config();
+        let config: OrchestralConfig = serde_yaml::from_str(&raw).unwrap();
+        for reasoning in [
+            ReasoningPreference::Off,
+            ReasoningPreference::None,
+            ReasoningPreference::Default,
+        ] {
+            let mut yaml: YamlValue = serde_yaml::from_str(&raw).unwrap();
+            apply_model_overrides_to_yaml(
+                &mut yaml,
+                &config,
+                &ModelOverrides {
+                    model: Some("selected-api-model".into()),
+                    reasoning: Some(reasoning),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let restored: OrchestralConfig = serde_yaml::from_value(yaml).unwrap();
+            assert_eq!(restored.agent.model.as_deref(), Some("selected-api-model"));
+            assert_eq!(restored.agent.reasoning, Some(reasoning));
+        }
+        assert!(ModelOverrides::default().is_empty());
+        assert!(!ModelOverrides {
+            reasoning: Some(ReasoningPreference::Default),
+            ..Default::default()
+        }
+        .is_empty());
     }
 
     #[test]

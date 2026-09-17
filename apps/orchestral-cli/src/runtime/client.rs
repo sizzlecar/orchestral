@@ -17,6 +17,7 @@ pub struct ModelOverrides {
     pub model_profile: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
+    pub reasoning: Option<orchestral_core::config::ReasoningPreference>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub no_auth: bool,
@@ -28,6 +29,7 @@ impl ModelOverrides {
             && self.model_profile.is_none()
             && self.model.is_none()
             && self.temperature.is_none()
+            && self.reasoning.is_none()
             && self.base_url.is_none()
             && self.api_key_env.is_none()
             && !self.no_auth

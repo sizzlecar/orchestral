@@ -12,6 +12,7 @@ mod input_queue;
 mod insights;
 mod interaction;
 mod menu;
+mod models;
 #[cfg(test)]
 mod performance;
 #[cfg(test)]

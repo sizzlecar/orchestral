@@ -3884,6 +3884,13 @@ type FixtureHttpHandler = Box<dyn Fn(&CapturedHttpRequest) -> FixtureHttpRespons
 fn spawn_fixture_http_server(
     handlers: Vec<FixtureHttpHandler>,
 ) -> (String, JoinHandle<Vec<CapturedHttpRequest>>) {
+    spawn_fixture_http_server_with_models(handlers, None)
+}
+
+fn spawn_fixture_http_server_with_models(
+    handlers: Vec<FixtureHttpHandler>,
+    models: Option<FixtureHttpHandler>,
+) -> (String, JoinHandle<Vec<CapturedHttpRequest>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP fixture");
     listener
         .set_nonblocking(true)
@@ -3921,18 +3928,19 @@ fn spawn_fixture_http_server(
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .expect("bound fixture write timeout");
                 let request = read_http_fixture_request(&mut stream);
-                // These fixtures implement generation/MCP, not discovery.
-                // Optional capability probes must not consume a scripted POST.
+                // Discovery is independent of the generation/MCP script. It may
+                // run during startup, explicit refresh, or Host reconstruction.
                 if request.method == "GET" && request.path.ends_with("/models") {
-                    write_http_fixture_response(
-                        &mut stream,
-                        FixtureHttpResponse {
+                    let response = models.as_ref().map_or_else(
+                        || FixtureHttpResponse {
                             status: "404 Not Found",
                             content_type: "application/json",
                             body: b"{}".to_vec(),
                             repeat_handler: false,
                         },
+                        |handler| handler(&request),
                     );
+                    write_http_fixture_response(&mut stream, response);
                     continue;
                 }
                 let response = handler(&request);

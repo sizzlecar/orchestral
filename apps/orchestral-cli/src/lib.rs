@@ -9,6 +9,7 @@ mod google_auth;
 mod local_sessions;
 mod mcp_command;
 mod mcp_config;
+mod model_controls;
 mod openai_connection;
 pub mod remote;
 mod runtime;

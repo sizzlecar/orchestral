@@ -461,7 +461,7 @@ fn tui_pty_switches_models_without_losing_memory_journal_and_resumes_session_dra
         |s| s.contains("FIRST_MODEL_ANSWER") && s.contains("replied"),
         LOCAL_PROCESS_TIMEOUT,
     );
-    tui.send_paste("/model");
+    tui.send_paste("/model profiles");
     tui.wait_for_screen(
         |s| s.contains("Models · configured profiles") && s.contains("alternate"),
         LOCAL_PROCESS_TIMEOUT,
@@ -501,6 +501,128 @@ fn tui_pty_switches_models_without_losing_memory_journal_and_resumes_session_dra
     assert!(output.status.success());
     output.assert_terminal_restored();
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn tui_pty_discovers_models_and_preserves_reasoning_when_resuming_a_session() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("tui-api-model-reasoning");
+    let models: FixtureHttpHandler = Box::new(|request| {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/v1/models");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer fixture-key")
+        );
+        FixtureHttpResponse {
+            status: "200 OK",
+            content_type: "application/json",
+            repeat_handler: false,
+            body: serde_json::to_vec(&json!({"data":[
+                {"id":"fixture-model", "max_model_len":32768},
+                {"id":"api-alternate", "max_model_len":32768, "reasoning":{"thinking":{"default_enabled":true}}}
+            ]}))
+            .unwrap(),
+        }
+    });
+    let (endpoint, server) = spawn_fixture_http_server_with_models(
+        vec![
+            Box::new(|request| {
+                assert_eq!(request.body["model"], "fixture-model");
+                assert!(request.body.get("reasoning_effort").is_none());
+                assert!(request.body.get("chat_template_kwargs").is_none());
+                openai_text_response("INITIAL_SESSION_MEMORY")
+            }),
+            Box::new(|request| {
+                assert_eq!(request.body["model"], "api-alternate");
+                assert_eq!(
+                    request.body["chat_template_kwargs"]["enable_thinking"],
+                    false
+                );
+                assert!(request.body.get("reasoning_effort").is_none());
+                assert!(model_request_text(&request.body).contains("INITIAL_SESSION_MEMORY"));
+                openai_text_response("API_SELECTION_CONFIRMED")
+            }),
+            Box::new(|request| {
+                assert_eq!(request.body["model"], "api-alternate");
+                assert_eq!(
+                    request.body["chat_template_kwargs"]["enable_thinking"],
+                    false
+                );
+                assert!(model_request_text(&request.body).contains("API_SELECTION_CONFIRMED"));
+                openai_text_response("RESUMED_SELECTION_CONFIRMED")
+            }),
+        ],
+        Some(models),
+    );
+    workspace.configure_local_openai(&endpoint);
+    workspace.rewrite_config(|config| {
+        config["journal"]["backend"] = serde_yaml::Value::String("memory".into());
+    });
+    let mut tui = PtyHarness::spawn(local_tui_command(
+        &workspace,
+        "api-selection-session",
+        "Follow the user's request.",
+    ));
+    tui.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
+    tui.send_paste("remember the connection selection");
+    tui.wait_for_screen(
+        |s| s.contains("INITIAL_SESSION_MEMORY") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("/model");
+    tui.wait_for_screen(
+        |s| s.contains("refreshed from service") && s.contains("api-alternate"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"api-alternate\r");
+    tui.wait_for_screen(
+        |s| s.contains("Model selected for the next request"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("/reasoning");
+    tui.wait_for_screen(
+        |s| s.contains("Reasoning") && s.contains("Disable thinking explicitly"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"off\r");
+    tui.wait_for_screen(
+        |s| s.contains("Reasoning off selected"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("continue with the selected model");
+    tui.wait_for_screen(
+        |s| s.contains("API_SELECTION_CONFIRMED") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("/new");
+    tui.wait_for_screen(
+        |s| s.contains("Ask Orchestral") && !s.contains("API_SELECTION_CONFIRMED"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("/resume");
+    tui.wait_for_screen(
+        |s| {
+            s.contains("Sessions · this workspace")
+                && s.contains("remember the connection selection")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\r");
+    tui.wait_for_screen(
+        |s| s.contains("API_SELECTION_CONFIRMED") && s.contains("Resumed ·"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("continue after resuming");
+    tui.wait_for_screen(
+        |s| s.contains("RESUMED_SELECTION_CONFIRMED") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success());
+    output.assert_terminal_restored();
+    assert_eq!(server.join().unwrap().len(), 3);
 }
 
 #[cfg(windows)]

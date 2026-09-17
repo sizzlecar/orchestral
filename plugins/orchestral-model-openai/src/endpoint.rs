@@ -4,6 +4,8 @@ use std::time::Duration;
 use orchestral_core::model_protocol::ModelError;
 use reqwest::{Client, Url};
 
+use crate::OpenAiReasoningCapabilities;
+
 /// Validated OpenAI-compatible API base, without credentials or query parameters.
 #[derive(Debug, Clone)]
 pub struct OpenAiEndpoint(Url);
@@ -63,9 +65,12 @@ pub struct DiscoveredModel {
     pub id: String,
     /// Input plus output tokens. Absent when the server does not declare it.
     pub max_context_tokens: Option<u64>,
+    /// None preserves unknown support rather than claiming all/no controls.
+    pub reasoning: Option<OpenAiReasoningCapabilities>,
 }
 
-/// Discover IDs and capacities without sending a generation request.
+/// Discover IDs, capacities and optional controls without a generation request.
+/// Unknown extension fields are ignored; malformed known controls fail visibly.
 pub async fn discover_model_metadata(
     endpoint: &OpenAiEndpoint,
     api_key: &str,
@@ -117,8 +122,8 @@ fn parse_model_metadata(value: &serde_json::Value) -> Result<Vec<DiscoveredModel
         .get("data")
         .and_then(serde_json::Value::as_array)
         .ok_or("model discovery requires an OpenAI-compatible data array; specify --model")?;
-    let mut models = BTreeMap::<String, Option<u64>>::new();
-    for model in data {
+    let mut models = BTreeMap::<String, DiscoveredModel>::new();
+    for (index, model) in data.iter().enumerate() {
         let Some(id) = model
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -132,28 +137,156 @@ fn parse_model_metadata(value: &serde_json::Value) -> Result<Vec<DiscoveredModel
             .get("max_model_len")
             .and_then(serde_json::Value::as_u64)
             .filter(|tokens| *tokens > 0);
-        models
-            .entry(id.to_owned())
-            .and_modify(|existing| {
-                *existing = match (*existing, capacity) {
+        let reasoning = parse_reasoning_metadata(model, index)?;
+        match models.entry(id.to_owned()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.reasoning != reasoning {
+                    return Err("model discovery returned conflicting reasoning metadata for a duplicate model ID".to_owned());
+                }
+                existing.max_context_tokens = match (existing.max_context_tokens, capacity) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };
-            })
-            .or_insert(capacity);
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(DiscoveredModel {
+                    id: id.to_owned(),
+                    max_context_tokens: capacity,
+                    reasoning,
+                });
+            }
+        }
     }
-    Ok(models
-        .into_iter()
-        .map(|(id, max_context_tokens)| DiscoveredModel {
-            id,
-            max_context_tokens,
-        })
-        .collect())
+    Ok(models.into_values().collect())
+}
+
+fn parse_reasoning_metadata(
+    model: &serde_json::Value,
+    index: usize,
+) -> Result<Option<OpenAiReasoningCapabilities>, String> {
+    let invalid_metadata = || {
+        format!(
+        "model discovery entry {index} has invalid reasoning metadata; expected supported_efforts and/or thinking.default_enabled with valid types"
+    )
+    };
+    let mut reasoning: Option<OpenAiReasoningCapabilities> = match model.get("reasoning") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            // Serde structs may also deserialize positional arrays; this
+            // extension deliberately requires named JSON object fields.
+            if !value.is_object()
+                || value
+                    .get("thinking")
+                    .is_some_and(|thinking| !thinking.is_null() && !thinking.is_object())
+            {
+                return Err(invalid_metadata());
+            }
+            Some(serde_json::from_value(value.clone()).map_err(|_| invalid_metadata())?)
+        }
+    };
+    if let Some(capabilities) = &mut reasoning {
+        if let Some(efforts) = &mut capabilities.supported_efforts {
+            efforts.sort();
+            efforts.dedup();
+        }
+        if capabilities.supported_efforts.is_none() && capabilities.thinking.is_none() {
+            reasoning = None;
+        }
+    }
+    Ok(reasoning)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OpenAiReasoningEffort;
+    use serde_json::json;
+
+    #[test]
+    fn discovered_reasoning_preserves_unknown_empty_efforts_and_toggle_only_support() {
+        let models = parse_model_metadata(&json!({"data": [
+            json!({"id": "unknown"}),
+            json!({"id": "future", "reasoning": {"future_extension": true}}),
+            json!({"id": "empty", "reasoning": {"supported_efforts": []}}),
+            json!({"id": "toggle", "reasoning": {"thinking": {"default_enabled": false, "future": 1}}}),
+            json!({"id": "levels", "reasoning": {"supported_efforts": ["high", "low", "high"]}}),
+            json!({"id": "unknown"}),
+        ]}))
+        .unwrap();
+        assert_eq!(models.len(), 5);
+        let find = |id| models.iter().find(|model| model.id == id).unwrap();
+        assert!(find("unknown").reasoning.is_none());
+        assert!(find("future").reasoning.is_none());
+        assert_eq!(
+            find("empty").reasoning.as_ref().unwrap().supported_efforts,
+            Some(vec![])
+        );
+        let toggle = find("toggle").reasoning.as_ref().unwrap();
+        assert!(toggle.supported_efforts.is_none());
+        assert!(!toggle.thinking.unwrap().default_enabled);
+        assert_eq!(
+            find("levels").reasoning.as_ref().unwrap().supported_efforts,
+            Some(vec![
+                OpenAiReasoningEffort::Low,
+                OpenAiReasoningEffort::High
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_known_reasoning_metadata_is_visible_without_echoing_untrusted_values() {
+        for reasoning in [
+            json!(true),
+            json!([]),
+            json!([null, null]),
+            json!({"thinking": [false]}),
+            json!({"thinking": {}}),
+            json!({"thinking": {"default_enabled": "secret"}}),
+            json!({"supported_efforts": "secret"}),
+            json!({"supported_efforts": ["secret"]}),
+        ] {
+            let error =
+                parse_model_metadata(&json!({"data": [{"id": "model", "reasoning": reasoning}]}))
+                    .unwrap_err();
+            assert!(error.contains("reasoning metadata"));
+            assert!(!error.contains("secret"));
+        }
+        assert!(parse_model_metadata(&json!({"data": [
+            json!({"id": "same", "reasoning": {"supported_efforts": ["low"]}}),
+            json!({"id": "same", "reasoning": {"supported_efforts": ["high"]}}),
+        ]}))
+        .is_err());
+    }
+
+    #[test]
+    fn duplicate_capacity_minimum_and_reasoning_agreement_are_independent() {
+        let models = parse_model_metadata(&json!({"data": [
+            {"id": "known", "max_model_len": 8192, "reasoning": {"supported_efforts": ["high", "low"]}},
+            {"id": "known", "max_model_len": 4096, "reasoning": {"supported_efforts": ["low", "high", "low"]}},
+            {"id": "known", "reasoning": {"supported_efforts": ["low", "high"]}},
+            {"id": "unknown", "max_model_len": 16384},
+            {"id": "unknown", "max_model_len": 8192, "reasoning": {}},
+            {"id": "unknown", "reasoning": null}
+        ]})).unwrap();
+        assert_eq!(models[0].id, "known");
+        assert_eq!(models[0].max_context_tokens, Some(4096));
+        assert_eq!(
+            models[0].reasoning.as_ref().unwrap().supported_efforts,
+            Some(vec![
+                OpenAiReasoningEffort::Low,
+                OpenAiReasoningEffort::High
+            ])
+        );
+        assert_eq!(models[1].max_context_tokens, Some(8192));
+        assert!(models[1].reasoning.is_none());
+        for conflicting in [json!({"thinking": {"default_enabled": false}}), json!(null)] {
+            assert!(parse_model_metadata(&json!({"data": [
+                {"id": "same", "max_model_len": 8192, "reasoning": {"thinking": {"default_enabled": true}}},
+                {"id": "same", "max_model_len": 4096, "reasoning": conflicting}
+            ]})).is_err());
+        }
+    }
 
     #[test]
     fn discovery_preserves_unknown_capacity_and_uses_smallest_duplicate_declaration() {

@@ -224,6 +224,8 @@ pub(crate) struct HostMetadata {
     pub context: String,
     pub context_budget: Option<u64>,
     pub models: Vec<ModelProfile>,
+    pub model_backend: BackendSpec,
+    pub reasoning: orchestral_core::config::ReasoningPreference,
 }
 
 pub struct AgentHost {
@@ -300,6 +302,8 @@ async fn build_agent_host_with_journals(
     let config = load_config(&config_path)
         .with_context(|| format!("load Generic Agent config '{}'", config_path.display()))?;
     let (backend, profile, model, temperature) = resolve_model(&config).await?;
+    let reasoning =
+        crate::model_controls::resolve_reasoning(config.agent.reasoning, profile.as_ref())?;
     let (model_backend, token_meter) = build_model_backend(
         &backend,
         &model,
@@ -307,6 +311,7 @@ async fn build_agent_host_with_journals(
         profile.as_ref(),
         config.agent.stream_buffer,
         options.credential_file.as_deref(),
+        reasoning,
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
@@ -417,6 +422,8 @@ async fn build_agent_host_with_journals(
             if config.agent.compaction.enabled { "automatic" } else { "disabled" },
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
         models: config.providers.models.clone(),
+        model_backend: backend.clone(),
+        reasoning,
     };
     let session_history = if matches!(config.journal.backend.as_str(), "fs" | "filesystem") {
         crate::local_sessions::LocalSessionHistory::Directory(base_journal_root)
@@ -584,7 +591,7 @@ async fn build_agent_host_with_journals(
         workspace_root: workspaces.primary.clone(),
         execution_profile: AgentSessionExecutionProfile {
             model: Some(model),
-            reasoning_effort: Some("default".to_owned()),
+            reasoning_effort: Some(reasoning.to_string()),
             permissions: Default::default(),
         },
         skill_manager,
@@ -1628,7 +1635,9 @@ pub(crate) fn build_model_backend(
     profile: Option<&ModelProfile>,
     max_buffered_events: usize,
     credential_file: Option<&std::path::Path>,
+    reasoning: orchestral_core::config::ReasoningPreference,
 ) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
+    let reasoning_control = crate::model_controls::openai_reasoning(backend, reasoning)?;
     let max_output_tokens = profile
         .and_then(|profile| profile.max_tokens)
         .unwrap_or(8_192) as u64;
@@ -1721,16 +1730,7 @@ pub(crate) fn build_model_backend(
                 .context("parse model profile config.tool_result_format")?
                 .unwrap_or_default();
             let api_key = crate::openai_connection::api_key(backend)?;
-            let endpoint = backend.endpoint.clone().or_else(|| match backend.kind.as_str() {
-                "openai" => Some("https://api.openai.com/v1".to_owned()),
-                "deepseek" => Some("https://api.deepseek.com".to_owned()),
-                _ => None,
-            }).with_context(|| {
-                format!(
-                    "OpenAI-compatible backend '{}' requires an endpoint",
-                    backend.name
-                )
-            })?;
+            let endpoint = crate::openai_connection::endpoint(backend)?.base_url().to_owned();
             let backend = Arc::new(
                 OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
                     backend_id: format!("openai-compatible/{}", backend.name),
@@ -1749,7 +1749,8 @@ pub(crate) fn build_model_backend(
                 .context("build OpenAI-compatible ModelBackend")?
                 .with_sampling(sampling)
                 .context("configure OpenAI-compatible sampling")?
-                .with_tool_result_format(tool_result_format),
+                .with_tool_result_format(tool_result_format)
+                .with_reasoning_control(reasoning_control),
             );
             Ok((backend.clone(), backend))
         }
@@ -2202,10 +2203,17 @@ mod entry_mode_tests {
                 "config": {"sampling": sampling},
             }))
             .unwrap();
-            let error =
-                super::build_model_backend(&backend, "local-model", 0.6, Some(&profile), 8, None)
-                    .err()
-                    .expect("invalid model sampling must fail before HTTP");
+            let error = super::build_model_backend(
+                &backend,
+                "local-model",
+                0.6,
+                Some(&profile),
+                8,
+                None,
+                Default::default(),
+            )
+            .err()
+            .expect("invalid model sampling must fail before HTTP");
             assert!(format!("{error:#}").contains("sampling"));
         }
     }
@@ -2236,6 +2244,7 @@ mod entry_mode_tests {
                 Some(&profile(format)),
                 8,
                 None,
+                Default::default(),
             )
             .err()
             .expect("invalid result format must fail before HTTP");
@@ -2248,6 +2257,7 @@ mod entry_mode_tests {
             Some(&profile(serde_json::json!("json"))),
             8,
             None,
+            Default::default(),
         )
         .unwrap();
         let (_, yaml_meter) = super::build_model_backend(
@@ -2257,6 +2267,7 @@ mod entry_mode_tests {
             Some(&profile(serde_json::json!("yaml"))),
             8,
             None,
+            Default::default(),
         )
         .unwrap();
         assert_ne!(json_meter.meter_descriptor(), yaml_meter.meter_descriptor());
@@ -2267,12 +2278,21 @@ mod entry_mode_tests {
             Some(&profile(serde_json::json!("text"))),
             8,
             None,
+            Default::default(),
         )
         .unwrap();
         assert_ne!(text_meter.meter_descriptor(), yaml_meter.meter_descriptor());
         assert_ne!(text_meter.meter_descriptor(), json_meter.meter_descriptor());
-        let (_, default_meter) =
-            super::build_model_backend(&backend, "local-model", 0.6, None, 8, None).unwrap();
+        let (_, default_meter) = super::build_model_backend(
+            &backend,
+            "local-model",
+            0.6,
+            None,
+            8,
+            None,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             default_meter.meter_descriptor(),
             text_meter.meter_descriptor()
@@ -2290,6 +2310,7 @@ mod entry_mode_tests {
             Some(&omitted_format),
             8,
             None,
+            Default::default(),
         )
         .unwrap();
         assert_eq!(

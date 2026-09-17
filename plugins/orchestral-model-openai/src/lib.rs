@@ -3,6 +3,11 @@
 mod continuation;
 mod endpoint;
 pub use endpoint::{discover_model_metadata, discover_models, DiscoveredModel, OpenAiEndpoint};
+mod reasoning;
+pub use reasoning::{
+    OpenAiReasoningCapabilities, OpenAiReasoningControl, OpenAiReasoningEffort,
+    OpenAiThinkingCapability,
+};
 mod sampling;
 pub use sampling::OpenAiSamplingConfig;
 mod tool_result;
@@ -72,6 +77,7 @@ pub struct OpenAiCompatibleBackend {
     client: Client,
     config: OpenAiCompatibleConfig,
     sampling: OpenAiSamplingConfig,
+    reasoning: Option<OpenAiReasoningControl>,
     tool_result_format: OpenAiToolResultFormat,
 }
 
@@ -89,6 +95,7 @@ impl OpenAiCompatibleBackend {
             client,
             config,
             sampling: OpenAiSamplingConfig::default(),
+            reasoning: None,
             tool_result_format: OpenAiToolResultFormat::default(),
         })
     }
@@ -98,6 +105,13 @@ impl OpenAiCompatibleBackend {
         sampling.validate()?;
         self.sampling = sampling;
         Ok(self)
+    }
+
+    /// Select an explicit reasoning request. None retains the endpoint default;
+    /// model support is declared by discovery or validated by the service.
+    pub fn with_reasoning_control(mut self, control: Option<OpenAiReasoningControl>) -> Self {
+        self.reasoning = control;
+        self
     }
 
     /// Select the text encoding of complete ToolResult envelopes. Canonical
@@ -122,6 +136,18 @@ impl OpenAiCompatibleBackend {
             .map_err(|error| ModelError::invalid_request(error.to_string()))?;
         if let Value::Object(sampling) = sampling {
             body.extend(sampling);
+        }
+        match self.reasoning {
+            Some(OpenAiReasoningControl::Effort(effort)) => {
+                body.insert("reasoning_effort".to_owned(), json!(effort));
+            }
+            Some(OpenAiReasoningControl::Thinking(enabled)) => {
+                body.insert(
+                    "chat_template_kwargs".to_owned(),
+                    json!({"enable_thinking": enabled}),
+                );
+            }
+            None => {}
         }
         body.insert(
             "max_tokens".to_owned(),
@@ -240,6 +266,13 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
             ),
         };
         let config = config.expect("OpenAI token meter scalar configuration is serializable");
+        // Preserve existing recovery identities when no control was selected.
+        // Explicit controls affect both wire size and the model's continuation.
+        let config = match self.reasoning {
+            Some(control) => serde_json::to_vec(&("reasoning-control/v1", config, control))
+                .expect("typed reasoning control is serializable"),
+            None => config,
+        };
         ModelTokenMeterDescriptor {
             strategy: strategy.to_owned(),
             version: version.to_owned(),
@@ -296,6 +329,12 @@ impl ModelBackend for OpenAiCompatibleBackend {
             extensions.insert(
                 "openai-compatible/tool-result-encoding".to_owned(),
                 Value::String(encoding_identity.to_owned()),
+            );
+        }
+        if let Some(control) = self.reasoning {
+            extensions.insert(
+                "openai-compatible/reasoning-control".to_owned(),
+                json!(control),
             );
         }
         ModelDescriptor {
