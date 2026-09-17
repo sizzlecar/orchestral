@@ -191,9 +191,69 @@ fn binary_reasoning_menu_lists_only_default_on_off_and_marks_unknown_explicitly(
         "selectable choices must not become a read-only detail panel"
     );
     assert!(menu.choices[0].description.contains("not declared"));
-    assert!(menu
-        .choices
-        .iter()
-        .filter(|choice| choice.label != "default")
-        .all(|choice| choice.description.contains("validated by the service")));
+    assert_eq!(menu.choices.len(), 1);
+    assert!(menu.choices[0].description.contains("/reasoning <value>"));
+}
+
+#[test]
+fn declared_efforts_round_trip_through_menu_and_selection_without_local_control_aliases() {
+    let metadata = metadata("http://127.0.0.1:1/v1");
+    for (name, label) in [
+        ("ultra", "ultra"),
+        ("future-next", "future-next"),
+        ("HIGH", "HIGH"),
+        ("on", "effort:on"),
+        ("off", "effort:off"),
+        ("default", "effort:default"),
+        ("effort:on", "effort:effort:on"),
+    ] {
+        let model =
+            crate::model_controls::discovered_model(orchestral_model_openai::DiscoveredModel {
+                id: "model".into(),
+                max_context_tokens: None,
+                reasoning: Some(orchestral_model_openai::OpenAiReasoningCapabilities {
+                    supported_efforts: Some(vec![name.parse().unwrap()]),
+                    thinking: None,
+                }),
+            });
+        let menu = reasoning_menu(&metadata, &model);
+        assert_eq!(menu.choices.len(), 2);
+        assert_eq!(menu.choices[1].label, label);
+        let selection = serde_json::from_str(&menu.choices[1].value).unwrap();
+        let mut overrides = ModelOverrides::default();
+        apply_selection(&metadata, "model", &mut overrides, selection).unwrap();
+        let control = crate::model_controls::openai_reasoning(
+            &metadata.model_backend,
+            overrides.reasoning.unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            control,
+            orchestral_model_openai::OpenAiReasoningControl::Effort(name.parse().unwrap())
+        );
+    }
+}
+
+#[test]
+fn explicit_reasoning_command_needs_no_discovery_and_preserves_custom_effort() {
+    let metadata = metadata("http://127.0.0.1:1/v1");
+    for (command, expected) in [
+        ("/reasoning future-next", "future-next"),
+        ("/reasoning\tHIGH", "HIGH"),
+        ("/reasoning effort:on", "on"),
+    ] {
+        let argument = reasoning_argument(command).unwrap();
+        let selection = explicit_reasoning(&metadata, "model", argument).unwrap();
+        let mut overrides = ModelOverrides::default();
+        apply_selection(&metadata, "model", &mut overrides, selection).unwrap();
+        assert_eq!(overrides.model.as_deref(), Some("model"));
+        assert_eq!(
+            overrides.reasoning,
+            Some(ReasoningPreference::Custom(expected.into()))
+        );
+    }
+    assert!(reasoning_argument("/reasoning").is_none());
+    assert!(reasoning_argument("/reasoningful high").is_none());
+    assert!(explicit_reasoning(&metadata, "model", "effort:").is_err());
 }

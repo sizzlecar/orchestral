@@ -733,7 +733,10 @@ impl CodexConnector {
                 dispatch_journal_dir: None,
                 ..CodexAppServerConfig::default()
             },
-            creation_schema: codex_session_creation_schema(),
+            creation_schema: codex_creation_schema(
+                &CodexModelCache::default(),
+                &CodexUserDefaults::default(),
+            ),
             artifact_resolver: None,
             artifact_blob_store: None,
             artifact_publisher: None,
@@ -763,7 +766,10 @@ impl CodexConnector {
                 dispatch_journal_dir: None,
                 ..CodexAppServerConfig::default()
             },
-            creation_schema: codex_session_creation_schema(),
+            creation_schema: codex_creation_schema(
+                &CodexModelCache::default(),
+                &CodexUserDefaults::default(),
+            ),
             artifact_resolver: None,
             artifact_blob_store: None,
             artifact_publisher: None,
@@ -1407,92 +1413,96 @@ struct CodexUserDefaults {
 }
 
 fn codex_session_creation_schema() -> Value {
-    const FALLBACK_MODELS: [&str; 6] = [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-    ];
-    const REASONING_ORDER: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
-
     let home = codex_home();
     let cache = fs::read_to_string(home.join("models_cache.json"))
         .ok()
         .and_then(|contents| serde_json::from_str::<CodexModelCache>(&contents).ok())
         .unwrap_or_default();
-    let visible_models = cache
-        .models
-        .iter()
-        .filter(|model| model.visibility == "list" && model.supported_in_api)
-        .collect::<Vec<_>>();
-    let models = if visible_models.is_empty() {
-        FALLBACK_MODELS
-            .iter()
-            .map(|model| (*model).to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        visible_models
-            .iter()
-            .map(|model| model.slug.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut reasoning_efforts = REASONING_ORDER
-        .iter()
-        .filter(|effort| {
-            visible_models.is_empty()
-                || visible_models.iter().any(|model| {
-                    model
-                        .supported_reasoning_levels
-                        .iter()
-                        .any(|level| level.effort == **effort)
-                })
-        })
-        .map(|effort| (*effort).to_owned())
-        .collect::<Vec<_>>();
-    if reasoning_efforts.is_empty() {
-        reasoning_efforts = REASONING_ORDER
-            .iter()
-            .map(|effort| (*effort).to_owned())
-            .collect();
-    }
     let defaults = fs::read_to_string(home.join("config.toml"))
         .ok()
         .and_then(|contents| toml::from_str::<CodexUserDefaults>(&contents).ok())
         .unwrap_or_default();
+    codex_creation_schema(&cache, &defaults)
+}
+
+fn codex_creation_schema(cache: &CodexModelCache, defaults: &CodexUserDefaults) -> Value {
+    let visible_models = cache
+        .models
+        .iter()
+        .filter(|model| {
+            model.visibility == "list" && model.supported_in_api && !model.slug.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
     let default_model = defaults
         .model
-        .filter(|model| models.contains(model))
-        .unwrap_or_else(|| models[0].clone());
+        .as_deref()
+        .filter(|model| !model.trim().is_empty());
     let model_default_effort = visible_models
         .iter()
-        .find(|model| model.slug == default_model)
-        .and_then(|model| model.default_reasoning_level.clone());
+        .find(|model| Some(model.slug.as_str()) == default_model)
+        .and_then(|model| model.default_reasoning_level.as_deref());
     let default_reasoning_effort = defaults
         .model_reasoning_effort
-        .filter(|effort| reasoning_efforts.contains(effort))
+        .as_deref()
+        .filter(|effort| !effort.trim().is_empty())
         .or(model_default_effort)
-        .filter(|effort| reasoning_efforts.contains(effort))
-        .unwrap_or_else(|| "medium".to_owned());
+        .filter(|effort| !effort.trim().is_empty());
+    let mut models = Vec::new();
+    let mut reasoning_efforts = Vec::new();
+    for model in &visible_models {
+        if !models.contains(&model.slug.as_str()) {
+            models.push(model.slug.as_str());
+        }
+        for level in &model.supported_reasoning_levels {
+            if !level.effort.trim().is_empty()
+                && !reasoning_efforts.contains(&level.effort.as_str())
+            {
+                reasoning_efforts.push(level.effort.as_str());
+            }
+        }
+    }
+    // Preserve native catalog strings and explicit user defaults without a
+    // client-owned vocabulary. Codex validates the selected model/effort pair.
+    let has_catalog_models = !models.is_empty();
+    let has_catalog_efforts = !reasoning_efforts.is_empty();
+    if let Some(model) = default_model {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    if let Some(effort) = default_reasoning_effort {
+        if !reasoning_efforts.contains(&effort) {
+            reasoning_efforts.push(effort);
+        }
+    }
+    let mut model_field = json!({
+        "type": "string", "title": "模型（留空使用 Codex 默认）", "minLength": 1
+    });
+    let mut reasoning_field = json!({
+        "type": "string", "title": "推理强度（由所选模型验证）", "minLength": 1
+    });
+    // Missing metadata leaves an optional text field, rather than advertising
+    // a fixed set of invented model IDs or effort levels.
+    if has_catalog_models {
+        model_field["enum"] = json!(models);
+    }
+    if has_catalog_efforts {
+        reasoning_field["enum"] = json!(reasoning_efforts);
+    }
+    if let Some(model) = default_model {
+        model_field["default"] = json!(model);
+    }
+    if let Some(effort) = default_reasoning_effort {
+        reasoning_field["default"] = json!(effort);
+    }
 
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["model", "reasoning_effort", "sandbox_mode", "approval_policy"],
+        "required": ["sandbox_mode", "approval_policy"],
         "properties": {
-            "model": {
-                "type": "string",
-                "title": "模型",
-                "default": default_model,
-                "enum": models
-            },
-            "reasoning_effort": {
-                "type": "string",
-                "title": "推理强度",
-                "default": default_reasoning_effort,
-                "enum": reasoning_efforts
-            },
+            "model": model_field,
+            "reasoning_effort": reasoning_field,
             "sandbox_mode": {
                 "type": "string",
                 "title": "文件与命令权限",
@@ -2068,6 +2078,142 @@ mod tests {
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
+
+    #[test]
+    fn native_catalog_preserves_new_efforts_and_explicit_defaults() {
+        let mut cache: CodexModelCache = serde_json::from_value(json!({"models": [{
+            "slug": "native-future-model", "visibility": "list", "supported_in_api": true,
+            "default_reasoning_level": "ultra",
+            "supported_reasoning_levels": [
+                {"effort": "low"}, {"effort": "ultra"}, {"effort": "future-Deep"},
+                {"effort": "ultra"}, {"effort": " "}
+            ]
+        }]}))
+        .unwrap();
+        let defaults = CodexUserDefaults {
+            model: Some("native-future-model".into()),
+            model_reasoning_effort: None,
+        };
+        let schema = codex_creation_schema(&cache, &defaults);
+        assert_eq!(
+            schema["properties"]["reasoning_effort"]["enum"],
+            json!(["low", "ultra", "future-Deep"])
+        );
+        assert_eq!(schema["properties"]["reasoning_effort"]["default"], "ultra");
+
+        cache.models[0]
+            .supported_reasoning_levels
+            .push(CodexReasoningLevel {
+                effort: "new-after-refresh".into(),
+            });
+        let refreshed = codex_creation_schema(&cache, &defaults);
+        assert!(refreshed["properties"]["reasoning_effort"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("new-after-refresh")));
+        let configured = codex_creation_schema(
+            &cache,
+            &CodexUserDefaults {
+                model: Some("explicit-new-model".into()),
+                model_reasoning_effort: Some("explicit-new-effort".into()),
+            },
+        );
+        assert_eq!(
+            configured["properties"]["model"]["default"],
+            "explicit-new-model"
+        );
+        assert_eq!(
+            configured["properties"]["reasoning_effort"]["default"],
+            "explicit-new-effort"
+        );
+        assert!(configured["properties"]["reasoning_effort"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("explicit-new-effort")));
+    }
+
+    #[test]
+    fn missing_native_catalog_uses_native_defaults_without_invented_choices() {
+        let schema =
+            codex_creation_schema(&CodexModelCache::default(), &CodexUserDefaults::default());
+        for field in ["model", "reasoning_effort"] {
+            assert!(schema["properties"][field].get("enum").is_none());
+            assert!(schema["properties"][field].get("default").is_none());
+            assert!(!schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field)));
+        }
+        let settings = session_creation_settings(&json!({
+            "sandbox_mode": "workspace-write", "approval_policy": "on-request"
+        }))
+        .unwrap();
+        assert!(settings.model.is_none());
+        assert!(settings.reasoning_effort.is_none());
+
+        let configured = codex_creation_schema(
+            &CodexModelCache::default(),
+            &CodexUserDefaults {
+                model: Some("configured-model".into()),
+                model_reasoning_effort: Some("configured-effort".into()),
+            },
+        );
+        assert_eq!(
+            configured["properties"]["model"]["default"],
+            "configured-model"
+        );
+        assert_eq!(
+            configured["properties"]["reasoning_effort"]["default"],
+            "configured-effort"
+        );
+        for field in ["model", "reasoning_effort"] {
+            assert!(configured["properties"][field].get("enum").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_session_preserves_ultra_and_future_efforts_on_the_rpc() {
+        for effort in ["ultra", "future-Deep"] {
+            let (client_io, server_io) = duplex(64 * 1024);
+            let (client_read, client_write) = tokio::io::split(client_io);
+            let (server_read, mut server_write) = tokio::io::split(server_io);
+            let rpc = CodexRpcClient::from_io(
+                client_read,
+                client_write,
+                Duration::from_secs(1),
+                1024 * 1024,
+            );
+            let connector = CodexConnector::with_client(rpc, "codex/test");
+            let server = tokio::spawn(async move {
+                let mut requests = BufReader::new(server_read).lines();
+                let start = read_request(&mut requests).await;
+                assert_eq!(start["method"], "thread/start");
+                assert_eq!(
+                    start["params"]["config"],
+                    json!({"model_reasoning_effort": effort})
+                );
+                write_result(
+                    &mut server_write,
+                    &start,
+                    json!({
+                        "thread": thread("future-effort-session", Value::Null),
+                        "model": "native-model", "reasoningEffort": effort
+                    }),
+                )
+                .await;
+            });
+            let session = connector.create_session(CreateAgentSessionRequest {
+                cwd: None, title: None,
+                options: json!({"sandbox_mode":"workspace-write", "approval_policy":"on-request", "model":"native-model", "reasoning_effort":effort}),
+                extensions: BTreeMap::new(),
+            }).await.unwrap();
+            assert_eq!(
+                session.execution_profile.reasoning_effort.as_deref(),
+                Some(effort)
+            );
+            server.await.unwrap();
+        }
+    }
 
     const ONE_PIXEL_PNG: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -3248,14 +3394,11 @@ mod tests {
             .as_ref()
             .and_then(|creation| creation.input_schema.as_ref())
             .expect("Codex creation options must be declared");
-        assert!(!creation_schema["properties"]["model"]["enum"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert!(!creation_schema["properties"]["reasoning_effort"]["enum"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert_eq!(creation_schema["properties"]["model"]["type"], "string");
+        assert_eq!(
+            creation_schema["properties"]["reasoning_effort"]["type"],
+            "string"
+        );
 
         let created = connector
             .create_session(CreateAgentSessionRequest {

@@ -116,7 +116,10 @@ fn merge_model_overrides(requested: &ModelOverrides, automatic: &ModelOverrides)
             .or_else(|| automatic.model_profile.clone()),
         model: requested.model.clone().or_else(|| automatic.model.clone()),
         temperature: requested.temperature.or(automatic.temperature),
-        reasoning: requested.reasoning.or(automatic.reasoning),
+        reasoning: requested
+            .reasoning
+            .clone()
+            .or_else(|| automatic.reasoning.clone()),
         base_url: requested.base_url.clone(),
         api_key_env: requested.api_key_env.clone(),
         no_auth: requested.no_auth,
@@ -211,7 +214,7 @@ fn apply_model_overrides_to_yaml(
             serde_yaml::to_value(temperature).context("serialize temperature")?,
         );
     }
-    if let Some(reasoning) = overrides.reasoning {
+    if let Some(reasoning) = &overrides.reasoning {
         set_yaml_key(agent, "reasoning", serde_yaml::to_value(reasoning)?);
     }
     if overrides.base_url.is_some() || overrides.api_key_env.is_some() || overrides.no_auth {
@@ -557,6 +560,8 @@ mod tests {
             ReasoningPreference::Off,
             ReasoningPreference::None,
             ReasoningPreference::Default,
+            ReasoningPreference::Custom("future-next".into()),
+            ReasoningPreference::Custom("on".into()),
         ] {
             let mut yaml: YamlValue = serde_yaml::from_str(&raw).unwrap();
             apply_model_overrides_to_yaml(
@@ -564,7 +569,7 @@ mod tests {
                 &config,
                 &ModelOverrides {
                     model: Some("selected-api-model".into()),
-                    reasoning: Some(reasoning),
+                    reasoning: Some(reasoning.clone()),
                     ..Default::default()
                 },
             )

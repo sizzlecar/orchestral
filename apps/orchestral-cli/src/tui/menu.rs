@@ -142,7 +142,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "/reasoning",
         "Change reasoning",
-        "Inspect the current model's reasoning controls for the next request",
+        "Inspect declared controls, or /reasoning <value>; effort:<name> sends a literal effort",
     ),
     (
         "/copy",

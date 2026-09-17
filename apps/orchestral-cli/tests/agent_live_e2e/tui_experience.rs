@@ -520,7 +520,8 @@ fn tui_pty_discovers_models_and_preserves_reasoning_when_resuming_a_session() {
             repeat_handler: false,
             body: serde_json::to_vec(&json!({"data":[
                 {"id":"fixture-model", "max_model_len":32768},
-                {"id":"api-alternate", "max_model_len":32768, "reasoning":{"thinking":{"default_enabled":true}}}
+                {"id":"api-alternate", "max_model_len":32768, "reasoning":{
+                    "thinking":{"default_enabled":true}, "supported_efforts":["future-next", "on"]}}
             ]}))
             .unwrap(),
         }
@@ -552,6 +553,20 @@ fn tui_pty_discovers_models_and_preserves_reasoning_when_resuming_a_session() {
                 assert!(model_request_text(&request.body).contains("API_SELECTION_CONFIRMED"));
                 openai_text_response("RESUMED_SELECTION_CONFIRMED")
             }),
+            Box::new(|request| {
+                assert_eq!(request.body["model"], "api-alternate");
+                assert_eq!(request.body["reasoning_effort"], "future-next");
+                assert!(request.body.get("chat_template_kwargs").is_none());
+                assert!(model_request_text(&request.body).contains("RESUMED_SELECTION_CONFIRMED"));
+                openai_text_response("FUTURE_EFFORT_CONFIRMED")
+            }),
+            Box::new(|request| {
+                assert_eq!(request.body["model"], "api-alternate");
+                assert_eq!(request.body["reasoning_effort"], "on");
+                assert!(request.body.get("chat_template_kwargs").is_none());
+                assert!(model_request_text(&request.body).contains("FUTURE_EFFORT_CONFIRMED"));
+                openai_text_response("LITERAL_EFFORT_CONFIRMED")
+            }),
         ],
         Some(models),
     );
@@ -582,7 +597,7 @@ fn tui_pty_discovers_models_and_preserves_reasoning_when_resuming_a_session() {
     );
     tui.send_paste("/reasoning");
     tui.wait_for_screen(
-        |s| s.contains("Reasoning") && s.contains("Disable thinking explicitly"),
+        |s| s.contains("Reasoning") && s.contains("Use service default (thinking on)"),
         LOCAL_PROCESS_TIMEOUT,
     );
     tui.send(b"off\r");
@@ -618,11 +633,36 @@ fn tui_pty_discovers_models_and_preserves_reasoning_when_resuming_a_session() {
         |s| s.contains("RESUMED_SELECTION_CONFIRMED") && s.contains("replied"),
         LOCAL_PROCESS_TIMEOUT,
     );
+    tui.send_paste("/reasoning");
+    tui.wait_for_screen(
+        |s| s.contains("Reasoning") && s.contains("future-next"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"future-next\r");
+    tui.wait_for_screen(
+        |s| s.contains("Reasoning future-next selected"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("continue with the declared future effort");
+    tui.wait_for_screen(
+        |s| s.contains("FUTURE_EFFORT_CONFIRMED") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("/reasoning effort:on");
+    tui.wait_for_screen(
+        |s| s.contains("Reasoning effort:on selected"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("continue with the literal provider effort");
+    tui.wait_for_screen(
+        |s| s.contains("LITERAL_EFFORT_CONFIRMED") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
     tui.send(b"\x04");
     let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success());
     output.assert_terminal_restored();
-    assert_eq!(server.join().unwrap().len(), 3);
+    assert_eq!(server.join().unwrap().len(), 5);
 }
 
 #[cfg(windows)]

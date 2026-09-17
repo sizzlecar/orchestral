@@ -60,6 +60,17 @@ fn profile_reasoning_and_explicit_default_have_distinct_precedence() {
         ReasoningPreference::Default
     );
     let mut invalid = profile.clone();
+    for (value, expected) in [
+        ("future-next", "future-next"),
+        ("HIGH", "HIGH"),
+        ("effort:off", "off"),
+    ] {
+        invalid.config["reasoning"] = json!(value);
+        assert_eq!(
+            resolve_reasoning(None, Some(&invalid)).unwrap(),
+            ReasoningPreference::Custom(expected.into())
+        );
+    }
     invalid.config["reasoning"] = json!(true);
     assert!(resolve_reasoning(None, Some(&invalid)).is_err());
 }

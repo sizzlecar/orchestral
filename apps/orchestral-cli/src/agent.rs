@@ -303,7 +303,7 @@ async fn build_agent_host_with_journals(
         .with_context(|| format!("load Generic Agent config '{}'", config_path.display()))?;
     let (backend, profile, model, temperature) = resolve_model(&config).await?;
     let reasoning =
-        crate::model_controls::resolve_reasoning(config.agent.reasoning, profile.as_ref())?;
+        crate::model_controls::resolve_reasoning(config.agent.reasoning.clone(), profile.as_ref())?;
     let (model_backend, token_meter) = build_model_backend(
         &backend,
         &model,
@@ -311,7 +311,7 @@ async fn build_agent_host_with_journals(
         profile.as_ref(),
         config.agent.stream_buffer,
         options.credential_file.as_deref(),
-        reasoning,
+        reasoning.clone(),
     )?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
@@ -423,7 +423,7 @@ async fn build_agent_host_with_journals(
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
         models: config.providers.models.clone(),
         model_backend: backend.clone(),
-        reasoning,
+        reasoning: reasoning.clone(),
     };
     let session_history = if matches!(config.journal.backend.as_str(), "fs" | "filesystem") {
         crate::local_sessions::LocalSessionHistory::Directory(base_journal_root)

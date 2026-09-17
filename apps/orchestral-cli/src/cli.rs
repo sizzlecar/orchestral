@@ -47,12 +47,8 @@ pub struct Cli {
     /// Override the model's sampling temperature.
     #[arg(long, global = true)]
     temperature: Option<f32>,
-    /// Generic Agent reasoning: default omits controls; none disables effort; on/off toggle thinking.
-    #[arg(
-        long,
-        value_name = "default|none|minimal|low|medium|high|xhigh|max|on|off",
-        global = true
-    )]
+    /// Generic Agent reasoning: default omits controls; on/off toggle thinking; other names request provider effort. Use effort:<name> for literal reserved names.
+    #[arg(long, value_name = "default|on|off|EFFORT|effort:NAME", global = true)]
     reasoning: Option<orchestral_core::config::ReasoningPreference>,
     /// Continue the conversation with this session ID
     #[arg(long, global = true)]
@@ -125,7 +121,7 @@ impl Cli {
             model_profile: self.model_profile.clone(),
             model,
             temperature: self.temperature,
-            reasoning: self.reasoning,
+            reasoning: self.reasoning.clone(),
             base_url,
             api_key_env: self.api_key_env.clone(),
             no_auth: self.no_auth,
@@ -223,7 +219,12 @@ mod tests {
                 .reasoning,
             Some(ReasoningPreference::Default)
         );
-        assert!(Cli::try_parse_from(["orchestral", "--reasoning", "ultra", "inspect"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["orchestral", "--reasoning", "ultra", "inspect"])
+                .unwrap()
+                .reasoning,
+            Some(ReasoningPreference::Custom("ultra".into()))
+        );
         let native =
             Cli::try_parse_from(["orchestral", "--reasoning", "high", "sessions", "agents"])
                 .unwrap();

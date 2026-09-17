@@ -92,7 +92,8 @@ impl Tasks {
         if (matches!(
             name.as_str(),
             "/model" | "/model profiles" | "/reasoning" | "/new"
-        ) || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _))))
+        ) || super::models::reasoning_argument(&name).is_some()
+            || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _))))
             && active
         {
             state.ui_notice = Some(
@@ -156,6 +157,7 @@ impl Tasks {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let changes_host_state = name == "/new"
+            || super::models::reasoning_argument(&name).is_some()
             || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _)))
             || matches!(action, Some(LocalAction::SetSkillEnabled { .. }))
             || (name.starts_with("/skills ") && name.trim() != "/skills list");
@@ -317,6 +319,17 @@ pub(crate) async fn command(
         "/reasoning" => Ok(Response::Menu(
             super::models::reasoning(&host.metadata, &host.model).await?,
         )),
+        command if super::models::reasoning_argument(command).is_some() => {
+            let value = super::models::reasoning_argument(command).unwrap();
+            let selection = super::models::explicit_reasoning(&host.metadata, &host.model, value)?;
+            choose(
+                host,
+                options,
+                MenuKind::Models,
+                serde_json::to_string(&selection)?,
+            )
+            .await
+        }
         "/resume" => {
             let sessions = host
                 .session_history
