@@ -1,12 +1,12 @@
-//! Explicit reasoning requests and optional model-declared controls. A known
-//! wire vocabulary is not a claim that every endpoint/model supports its values.
+//! Explicit reasoning requests and optional model-declared controls. Provider
+//! effort names are extensible and preserve their exact spelling on the wire.
 
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum OpenAiReasoningEffort {
     None,
     Minimal,
@@ -15,10 +15,11 @@ pub enum OpenAiReasoningEffort {
     High,
     XHigh,
     Max,
+    Custom(String),
 }
 
 impl OpenAiReasoningEffort {
-    /// Recognized request values, independently of a model's advertised support.
+    /// Common spellings, not an exhaustive capability list.
     pub const ALL: [Self; 7] = [
         Self::None,
         Self::Minimal,
@@ -29,7 +30,7 @@ impl OpenAiReasoningEffort {
         Self::Max,
     ];
 
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::None => "none",
             Self::Minimal => "minimal",
@@ -38,6 +39,7 @@ impl OpenAiReasoningEffort {
             Self::High => "high",
             Self::XHigh => "xhigh",
             Self::Max => "max",
+            Self::Custom(value) => value,
         }
     }
 }
@@ -52,20 +54,34 @@ impl FromStr for OpenAiReasoningEffort {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL
+        if value.trim().is_empty() {
+            return Err("reasoning effort must be a non-empty string".to_owned());
+        }
+        Ok(Self::ALL
             .into_iter()
             .find(|effort| effort.as_str() == value)
-            .ok_or_else(|| {
-                "expected reasoning effort none, minimal, low, medium, high, xhigh, or max"
-                    .to_owned()
-            })
+            .unwrap_or_else(|| Self::Custom(value.to_owned())))
+    }
+}
+
+impl TryFrom<String> for OpenAiReasoningEffort {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<OpenAiReasoningEffort> for String {
+    fn from(value: OpenAiReasoningEffort) -> Self {
+        value.to_string()
     }
 }
 
 /// Select one wire control, preventing contradictory standard/extension fields.
 /// Absence of this enum means the service's default; `Effort(None)` is an
 /// explicit request to disable reasoning and must not be omitted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum OpenAiReasoningControl {
     Effort(OpenAiReasoningEffort),

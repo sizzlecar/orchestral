@@ -137,8 +137,13 @@ impl OpenAiCompatibleBackend {
         if let Value::Object(sampling) = sampling {
             body.extend(sampling);
         }
-        match self.reasoning {
+        match &self.reasoning {
             Some(OpenAiReasoningControl::Effort(effort)) => {
+                if effort.as_str().trim().is_empty() {
+                    return Err(ModelError::invalid_request(
+                        "reasoning effort must be non-empty",
+                    ));
+                }
                 body.insert("reasoning_effort".to_owned(), json!(effort));
             }
             Some(OpenAiReasoningControl::Thinking(enabled)) => {
@@ -268,7 +273,7 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
         let config = config.expect("OpenAI token meter scalar configuration is serializable");
         // Preserve existing recovery identities when no control was selected.
         // Explicit controls affect both wire size and the model's continuation.
-        let config = match self.reasoning {
+        let config = match &self.reasoning {
             Some(control) => serde_json::to_vec(&("reasoning-control/v1", config, control))
                 .expect("typed reasoning control is serializable"),
             None => config,
@@ -331,7 +336,7 @@ impl ModelBackend for OpenAiCompatibleBackend {
                 Value::String(encoding_identity.to_owned()),
             );
         }
-        if let Some(control) = self.reasoning {
+        if let Some(control) = &self.reasoning {
             extensions.insert(
                 "openai-compatible/reasoning-control".to_owned(),
                 json!(control),

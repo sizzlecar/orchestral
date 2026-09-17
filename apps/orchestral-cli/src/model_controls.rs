@@ -49,6 +49,9 @@ pub(crate) fn openai_reasoning(
         Preference::High => OpenAiReasoningControl::Effort(Effort::High),
         Preference::XHigh => OpenAiReasoningControl::Effort(Effort::XHigh),
         Preference::Max => OpenAiReasoningControl::Effort(Effort::Max),
+        Preference::Custom(value) => {
+            OpenAiReasoningControl::Effort(value.parse().map_err(anyhow::Error::msg)?)
+        }
         Preference::Default => unreachable!(),
     }))
 }
@@ -75,6 +78,7 @@ pub(crate) fn discovered_model(model: orchestral_model_openai::DiscoveredModel) 
                     Effort::High => Preference::High,
                     Effort::XHigh => Preference::XHigh,
                     Effort::Max => Preference::Max,
+                    Effort::Custom(value) => Preference::Custom(value),
                 }));
             }
             if caps.thinking.is_some() {

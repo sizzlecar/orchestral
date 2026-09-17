@@ -23,24 +23,30 @@ fn backend(format: OpenAiToolResultFormat) -> OpenAiCompatibleBackend {
 
 #[test]
 fn reasoning_effort_vocabulary_is_typed_and_none_is_an_explicit_value() {
-    for effort in OpenAiReasoningEffort::ALL {
+    for effort in OpenAiReasoningEffort::ALL.into_iter().chain(
+        [
+            "ultra",
+            "future-next",
+            "HIGH",
+            "default",
+            "on",
+            "off",
+            "effort:future",
+        ]
+        .into_iter()
+        .map(|name| name.parse().unwrap()),
+    ) {
         assert_eq!(
             effort.as_str().parse::<OpenAiReasoningEffort>().unwrap(),
             effort
         );
-        assert_eq!(serde_json::to_value(effort).unwrap(), effort.as_str());
+        assert_eq!(serde_json::to_value(&effort).unwrap(), effort.as_str());
         assert_eq!(
             serde_json::from_value::<OpenAiReasoningEffort>(json!(effort.as_str())).unwrap(),
             effort
         );
     }
-    for invalid in [
-        json!("default"),
-        json!("on"),
-        json!("HIGH"),
-        json!(false),
-        json!(0),
-    ] {
+    for invalid in [json!(""), json!(" "), json!(false), json!(0)] {
         assert!(serde_json::from_value::<OpenAiReasoningEffort>(invalid).is_err());
     }
     assert_eq!(
@@ -53,17 +59,33 @@ fn reasoning_effort_vocabulary_is_typed_and_none_is_an_explicit_value() {
     );
 }
 
-#[test]
-fn explicit_reasoning_changes_only_its_wire_control_and_recovery_identity() {
-    let request = crate::tests::request();
-    let controls = OpenAiReasoningEffort::ALL
+fn controls() -> impl Iterator<Item = OpenAiReasoningControl> {
+    OpenAiReasoningEffort::ALL
         .into_iter()
+        .chain(
+            [
+                "ultra",
+                "future-next",
+                "HIGH",
+                "default",
+                "on",
+                "off",
+                "effort:future",
+            ]
+            .into_iter()
+            .map(|name| name.parse().unwrap()),
+        )
         .map(OpenAiReasoningControl::Effort)
         .chain([
             OpenAiReasoningControl::Thinking(false),
             OpenAiReasoningControl::Thinking(true),
-        ]);
-    for control in controls {
+        ])
+}
+
+#[test]
+fn explicit_reasoning_changes_only_its_wire_control_and_recovery_identity() {
+    let request = crate::tests::request();
+    for control in controls() {
         for format in [
             OpenAiToolResultFormat::Text,
             OpenAiToolResultFormat::Json,
@@ -77,9 +99,9 @@ fn explicit_reasoning_changes_only_its_wire_control_and_recovery_identity() {
             assert!(default_body.get("reasoning_effort").is_none());
             assert!(default_body.get("chat_template_kwargs").is_none());
 
-            let configured = original.with_reasoning_control(Some(control));
+            let configured = original.with_reasoning_control(Some(control.clone()));
             let mut body = configured.build_request_body(&request).unwrap();
-            match control {
+            match &control {
                 OpenAiReasoningControl::Effort(effort) => {
                     assert_eq!(
                         body.as_object_mut().unwrap().remove("reasoning_effort"),
@@ -125,18 +147,21 @@ fn explicit_reasoning_changes_only_its_wire_control_and_recovery_identity() {
 #[test]
 fn distinct_explicit_controls_cannot_share_the_same_meter_identity() {
     let mut digests = std::collections::BTreeSet::new();
-    for control in OpenAiReasoningEffort::ALL
-        .into_iter()
-        .map(OpenAiReasoningControl::Effort)
-        .chain([
-            OpenAiReasoningControl::Thinking(false),
-            OpenAiReasoningControl::Thinking(true),
-        ])
-    {
+    for control in controls() {
         let digest = backend(OpenAiToolResultFormat::Yaml)
             .with_reasoning_control(Some(control))
             .meter_descriptor()
             .config_digest;
         assert!(digests.insert(serde_json::to_string(&digest).unwrap()));
     }
+}
+
+#[test]
+fn empty_programmatic_effort_is_rejected_before_sending_a_request() {
+    let backend = backend(OpenAiToolResultFormat::Json).with_reasoning_control(Some(
+        OpenAiReasoningControl::Effort(OpenAiReasoningEffort::Custom(" ".into())),
+    ));
+    assert!(backend
+        .build_request_body(&crate::tests::request())
+        .is_err());
 }

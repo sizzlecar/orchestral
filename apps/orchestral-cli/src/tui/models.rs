@@ -131,18 +131,31 @@ pub(super) async fn reasoning(metadata: &HostMetadata, current: &str) -> Result<
 }
 
 fn reasoning_choices(model: &DiscoveredModel) -> Vec<ReasoningPreference> {
-    use ReasoningPreference as R;
-    model.reasoning.clone().unwrap_or_else(|| {
-        vec![
-            R::Default,
-            R::None,
-            R::Minimal,
-            R::Low,
-            R::Medium,
-            R::High,
-            R::XHigh,
-            R::Max,
-        ]
+    model
+        .reasoning
+        .clone()
+        .unwrap_or_else(|| vec![ReasoningPreference::Default])
+}
+
+pub(super) fn reasoning_argument(command: &str) -> Option<&str> {
+    let rest = command.strip_prefix("/reasoning")?;
+    rest.starts_with(char::is_whitespace).then(|| rest.trim())
+}
+
+pub(super) fn explicit_reasoning(
+    metadata: &HostMetadata,
+    current: &str,
+    value: &str,
+) -> Result<Selection> {
+    let value = value
+        .parse::<ReasoningPreference>()
+        .map_err(anyhow::Error::msg)?;
+    // Validate protocol support without requiring optional model discovery.
+    crate::model_controls::openai_reasoning(&metadata.model_backend, value.clone())?;
+    Ok(Selection::Reasoning {
+        backend: metadata.model_backend.name.clone(),
+        model: current.to_owned(),
+        value,
     })
 }
 
@@ -154,7 +167,7 @@ fn reasoning_menu(metadata: &HostMetadata, model: &DiscoveredModel) -> Menu {
         reasoning_choices(model)
             .into_iter()
             .map(|value| {
-                let description = match value {
+                let description = match &value {
                     ReasoningPreference::Default
                         if model.thinking_default_enabled == Some(true) =>
                     {
@@ -166,7 +179,7 @@ fn reasoning_menu(metadata: &HostMetadata, model: &DiscoveredModel) -> Menu {
                         "Use service default (thinking off); omit controls"
                     }
                     ReasoningPreference::Default if !declared => {
-                        "Capabilities not declared; omit controls by default"
+                        "Capabilities not declared; use /reasoning <value> or --reasoning for the service to validate an explicit request"
                     }
                     ReasoningPreference::Default => "Use service default; omit reasoning controls",
                     ReasoningPreference::On => {
@@ -179,7 +192,7 @@ fn reasoning_menu(metadata: &HostMetadata, model: &DiscoveredModel) -> Menu {
                     }
                 };
                 choice(
-                    value.as_str(),
+                    &value.to_string(),
                     Selection::Reasoning {
                         backend: metadata.model_backend.name.clone(),
                         model: model.id.clone(),

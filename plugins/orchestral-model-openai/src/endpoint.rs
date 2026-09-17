@@ -244,7 +244,9 @@ mod tests {
             json!({"thinking": {}}),
             json!({"thinking": {"default_enabled": "secret"}}),
             json!({"supported_efforts": "secret"}),
-            json!({"supported_efforts": ["secret"]}),
+            json!({"supported_efforts": [""]}),
+            json!({"supported_efforts": [" "]}),
+            json!({"supported_efforts": [false]}),
         ] {
             let error =
                 parse_model_metadata(&json!({"data": [{"id": "model", "reasoning": reasoning}]}))
@@ -257,6 +259,42 @@ mod tests {
             json!({"id": "same", "reasoning": {"supported_efforts": ["high"]}}),
         ]}))
         .is_err());
+    }
+
+    #[test]
+    fn discovered_efforts_preserve_future_names_case_and_reserved_local_words() {
+        let names = [
+            "ultra",
+            "future-next",
+            "HIGH",
+            "on",
+            "off",
+            "default",
+            "effort:high",
+        ];
+        let models = parse_model_metadata(&json!({"data": [{"id": "future", "max_model_len": 8192,
+            "reasoning": {"supported_efforts": names}}]}))
+        .unwrap();
+        assert_eq!(models[0].max_context_tokens, Some(8192));
+        let efforts = models[0]
+            .reasoning
+            .as_ref()
+            .unwrap()
+            .supported_efforts
+            .as_ref()
+            .unwrap();
+        let actual = efforts
+            .iter()
+            .map(OpenAiReasoningEffort::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, names.into_iter().collect());
+        assert_eq!(
+            serde_json::to_value(efforts).unwrap(),
+            json!(efforts
+                .iter()
+                .map(OpenAiReasoningEffort::as_str)
+                .collect::<Vec<_>>())
+        );
     }
 
     #[test]

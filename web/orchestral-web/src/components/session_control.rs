@@ -217,6 +217,9 @@ fn AgentSessionCreateCard(
                                             let name = field.name.clone();
                                             move |event| { values.write().insert(name.clone(), event.value()); }
                                         },
+                                        if !field.required {
+                                            option { value: "", "使用默认值" }
+                                        }
                                         for option_value in field.options.clone() {
                                             option { value: "{option_value}", "{option_value}" }
                                         }
@@ -381,6 +384,9 @@ fn ActionCard(
                                                 values.write().insert(name.clone(), event.value());
                                             }
                                         },
+                                        if !field.required {
+                                            option { value: "", "使用默认值" }
+                                        }
                                         for option_value in field.options.clone() {
                                             option { value: "{option_value}", "{option_value}" }
                                         }
@@ -590,6 +596,62 @@ mod tests {
                 .map(String::as_str),
             Some("workspace-write")
         );
+    }
+
+    #[test]
+    fn clearing_optional_enum_fields_omits_them_without_changing_permissions() {
+        let form = action_form(&Some(serde_json::json!({
+            "type": "object",
+            "required": ["sandbox_mode", "approval_policy"],
+            "properties": {
+                "model": {
+                    "type": "string", "enum": ["native-model", "future-model"],
+                    "default": "native-model"
+                },
+                "reasoning_effort": {
+                    "type": "string", "enum": ["ultra", "future-Deep"]
+                },
+                "sandbox_mode": {
+                    "type": "string", "enum": ["read-only", "workspace-write"],
+                    "default": "workspace-write"
+                },
+                "approval_policy": {
+                    "type": "string", "enum": ["on-request", "never"],
+                    "default": "on-request"
+                }
+            }
+        })));
+        let mut values = initial_action_values(&form);
+        assert_eq!(
+            action_arguments(&form, &values, "").unwrap(),
+            serde_json::json!({
+                "model": "native-model", "sandbox_mode": "workspace-write",
+                "approval_policy": "on-request"
+            })
+        );
+        values.insert("model".into(), "future-model".into());
+        values.insert("reasoning_effort".into(), "future-Deep".into());
+        assert_eq!(
+            action_arguments(&form, &values, "").unwrap()["reasoning_effort"],
+            "future-Deep"
+        );
+
+        for field in ["model", "reasoning_effort"] {
+            values.insert(field.into(), String::new());
+        }
+        assert_eq!(
+            action_arguments(&form, &values, "").unwrap(),
+            serde_json::json!({
+                "sandbox_mode": "workspace-write", "approval_policy": "on-request"
+            })
+        );
+        for field in ["sandbox_mode", "approval_policy"] {
+            let mut missing_permission = values.clone();
+            missing_permission.remove(field);
+            assert!(action_arguments(&form, &missing_permission, "").is_err());
+            missing_permission.insert(field.into(), String::new());
+            assert!(action_arguments(&form, &missing_permission, "").is_err());
+        }
     }
 
     #[test]
