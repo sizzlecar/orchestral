@@ -4,6 +4,51 @@ use anyhow::{bail, Context};
 use orchestral_core::config::BackendSpec;
 use orchestral_model_openai::{discover_model_metadata, DiscoveredModel, OpenAiEndpoint};
 
+pub(crate) fn supports_discovery(backend: &BackendSpec) -> bool {
+    matches!(
+        backend.kind.trim().to_ascii_lowercase().as_str(),
+        "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral"
+    )
+}
+
+pub(crate) fn endpoint(backend: &BackendSpec) -> anyhow::Result<OpenAiEndpoint> {
+    let endpoint = backend
+        .endpoint
+        .as_deref()
+        .or_else(|| match backend.kind.trim().to_ascii_lowercase().as_str() {
+            "openai" => Some("https://api.openai.com/v1"),
+            "deepseek" => Some("https://api.deepseek.com"),
+            _ => None,
+        })
+        .with_context(|| {
+            format!(
+                "OpenAI-compatible backend '{}' requires an endpoint",
+                backend.name
+            )
+        })?;
+    OpenAiEndpoint::parse(endpoint).map_err(anyhow::Error::msg)
+}
+
+pub(crate) async fn discover_backend_models(
+    backend: &BackendSpec,
+) -> anyhow::Result<Vec<crate::model_controls::DiscoveredModel>> {
+    if !supports_discovery(backend) {
+        bail!(
+            "backend protocol '{}' does not expose OpenAI-compatible model discovery",
+            backend.kind
+        );
+    }
+    orchestral_model_openai::discover_model_metadata(&endpoint(backend)?, &api_key(backend)?)
+        .await
+        .map_err(anyhow::Error::msg)
+        .map(|models| {
+            models
+                .into_iter()
+                .map(crate::model_controls::discovered_model)
+                .collect()
+        })
+}
+
 pub(crate) fn api_key(backend: &BackendSpec) -> anyhow::Result<String> {
     match backend
         .get_config::<String>("auth")
@@ -36,10 +81,7 @@ pub(crate) async fn resolve_model(
     mut backend: BackendSpec,
     configured_model: Option<String>,
 ) -> anyhow::Result<(BackendSpec, String)> {
-    if !matches!(
-        backend.kind.trim().to_ascii_lowercase().as_str(),
-        "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral"
-    ) {
+    if !supports_discovery(&backend) {
         return Ok((
             backend,
             configured_model
@@ -90,6 +132,7 @@ pub(crate) async fn resolve_model(
             .unwrap_or(DiscoveredModel {
                 id,
                 max_context_tokens: None,
+                reasoning: None,
             }),
         None => select_single_model(&models)?,
     };

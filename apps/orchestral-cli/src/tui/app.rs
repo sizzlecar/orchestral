@@ -200,7 +200,7 @@ pub(crate) async fn run_tui(
                     Err(error) => state.ui_notice = Some(error),
                     Ok(super::services::Response::Menu(menu)) => { update(&mut state, UiMsg::OpenMenu(menu)); }
                     Ok(super::services::Response::Notice(message)) => state.ui_notice = Some(message),
-                    Ok(super::services::Response::Model { host: next, options: next_options }) => {
+                    Ok(super::services::Response::Model { host: next, options: next_options, notice }) => {
                         let old = std::mem::replace(host, next);
                         service_tasks.cleanup.push(tokio::spawn(async move { old.shutdown().await; }));
                         options = next_options;
@@ -212,7 +212,7 @@ pub(crate) async fn run_tui(
                         state.model = host.model.clone();
                         state.context_budget = host.metadata.context_budget;
                         state.context_input_tokens = None;
-                        state.ui_notice = Some("Model selected for the next request".to_owned());
+                        state.ui_notice = Some(notice);
                     }
                     Ok(super::services::Response::Session { host: next_host, options: next_options, client: next, history, run }) => {
                         if !Arc::ptr_eq(host, &next_host) {

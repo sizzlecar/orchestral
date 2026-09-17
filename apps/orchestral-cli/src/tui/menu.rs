@@ -137,7 +137,12 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "/model",
         "Change model",
-        "Select a configured model for the next request",
+        "Refresh models from the current service; /model profiles selects configured profiles",
+    ),
+    (
+        "/reasoning",
+        "Change reasoning",
+        "Inspect the current model's reasoning controls for the next request",
     ),
     (
         "/copy",
@@ -171,10 +176,10 @@ pub(crate) fn commands(state: &super::state::UiState) -> Vec<Choice> {
         .iter()
         .map(|(name, label, description)| {
             let unavailable = match *name {
-                "/model" | "/new" | "/resume" if state.host_busy => {
+                "/model" | "/reasoning" | "/new" | "/resume" if state.host_busy => {
                     Some("session operation running")
                 }
-                "/model" | "/new"
+                "/model" | "/reasoning" | "/new"
                     if matches!(
                         state.phase,
                         super::state::UiPhase::Running

@@ -2,9 +2,11 @@
 
 mod loader;
 mod providers;
+mod reasoning;
 
 pub use loader::{load_config, load_providers_config, ConfigError};
 pub use providers::{ApiKeyError, BackendSpec, ModelPolicy, ModelProfile, ProvidersConfig};
+pub use reasoning::ReasoningPreference;
 
 use std::collections::HashMap;
 
@@ -104,6 +106,9 @@ pub struct AgentConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Override the selected profile's reasoning preference. `default` omits controls.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningPreference>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default = "default_stream_buffer")]
@@ -139,6 +144,7 @@ impl Default for AgentConfig {
             model_profile: None,
             model: None,
             temperature: None,
+            reasoning: None,
             system_prompt: None,
             stream_buffer: default_stream_buffer(),
             max_model_steps: None,

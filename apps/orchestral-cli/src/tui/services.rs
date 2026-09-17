@@ -89,8 +89,10 @@ impl Tasks {
                 | UiPhase::WaitingApproval
                 | UiPhase::Cancelling
         );
-        if (matches!(name.as_str(), "/model" | "/new")
-            || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _))))
+        if (matches!(
+            name.as_str(),
+            "/model" | "/model profiles" | "/reasoning" | "/new"
+        ) || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _))))
             && active
         {
             state.ui_notice = Some(
@@ -244,6 +246,7 @@ pub(crate) enum Response {
     Model {
         host: Arc<AgentHost>,
         options: AgentRunOptions,
+        notice: String,
     },
     Session {
         host: Arc<AgentHost>,
@@ -304,34 +307,16 @@ pub(crate) async fn command(
     current_run: Option<String>,
 ) -> Result<Response> {
     match name.as_str() {
-        "/model" => {
-            let choices = host
-                .metadata
-                .models
-                .iter()
-                .map(|model| {
-                    Choice::new(
-                        &model.name,
-                        &model.name,
-                        format!(
-                            "{} / {}{}",
-                            model.backend,
-                            model.model,
-                            if host.backend_name == model.backend && host.model == model.model {
-                                " · current"
-                            } else {
-                                ""
-                            }
-                        ),
-                    )
-                })
-                .collect();
-            Ok(Response::Menu(Menu::new(
-                MenuKind::Models,
-                "Models · configured profiles",
-                choices,
-            )))
-        }
+        "/model" => Ok(Response::Menu(
+            super::models::discover(&host.metadata, &host.model).await?,
+        )),
+        "/model profiles" => Ok(Response::Menu(super::models::profiles(
+            &host.metadata,
+            &host.model,
+        ))),
+        "/reasoning" => Ok(Response::Menu(
+            super::models::reasoning(&host.metadata, &host.model).await?,
+        )),
         "/resume" => {
             let sessions = host
                 .session_history
@@ -419,19 +404,34 @@ pub(crate) async fn choose(
 ) -> Result<Response> {
     match kind {
         MenuKind::Models => {
-            let profile = host
-                .metadata
-                .models
-                .iter()
-                .find(|model| model.name == value)
-                .context("Model profile is no longer available")?;
-            options.model_overrides.backend = Some(profile.backend.clone());
-            options.model_overrides.model = Some(profile.model.clone());
-            options.model_overrides.model_profile = Some(profile.name.clone());
+            let selection: super::models::Selection =
+                serde_json::from_str(&value).context("Invalid model selection; refresh /model")?;
+            if matches!(selection, super::models::Selection::Profiles) {
+                return Ok(Response::Menu(super::models::profiles(
+                    &host.metadata,
+                    &host.model,
+                )));
+            }
+            let reasoning = matches!(selection, super::models::Selection::Reasoning { .. });
+            super::models::apply_selection(
+                &host.metadata,
+                &host.model,
+                &mut options.model_overrides,
+                selection,
+            )?;
             let next = host.reconfigure(&options).await?;
+            let notice = if reasoning {
+                format!(
+                    "Reasoning {} selected for the next request",
+                    next.metadata.reasoning
+                )
+            } else {
+                "Model selected for the next request".to_owned()
+            };
             Ok(Response::Model {
                 host: Arc::new(next),
                 options,
+                notice,
             })
         }
         MenuKind::Sessions => {

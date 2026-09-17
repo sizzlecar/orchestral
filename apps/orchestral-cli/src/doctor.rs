@@ -65,22 +65,28 @@ impl DoctorCommand {
         let mut problems = Vec::new();
         // Construct the same adapter as startup. This parses provider/profile
         // options and validates capabilities without sending a model request.
-        if let Err(error) = crate::agent::build_model_backend(
-            &backend,
-            config
-                .agent
-                .model
-                .as_deref()
-                .or_else(|| profile.as_ref().map(|profile| profile.model.as_str()))
-                .unwrap_or("auto"),
-            profile
-                .as_ref()
-                .and_then(|profile| profile.temperature)
-                .unwrap_or(0.7),
-            profile.as_ref(),
-            config.agent.stream_buffer,
-            options.credential_file.as_deref(),
-        ) {
+        if let Err(error) =
+            crate::model_controls::resolve_reasoning(config.agent.reasoning, profile.as_ref())
+                .and_then(|reasoning| {
+                    crate::agent::build_model_backend(
+                        &backend,
+                        config
+                            .agent
+                            .model
+                            .as_deref()
+                            .or_else(|| profile.as_ref().map(|profile| profile.model.as_str()))
+                            .unwrap_or("auto"),
+                        profile
+                            .as_ref()
+                            .and_then(|profile| profile.temperature)
+                            .unwrap_or(0.7),
+                        profile.as_ref(),
+                        config.agent.stream_buffer,
+                        options.credential_file.as_deref(),
+                        reasoning,
+                    )
+                })
+        {
             problems.push(format!("{error:#}"));
         }
         if authentication == "missing" {
