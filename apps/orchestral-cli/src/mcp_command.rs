@@ -50,6 +50,11 @@ struct AddArgs {
     /// Stable name used to expose this server's tools.
     name: String,
 
+    /// Replace the entire registration if the name already exists.
+    /// Omitted settings reset to defaults; existing environment and permissions are not merged.
+    #[arg(long)]
+    replace: bool,
+
     /// Environment variable passed only to this MCP process (KEY=VALUE).
     #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env_pair)]
     env: Vec<(String, String)>,
@@ -146,6 +151,13 @@ fn get(path: &Path, args: GetArgs) -> anyhow::Result<()> {
 
 fn add(path: &Path, args: AddArgs) -> anyhow::Result<()> {
     validate_name(&args.name)?;
+    let mut registry = load_registry(path)?;
+    if registry.servers.contains_key(&args.name) && !args.replace {
+        bail!(
+            "MCP server '{}' is already registered; use --replace to replace the entire registration (omitted settings reset to defaults)",
+            args.name
+        );
+    }
     let mut command = args.command.into_iter();
     let program = command.next().context("MCP command is required")?;
     let program = normalize_program(&program)?;
@@ -181,7 +193,6 @@ fn add(path: &Path, args: AddArgs) -> anyhow::Result<()> {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
     };
-    let mut registry = load_registry(path)?;
     let replaced = registry.servers.insert(args.name.clone(), server).is_some();
     save_registry(path, &registry)?;
     println!(

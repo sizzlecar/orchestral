@@ -2137,6 +2137,125 @@ fn mcp_user_registry_add_list_get_remove_round_trip() {
 }
 
 #[test]
+fn mcp_user_registry_duplicate_requires_explicit_replace() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("mcp-registry-replace");
+    let orchestral_home = workspace.path("user-config");
+    let registry_path = orchestral_home.join("mcp.json");
+    let mcp_add = |name: &str| {
+        let mut command = root_command(&workspace);
+        command
+            .env("ORCHESTRAL_HOME", &orchestral_home)
+            .env("MCP_REGISTRY_HOST_ONLY", "not-an-mcp-setting")
+            .args(["mcp", "add", name]);
+        command
+    };
+
+    let mut add = mcp_add("fixture");
+    add.args(["--env", "OLD_SETTING=old", "--cwd"])
+        .arg(&workspace.root)
+        .arg("--read")
+        .arg(&workspace.root)
+        .arg("--write")
+        .arg(&workspace.root)
+        .args([
+            "--network",
+            "restricted.example:443",
+            "--no-child-processes",
+            "--required",
+            "--",
+            "original-mcp",
+            "--old-mode",
+        ]);
+    let added = run_to_completion(add, LOCAL_PROCESS_TIMEOUT);
+    assert!(added.status.success(), "{}", added.stderr_text());
+
+    let mut add_other = mcp_add("untouched");
+    add_other.args(["--no-network", "--", "other-mcp"]);
+    let other_added = run_to_completion(add_other, LOCAL_PROCESS_TIMEOUT);
+    assert!(
+        other_added.status.success(),
+        "{}",
+        other_added.stderr_text()
+    );
+
+    let mut before: Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("read MCP registry")).unwrap();
+    let original = &mut before["mcpServers"]["fixture"];
+    assert_eq!(original["env"], json!({"OLD_SETTING": "old"}));
+    assert_eq!(original["allowUnrestrictedNetwork"], false);
+    assert_eq!(original["allowChildProcesses"], false);
+    assert_eq!(original["allowHostUi"], false);
+    // These settings can be edited in the registry, but have no `mcp add` flags.
+    original["disabled"] = json!(true);
+    original["startupTimeoutMs"] = json!(1234);
+    original["toolTimeoutMs"] = json!(5678);
+    original["enabledTools"] = json!(["old-tool"]);
+    original["disabledTools"] = json!(["blocked-tool"]);
+    let before_bytes = serde_json::to_vec_pretty(&before).unwrap();
+    fs::write(&registry_path, &before_bytes).expect("write custom MCP settings");
+
+    let mut duplicate = mcp_add("fixture");
+    duplicate.args([
+        "--env",
+        "NEW_SETTING=new",
+        "--",
+        "replacement-mcp",
+        "--new-mode",
+    ]);
+    let rejected = run_to_completion(duplicate, LOCAL_PROCESS_TIMEOUT);
+    assert!(!rejected.status.success(), "{}", rejected.stdout_text());
+    assert!(rejected.stderr_text().contains("already registered"));
+    assert!(rejected.stderr_text().contains("--replace"));
+    assert_eq!(
+        fs::read(&registry_path).expect("read rejected duplicate registry"),
+        before_bytes,
+        "rejected duplicate must not rewrite any registry bytes"
+    );
+
+    let mut replace = mcp_add("fixture");
+    replace.args([
+        "--replace",
+        "--env",
+        "NEW_SETTING=new",
+        "--",
+        "replacement-mcp",
+        "--new-mode",
+    ]);
+    let replaced = run_to_completion(replace, LOCAL_PROCESS_TIMEOUT);
+    assert!(replaced.status.success(), "{}", replaced.stderr_text());
+    let after: Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("read replaced registry")).unwrap();
+    assert_eq!(after["mcpServers"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        after["mcpServers"]["untouched"], before["mcpServers"]["untouched"],
+        "replacing one server must preserve other registrations"
+    );
+    assert_eq!(
+        after["mcpServers"]["fixture"],
+        json!({
+            "type": "stdio",
+            "command": "replacement-mcp",
+            "args": ["--new-mode"],
+            "env": {"NEW_SETTING": "new"},
+            "allowChildProcesses": true,
+            "allowHostUi": true,
+            "readableRoots": [],
+            "writableRoots": [],
+            "networkTargets": [],
+            "allowUnrestrictedNetwork": true,
+            "disabled": false,
+            "required": false,
+            "startupTimeoutMs": null,
+            "toolTimeoutMs": null,
+            "enabledTools": [],
+            "disabledTools": []
+        }),
+        "explicit replacement uses only its new arguments and defaults"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn user_registered_stdio_mcp_is_automatically_loaded_and_called() {
     let _guard = local_e2e_guard();

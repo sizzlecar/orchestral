@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `mcp add` rejects an existing server name without changing its registration.
+  Use `--replace` to replace the entire entry; omitted settings reset to defaults
+  instead of retaining the previous environment or permissions.
+
 ## [0.4.0]
 
 ### Model selection and reasoning controls
