@@ -1768,6 +1768,13 @@ fn approval_mode(value: &Value) -> Option<AgentApprovalMode> {
 }
 
 fn connector_transport_error(error: CodexTransportError) -> AgentConnectorError {
+    if error.is_file_descriptor_exhaustion() {
+        return AgentConnectorError::new(
+            AgentConnectorErrorCode::Unavailable,
+            error.to_string(),
+            true,
+        );
+    }
     let (code, retryable) = match error {
         CodexTransportError::Spawn(_) | CodexTransportError::DaemonStart(_) => {
             (AgentConnectorErrorCode::Unavailable, false)
@@ -2078,6 +2085,20 @@ mod tests {
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
+
+    #[test]
+    fn native_file_descriptor_exhaustion_is_temporarily_unavailable() {
+        let error = connector_transport_error(CodexTransportError::Rpc(
+            "thread-store internal error: Too many open files (os error 24)".to_owned(),
+        ));
+        assert_eq!(error.code, AgentConnectorErrorCode::Unavailable);
+        assert!(error.retryable);
+        let error = connector_transport_error(CodexTransportError::Rpc(
+            "thread-store internal error: Permission denied (os error 13)".to_owned(),
+        ));
+        assert_eq!(error.code, AgentConnectorErrorCode::Protocol);
+        assert!(!error.retryable);
+    }
 
     #[test]
     fn native_catalog_preserves_new_efforts_and_explicit_defaults() {

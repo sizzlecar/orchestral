@@ -4106,13 +4106,14 @@ fn start_transport_error(error: CodexTransportError, outcome_unknown: bool) -> A
 }
 
 fn transport_to_protocol(error: CodexTransportError) -> AgentProtocolError {
-    let retryable = matches!(
-        error,
-        CodexTransportError::Io(_)
-            | CodexTransportError::Closed
-            | CodexTransportError::Disconnected(_)
-            | CodexTransportError::Timeout
-    );
+    let retryable = error.is_file_descriptor_exhaustion()
+        || matches!(
+            error,
+            CodexTransportError::Io(_)
+                | CodexTransportError::Closed
+                | CodexTransportError::Disconnected(_)
+                | CodexTransportError::Timeout
+        );
     protocol_error(error.to_string(), retryable)
 }
 
@@ -4154,6 +4155,32 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn native_file_descriptor_exhaustion_keeps_same_run_recovery_retryable() {
+        for native in [
+            "failed to read thread: Too many open files (os error 24)",
+            "failed to open rollout: Too many open files in system (os error 23)",
+        ] {
+            let error = transport_to_protocol(CodexTransportError::Rpc(native.to_owned()));
+            assert_eq!(error.code, AgentProtocolErrorCode::ProviderUnavailable);
+            assert!(error.retryable);
+            // A potentially dispatched start still requires reconciliation;
+            // retryability must never turn it into a safe new submission.
+            assert!(matches!(
+                start_transport_error(CodexTransportError::Rpc(native.to_owned()), true),
+                AgentStartError::OutcomeUnknown(error) if error.retryable
+            ));
+        }
+        for native in [
+            "invalid thread id",
+            "thread already has an active writer",
+            "Too many open files in user input",
+            "Permission denied (os error 13)",
+        ] {
+            assert!(!transport_to_protocol(CodexTransportError::Rpc(native.to_owned())).retryable);
+        }
+    }
 
     #[test]
     fn run_notification_requires_an_explicit_matching_thread() {

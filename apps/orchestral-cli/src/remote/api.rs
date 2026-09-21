@@ -2121,7 +2121,7 @@ async fn inspect_run(
 async fn recover_run(
     State(state): State<RemoteApiState>,
     Path(run_id): Path<String>,
-    Query(query): Query<RunTargetQuery>,
+    Query(query): Query<RunRecoveryQuery>,
 ) -> Result<Json<RemoteRunView>, ApiError> {
     let connector_id = query.connector_id.as_deref().map(AgentConnectorId::new);
     let (agent, run_id) = require_run(
@@ -2135,19 +2135,54 @@ async fn recover_run(
         == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
     {
         let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
-        if state.run_supervisors.manual_reason(&key).is_some() {
+        if state.run_supervisors.manual_reason(&key).is_some() && !query.retry_manual {
             current
         } else {
+            // Explicit recovery revisits this same Execution through the
+            // controller's recovery gate. It never releases the Session or
+            // submits the original input as a second Run.
             match agent.recover(&run_id).await {
                 Ok(view) => {
                     state.run_supervisors.clear_manual(&key);
+                    spawn_run_supervisor(
+                        state.clone(),
+                        agent.clone(),
+                        connector_id.clone(),
+                        run_id.clone(),
+                    );
                     view
                 }
-                Err(error) if !is_retryable_agent_error(&error) => {
-                    state.run_supervisors.mark_manual(key, error.to_string());
-                    current
+                Err(error) => {
+                    // Another explicit request or the supervisor may have
+                    // recovered while this caller waited for the Run gate.
+                    // Re-read before interpreting InvalidTransition as a new
+                    // permanent failure or returning a stale Unknown view.
+                    let latest = agent.inspect(&run_id).await?;
+                    if latest.state.status()
+                        != orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
+                    {
+                        state.run_supervisors.clear_manual(&key);
+                        spawn_run_supervisor(
+                            state.clone(),
+                            agent.clone(),
+                            connector_id.clone(),
+                            run_id.clone(),
+                        );
+                        latest
+                    } else if !is_retryable_agent_error(&error) {
+                        state.run_supervisors.mark_manual(key, error.to_string());
+                        latest
+                    } else {
+                        state.run_supervisors.clear_manual(&key);
+                        spawn_run_supervisor(
+                            state.clone(),
+                            agent.clone(),
+                            connector_id.clone(),
+                            run_id.clone(),
+                        );
+                        return Err(error.into());
+                    }
                 }
-                Err(error) => return Err(error.into()),
             }
         }
     } else {
@@ -2162,6 +2197,16 @@ async fn recover_run(
         view,
         agent.initial_input(&run_id).await?,
     )))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RunRecoveryQuery {
+    #[serde(default)]
+    connector_id: Option<String>,
+    /// Only an explicit user recovery action may cross a manual stop.
+    #[serde(default)]
+    retry_manual: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3168,7 +3213,7 @@ mod tests {
     use super::*;
     use orchestral_core::agent_connector::AgentSessionExecutionProfile;
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -3381,6 +3426,14 @@ mod tests {
 
     struct UnrecoverableDisconnectProvider {
         inner: Arc<dyn AgentProvider>,
+        probe: Arc<RecoveryProbe>,
+    }
+
+    #[derive(Default)]
+    struct RecoveryProbe {
+        starts: AtomicUsize,
+        recoveries: AtomicUsize,
+        available: AtomicBool,
     }
 
     #[test]
@@ -3607,6 +3660,7 @@ mod tests {
             &self,
             request: orchestral_core::agent_protocol::wire::AgentStartRequest,
         ) -> Result<AgentStart, AgentStartError> {
+            self.probe.starts.fetch_add(1, Ordering::SeqCst);
             let started = self.inner.start(request).await?;
             Ok(AgentStart {
                 execution: started.execution,
@@ -3625,8 +3679,20 @@ mod tests {
 
         async fn recover(
             &self,
-            _request: AgentRecoveryRequest,
+            request: AgentRecoveryRequest,
         ) -> Result<AgentRecovery, AgentProtocolError> {
+            self.probe.recoveries.fetch_add(1, Ordering::SeqCst);
+            if self.probe.available.load(Ordering::SeqCst) {
+                let replay = stream::iter(
+                    request
+                        .committed_provider_prefix
+                        .into_iter()
+                        .map(|event| Ok(AgentProviderStreamItem::Event(Box::new(event)))),
+                )
+                .chain(stream::pending())
+                .boxed();
+                return Ok(AgentRecovery::reattached(replay));
+            }
             Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::ProviderUnavailable,
                 "fixture recovery remains unavailable",
@@ -4252,10 +4318,17 @@ mod tests {
     }
 
     async fn unrecoverable_app() -> (Router, String) {
+        let (app, token, _) = unrecoverable_app_with_probe().await;
+        (app, token)
+    }
+
+    async fn unrecoverable_app_with_probe() -> (Router, String, Arc<RecoveryProbe>) {
         let approvals =
             Arc::new(InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap());
+        let probe = Arc::new(RecoveryProbe::default());
         let provider = Arc::new(UnrecoverableDisconnectProvider {
             inner: Arc::new(ApprovalProvider::new(approvals.clone())),
+            probe: probe.clone(),
         });
         let controller = Arc::new(
             AgentController::new(provider, ProviderBindingRef::new("remote-test")).unwrap(),
@@ -4281,6 +4354,7 @@ mod tests {
                 artifact_blob_store: None,
             }),
             claim.token,
+            probe,
         )
     }
 
@@ -5125,6 +5199,92 @@ mod tests {
         registry.clear_manual(&key);
         assert!(registry.begin(&key));
         registry.finish(&key);
+    }
+
+    #[tokio::test]
+    async fn manual_recovery_requires_explicit_retry_and_preserves_execution() {
+        let (app, token, probe) = unrecoverable_app_with_probe().await;
+        for (uri, body) in [
+            (
+                "/sessions",
+                serde_json::json!({"session_id": "manual-session"}),
+            ),
+            (
+                "/sessions/manual-session/runs",
+                serde_json::json!({"run_id": "manual-run", "input": "perform the effect once"}),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized("POST", uri, &token, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        let mut original_execution = None;
+        for _ in 0..50 {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    "GET",
+                    "/runs/manual-run",
+                    &token,
+                    serde_json::Value::Null,
+                ))
+                .await
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if view["recovery"]["mode"] == "manual" {
+                assert_eq!(view["recovery"]["can_start_new_run"], false);
+                original_execution = Some(view["execution"].clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let original_execution = original_execution.expect("fixture entered manual recovery");
+        assert!(!original_execution.is_null());
+        let before = probe.recoveries.load(Ordering::SeqCst);
+        for (uri, expected_calls) in [
+            ("/runs/manual-run/recover", before),
+            ("/runs/manual-run/recover?retry_manual=true", before + 1),
+            ("/runs/manual-run/recover", before + 1),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized("POST", uri, &token, serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(view["state"]["state"], "unknown");
+            assert_eq!(view["recovery"]["mode"], "manual");
+            assert_eq!(view["recovery"]["can_start_new_run"], false);
+            assert_eq!(probe.recoveries.load(Ordering::SeqCst), expected_calls);
+        }
+        probe.available.store(true, Ordering::SeqCst);
+        let request = || {
+            authorized(
+                "POST",
+                "/runs/manual-run/recover?retry_manual=true",
+                &token,
+                serde_json::json!({}),
+            )
+        };
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        for response in [first.unwrap(), second.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(view["execution"], original_execution);
+            assert_ne!(view["state"]["state"], "unknown");
+        }
+        assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.recoveries.load(Ordering::SeqCst), before + 2);
     }
 
     #[test]
