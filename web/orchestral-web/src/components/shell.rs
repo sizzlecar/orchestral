@@ -98,6 +98,11 @@ pub fn Workspace() -> Element {
         .unwrap_or_else(|| "Orchestral".to_owned());
     let session_metadata = selected.as_ref().map(session_metadata).unwrap_or_default();
     let run = state.current_run().cloned();
+    let manual_run_id = run
+        .as_ref()
+        .filter(|run| run.recovery_is_manual())
+        .map(|run| run.id.clone());
+    let mut retrying_recovery = use_signal(|| false);
     let native_session_state = selected.as_ref().and_then(|session| {
         session
             .connector_id
@@ -383,6 +388,22 @@ pub fn Workspace() -> Element {
                             h1 { "{title}" }
                         }
                         div { class: "conversation-header__controls",
+                            if let Some(run_id) = manual_run_id {
+                                button {
+                                    class: "session-actions-button",
+                                    r#type: "button",
+                                    disabled: retrying_recovery() || !state.connection.online,
+                                    onclick: move |_| {
+                                        let run_id = run_id.clone();
+                                        retrying_recovery.set(true);
+                                        spawn(async move {
+                                            controller.retry_manual_recovery(run_id).await;
+                                            retrying_recovery.set(false);
+                                        });
+                                    },
+                                    if retrying_recovery() { "恢复中…" } else { "重试恢复" }
+                                }
+                            }
                             if has_session_actions {
                                 button {
                                     class: "session-actions-button",

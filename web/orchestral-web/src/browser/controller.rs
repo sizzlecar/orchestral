@@ -2675,7 +2675,7 @@ impl AppController {
             .and_then(|run| run.connector_id.clone());
         match self
             .api
-            .recover(&token, &run_id, connector_id.as_deref())
+            .recover(&token, &run_id, connector_id.as_deref(), false)
             .await
         {
             Ok(view) => {
@@ -2702,6 +2702,46 @@ impl AppController {
                 // Keep the durable Run stream attached without turning a
                 // control-plane delay into a browser reconnect loop.
                 self.state.write().connection.error = Some(error.message);
+            }
+        }
+    }
+
+    pub async fn retry_manual_recovery(mut self, run_id: String) {
+        let Some(token) = self.token.read().clone() else {
+            return;
+        };
+        let Some(run) = self.state.read().runs.get(&run_id).cloned() else {
+            return;
+        };
+        if !run.recovery_is_manual() {
+            return;
+        }
+        match self
+            .api
+            .recover(&token, &run_id, run.connector_id.as_deref(), true)
+            .await
+        {
+            Ok(view) => {
+                let manual = {
+                    let mut state = self.state.write();
+                    let current =
+                        state.ensure_run_source(&run_id, run.session_id, run.connector_id);
+                    current.apply_view(view, platform::now());
+                    current.recovery_is_manual()
+                };
+                if manual {
+                    self.notice("恢复条件仍未满足，请查看运行错误。", "warning");
+                } else {
+                    self.resume_live_transport_for_selection(0);
+                }
+            }
+            Err(error) if error.status == 401 => self.handle_api_error(error).await,
+            Err(error) => {
+                // A transient failure may have re-enabled Host supervision.
+                // Refresh its disposition before choosing the live transport.
+                self.refresh_run(&run_id).await;
+                self.resume_live_transport_for_selection(0);
+                self.handle_api_error(error).await;
             }
         }
     }

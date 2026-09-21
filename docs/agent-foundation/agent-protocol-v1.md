@@ -57,6 +57,16 @@ let durable = controller.events(&execution.run_id, 0).await?;
   结构化 `UnsupportedCapability`，不能静默忽略。
 - recovery 必须继续同一 Execution；`OutcomeUnknown` 不能通过创建新 Run 绕过。
 
+HTTP Host 遇到不可重试的恢复错误时暂停自动恢复，保留 `unknown` 和原 Session 的
+执行权。排除故障后，用户可点击 PWA 的“重试恢复”，或显式调用
+`POST /api/v1/runs/{run_id}/recover?retry_manual=true`（外部 Agent 还需原
+`connector_id`）。默认 `retry_manual=false`，浏览器的自动恢复不越过手动暂停。
+此操作只重新核对并连接同一 Execution，不重发初始输入、不创建新 Run，也不将
+`unknown` 猜测为已完成。仍无法证明连续性时继续保留 `unknown`。
+
+Codex 原生文件描述符耗尽（`EMFILE`/`ENFILE`）按临时不可用处理，复用 Host 的退避
+恢复。它不会自动重启共享 app-server；该进程可能同时承载其他活跃会话。
+
 ## 可协商的输入队列与上下文用量扩展
 
 Generic Provider 在 descriptor 的 `extensions["orchestral/input-queue.v1"]` 声明
