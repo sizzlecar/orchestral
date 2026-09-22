@@ -95,8 +95,10 @@ pub(crate) fn session_items_page(
         .map(str::to_owned);
     let mut turns = Vec::<AgentSessionTurn>::new();
     let mut turn_indexes = BTreeMap::<String, usize>::new();
-    for entry in data.iter().rev() {
+    let mut last_item_positions = BTreeMap::new();
+    for (position, entry) in data.iter().rev().enumerate() {
         let turn_id = required_string(entry, "turnId", "thread item entry")?;
+        last_item_positions.insert(turn_id, position);
         let item = entry
             .get("item")
             .ok_or_else(|| AgentConnectorError::protocol("thread item entry omitted item"))?;
@@ -138,6 +140,11 @@ pub(crate) fn session_items_page(
             turns[*index].status = AgentSessionTurnStatus::Active;
         }
     }
+    // Items from different turns can interleave (for example late child
+    // activity). Group creation order then reflects the oldest item of each
+    // group, not the live edge. Preserve activity order within each turn while
+    // ordering groups by their last observed item, so the newest group is last.
+    turns.sort_by_key(|turn| last_item_positions[turn.turn_id.as_str()]);
     Ok(AgentSessionDetail {
         summary,
         turns,
@@ -545,6 +552,81 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_pages_keep_the_latest_turn_last_even_when_turn_items_interleave() {
+        let connector = AgentConnectorId::new("codex/local");
+        let summary = session_summary(
+            &connector,
+            &json!({
+                "id": "thread", "status": {"type": "active"}
+            }),
+        )
+        .unwrap();
+        let item = |turn, id| {
+            json!({"turnId": turn, "item": {
+                "type": "agentMessage", "id": id, "text": id
+            }})
+        };
+        for data in [
+            vec![
+                item("current", "newest"),
+                item("old", "late-old"),
+                item("current", "earlier"),
+            ],
+            vec![
+                item("current", "newest"),
+                item("current", "earlier"),
+                item("old", "late-old"),
+            ],
+        ] {
+            for live_edge in [false, true] {
+                let detail = session_items_page(
+                    summary.clone(),
+                    &json!({
+                        "data": data, "nextCursor": "opaque-native-cursor"
+                    }),
+                    live_edge,
+                    &NormalizationLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    detail
+                        .turns
+                        .iter()
+                        .map(|turn| turn.turn_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["old", "current"]
+                );
+                assert_eq!(
+                    detail.turns[1]
+                        .activities
+                        .iter()
+                        .map(|activity| activity.activity_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["earlier", "newest"]
+                );
+                assert_eq!(detail.turns[0].status, AgentSessionTurnStatus::Completed);
+                assert_eq!(
+                    detail.turns[1].status,
+                    if live_edge {
+                        AgentSessionTurnStatus::Active
+                    } else {
+                        AgentSessionTurnStatus::Completed
+                    }
+                );
+                assert_eq!(detail.next_cursor.as_deref(), Some("opaque-native-cursor"));
+                assert_eq!(
+                    detail
+                        .turns
+                        .iter()
+                        .map(|turn| turn.activities.len())
+                        .sum::<usize>(),
+                    3
+                );
+            }
+        }
+    }
 
     #[test]
     fn normalizes_known_items_and_bounds_large_outputs() {
