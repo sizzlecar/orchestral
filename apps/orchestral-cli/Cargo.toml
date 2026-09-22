@@ -60,6 +60,7 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 ignore = "0.4"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 insta = "1.48.0"
 portable-pty = "0.9"

@@ -1761,45 +1761,38 @@ async fn supervise_run(
     let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
     let policy = state.run_supervisors.policy;
     let mut failures = 0_u32;
-    let now = std::time::Instant::now();
-    let initial_age = agent
-        .catalog_runs()
-        .await
-        .ok()
-        .and_then(|runs| {
-            runs.into_iter()
-                .find(|entry| entry.run_id == run_id)
-                .map(|entry| {
-                    chrono::Utc::now()
-                        .timestamp_millis()
-                        .saturating_sub(entry.updated_at_unix_ms)
-                        .max(0) as u64
-                })
-        })
-        .map(Duration::from_millis)
-        .unwrap_or_default();
-    let mut last_progress = now
-        .checked_sub(initial_age.min(policy.inactivity_timeout))
-        .unwrap_or(now);
+    // Telemetry is intentionally not journaled. An old durable RunStarted is
+    // not evidence that the native execution has been idle since that time.
+    // Start one bounded observation window after attaching this supervisor.
+    let mut last_progress = tokio::time::Instant::now();
+    let mut observed_run_seq = 0;
+    let mut live: Option<broadcast::Receiver<AgentControlEvent>> = None;
     let mut watchdog_cancel_command = None;
-    let mut watchdog_stop_requested_at: Option<std::time::Instant> = None;
+    let mut watchdog_stop_requested_at: Option<tokio::time::Instant> = None;
+    let mut watchdog_cancel_failures = 0_u32;
+    let mut watchdog_cancel_unavailable = false;
     loop {
-        // Subscribe before inspecting so a transition committed between the
-        // two operations remains observable by this supervisor.
-        let mut live = match agent.subscribe(&run_id).await {
-            Ok(live) => live,
-            Err(error) => {
-                failures = failures.saturating_add(1);
-                tracing::warn!(
-                    connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
-                    run_id = %run_id.as_str(),
-                    %error,
-                    "could not subscribe to supervised Agent Run"
-                );
-                tokio::time::sleep(run_supervisor_backoff(failures)).await;
-                continue;
-            }
-        };
+        // Retain the receiver across inspections. Resubscribing after every
+        // event drops queued telemetry, including progress behind control chatter.
+        if live.is_none() {
+            live = match agent.subscribe(&run_id).await {
+                Ok(live) => {
+                    last_progress = tokio::time::Instant::now();
+                    Some(live)
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(
+                        connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
+                        run_id = %run_id.as_str(),
+                        %error,
+                        "could not subscribe to supervised Agent Run"
+                    );
+                    tokio::time::sleep(run_supervisor_backoff(failures)).await;
+                    continue;
+                }
+            };
+        }
         let view = match agent.inspect(&run_id).await {
             Ok(view) => view,
             Err(error) => {
@@ -1831,6 +1824,7 @@ async fn supervise_run(
                     // retaining exponential backoff prevents an unbounded
                     // continuity_lost/restored journal storm.
                     failures = failures.saturating_add(1);
+                    last_progress = tokio::time::Instant::now();
                     state.run_supervisors.clear_manual(&key);
                     tracing::info!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
@@ -1869,12 +1863,50 @@ async fn supervise_run(
         failures = 0;
         apply_remembered_approvals(&state, &agent, &run_id, &view.pending_requests).await;
 
+        // Drain activity that arrived during inspection/approval awaits before
+        // deciding to cancel. Durable gaps are recovered from the journal; a
+        // larger sequence alone is not progress (commands/recovery can advance it).
+        let (progress, live_head, closed) =
+            drain_execution_progress(live.as_mut().expect("supervisor receiver is present"));
+        if closed {
+            live = None;
+            // Lost observation is not evidence of native inactivity. Reattach
+            // before starting a new bounded observation window.
+            last_progress = tokio::time::Instant::now();
+            tokio::time::sleep(run_supervisor_backoff(1)).await;
+            continue;
+        }
+        let mut progress = progress;
+        if view.last_run_seq.unwrap_or(0).max(live_head) > observed_run_seq {
+            match agent.events(&run_id, observed_run_seq).await {
+                Ok(records) => {
+                    for record in records {
+                        observed_run_seq = observed_run_seq.max(record.event.run_seq);
+                        progress |= agent_event_is_execution_progress(&record.event.payload);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(run_id = %run_id, %error,
+                        "could not reconcile supervised Run progress; deferring inactivity decision");
+                    tokio::time::sleep(run_supervisor_backoff(1)).await;
+                    continue;
+                }
+            }
+        }
+        if progress {
+            last_progress = tokio::time::Instant::now();
+            watchdog_cancel_failures = 0;
+            if watchdog_stop_requested_at.is_none() {
+                state.run_supervisors.clear_issue(&key);
+            }
+        }
+
         if view.state.status()
             == orchestral_core::agent_protocol::reference::AgentRunStatus::Waiting
         {
             // A blocking input/approval request is healthy quiescence. Its
             // lifetime belongs to the user, not the execution watchdog.
-            last_progress = std::time::Instant::now();
+            last_progress = tokio::time::Instant::now();
             watchdog_cancel_command = None;
             watchdog_stop_requested_at = None;
             state.run_supervisors.clear_issue(&key);
@@ -1888,7 +1920,7 @@ async fn supervise_run(
                 "Agent stop was accepted; waiting for the Provider to confirm a terminal state"
                     .to_owned(),
             );
-            watchdog_stop_requested_at = Some(std::time::Instant::now());
+            watchdog_stop_requested_at = Some(tokio::time::Instant::now());
         } else if let Some(requested_at) = watchdog_stop_requested_at {
             if requested_at.elapsed() >= policy.stop_grace {
                 state.run_supervisors.mark_issue(
@@ -1900,7 +1932,9 @@ async fn supervise_run(
                     ),
                 );
             }
-        } else if last_progress.elapsed() >= policy.inactivity_timeout {
+        } else if !watchdog_cancel_unavailable
+            && last_progress.elapsed() >= policy.inactivity_timeout
+        {
             let reason = format!(
                 "Agent execution produced no model, Tool, output, or request progress for {} seconds; the Host watchdog requested a safe stop",
                 policy.inactivity_timeout.as_secs()
@@ -1944,7 +1978,7 @@ async fn supervise_run(
                         CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
                     ) =>
                 {
-                    watchdog_stop_requested_at = Some(std::time::Instant::now());
+                    watchdog_stop_requested_at = Some(tokio::time::Instant::now());
                     tracing::warn!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
                         run_id = %run_id.as_str(),
@@ -1961,10 +1995,10 @@ async fn supervise_run(
                             ack.state
                         ),
                     );
-                    return;
+                    watchdog_cancel_unavailable = true;
                 }
                 Err(error) => {
-                    failures = failures.saturating_add(1);
+                    watchdog_cancel_failures = watchdog_cancel_failures.saturating_add(1);
                     state.run_supervisors.mark_issue(
                         key.clone(),
                         "stalled",
@@ -1978,16 +2012,26 @@ async fn supervise_run(
                         %error,
                         "Agent Run watchdog cancellation failed"
                     );
-                    tokio::time::sleep(run_supervisor_backoff(failures)).await;
-                    continue;
+                    if is_retryable_agent_error(&error) {
+                        tokio::time::sleep(run_supervisor_backoff(watchdog_cancel_failures)).await;
+                        continue;
+                    }
+                    // Unsupported ownership/control is a permanent rejection,
+                    // not a reason to reissue Cancel every 100 ms. Continue
+                    // observation so the real native terminal result can arrive.
+                    watchdog_cancel_unavailable = true;
                 }
             }
         }
 
-        match tokio::time::timeout(RUN_SUPERVISOR_POLL_INTERVAL, live.recv()).await {
+        let Some(receiver) = live.as_mut() else {
+            continue;
+        };
+        match tokio::time::timeout(RUN_SUPERVISOR_POLL_INTERVAL, receiver.recv()).await {
             Ok(Ok(event)) => {
                 if agent_control_event_is_execution_progress(&event) {
-                    last_progress = std::time::Instant::now();
+                    last_progress = tokio::time::Instant::now();
+                    watchdog_cancel_failures = 0;
                     if watchdog_stop_requested_at.is_none() {
                         state.run_supervisors.clear_issue(&key);
                     }
@@ -1995,9 +2039,31 @@ async fn supervise_run(
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {}
             Ok(Err(broadcast::error::RecvError::Closed)) => {
+                live = None;
+                last_progress = tokio::time::Instant::now();
                 failures = failures.saturating_add(1);
                 tokio::time::sleep(run_supervisor_backoff(failures)).await;
             }
+        }
+    }
+}
+
+fn drain_execution_progress(
+    receiver: &mut broadcast::Receiver<AgentControlEvent>,
+) -> (bool, u64, bool) {
+    let mut progress = false;
+    let mut durable_head = 0;
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                progress |= agent_control_event_is_execution_progress(&event);
+                if let AgentControlEvent::Durable(record) = event {
+                    durable_head = durable_head.max(record.event.run_seq);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Empty) => return (progress, durable_head, false),
+            Err(broadcast::error::TryRecvError::Closed) => return (progress, durable_head, true),
         }
     }
 }
@@ -3422,6 +3488,12 @@ mod tests {
         inner: Arc<dyn AgentProvider>,
         finish: Arc<tokio::sync::Notify>,
         rejection: Option<AgentProtocolErrorCode>,
+        watchdog: Option<Arc<WatchdogProbe>>,
+    }
+
+    struct WatchdogProbe {
+        commands: AtomicUsize,
+        events: broadcast::Sender<AgentProviderStreamItem>,
     }
 
     struct UnrecoverableDisconnectProvider {
@@ -3614,10 +3686,18 @@ mod tests {
                     },
                 })))
             });
+            let remaining = if let Some(probe) = &self.watchdog {
+                let activity = stream::unfold(probe.events.subscribe(), |mut events| async move {
+                    events.recv().await.ok().map(|event| (Ok(event), events))
+                });
+                stream::select(terminal, activity).boxed()
+            } else {
+                terminal.boxed()
+            };
             Ok(AgentStart {
                 execution: started.execution,
                 admission: started.admission,
-                stream: started.stream.take(1).chain(terminal).boxed(),
+                stream: started.stream.take(1).chain(remaining).boxed(),
             })
         }
 
@@ -3626,6 +3706,13 @@ mod tests {
             _execution: &AgentExecutionRef,
             command: AgentCommandEnvelope,
         ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+            if let Some(probe) = &self.watchdog {
+                probe.commands.fetch_add(1, Ordering::SeqCst);
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "external owner controls this turn",
+                ));
+            }
             Ok(ProviderCommandDisposition {
                 command_id: command.command_id,
                 run_id: command.run_id,
@@ -4140,6 +4227,7 @@ mod tests {
         let external_provider = Arc::new(HoldingProvider {
             finish: finish.clone(),
             rejection,
+            watchdog: None,
             inner: external_factory.create(external_scenario, TestProbes::default()),
         });
         let agent_directory = Arc::new(AgentDirectory::new());
@@ -5311,6 +5399,137 @@ mod tests {
 
         registry.clear_issue(&key);
         assert!(registry.issue(&key).is_none());
+    }
+
+    fn watchdog_progress(run_id: &RunId, sequence: u64) -> AgentProviderStreamItem {
+        use orchestral_core::agent_protocol::wire::{
+            AgentTelemetry, AgentTelemetryEnvelope, TelemetryId,
+        };
+        AgentProviderStreamItem::Telemetry(AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!("progress-{sequence}")),
+            run_id: run_id.clone(),
+            provider_seq: Some(sequence),
+            payload: AgentTelemetry::ProgressReported {
+                message: "new native activity".to_owned(),
+                fraction: None,
+            },
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_observes_progress_and_attempts_permanent_cancel_only_once() {
+        let factory = SessionfulRecoverFactory::new().unwrap();
+        let scenario = ProviderScenario::standard(&factory.descriptor()).unwrap();
+        let start = scenario.start_request.run.clone();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let probe = Arc::new(WatchdogProbe {
+            commands: AtomicUsize::new(0),
+            events: broadcast::channel(64).0,
+        });
+        let provider = Arc::new(HoldingProvider {
+            inner: factory.create(scenario, TestProbes::default()),
+            finish: finish.clone(),
+            rejection: None,
+            watchdog: Some(probe.clone()),
+        });
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("watchdog-test")).unwrap(),
+        );
+        let execution = controller.start(start).await.unwrap();
+        let agent = AgentApi::new(controller);
+        let state = RemoteApiState {
+            agent: agent.clone(),
+            agent_directory: Arc::new(AgentDirectory::new()),
+            native_session_defaults: NativeSessionDefaults::default(),
+            approvals: Arc::new(
+                InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap(),
+            ),
+            registry: RemoteRegistry::in_memory(None),
+            gateway_authenticator: None,
+            run_supervisors: Arc::new(RunSupervisorRegistry {
+                policy: RunSupervisionPolicy {
+                    inactivity_timeout: Duration::from_secs(60),
+                    stop_grace: Duration::from_secs(30),
+                },
+                ..Default::default()
+            }),
+            session_coordinators: Arc::default(),
+            artifact_resolver: None,
+            artifact_blob_store: None,
+        };
+        let task = tokio::spawn(supervise_run(
+            state,
+            agent.clone(),
+            None,
+            execution.run_id.clone(),
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        for sequence in 1..=10 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            probe
+                .events
+                .send(watchdog_progress(&execution.run_id, sequence))
+                .unwrap();
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                probe.commands.load(Ordering::SeqCst),
+                0,
+                "actual activity keeps execution alive"
+            );
+        }
+        tokio::time::advance(Duration::from_secs(90)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            probe.commands.load(Ordering::SeqCst),
+            1,
+            "a genuinely idle turn still triggers the watchdog"
+        );
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(
+            probe.commands.load(Ordering::SeqCst),
+            1,
+            "ownership rejection must not create a cancel storm"
+        );
+        assert!(
+            !task.is_finished(),
+            "permanent cancel rejection does not stop observing the real turn"
+        );
+        finish.notify_one();
+        task.await.unwrap();
+        assert!(agent
+            .inspect(&execution.run_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal());
+    }
+
+    #[test]
+    fn supervision_drains_all_buffered_progress_even_after_broadcast_lag() {
+        let (sender, mut receiver) = broadcast::channel(2);
+        let run_id = RunId::new("buffered-progress");
+        for sequence in 0..4 {
+            let AgentProviderStreamItem::Telemetry(event) = watchdog_progress(&run_id, sequence)
+            else {
+                unreachable!()
+            };
+            sender.send(AgentControlEvent::Telemetry(event)).unwrap();
+        }
+        assert_eq!(drain_execution_progress(&mut receiver), (true, 0, false));
+        assert_eq!(drain_execution_progress(&mut receiver), (false, 0, false));
+        drop(sender);
+        assert_eq!(drain_execution_progress(&mut receiver), (false, 0, true));
     }
 
     #[test]

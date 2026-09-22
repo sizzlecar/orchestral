@@ -14,8 +14,8 @@ use crate::model::{
     SessionView,
 };
 use crate::state::{
-    is_terminal, timeline_blocks_for_session, AppState, AuthStatus, LoadStatus, RunState,
-    TimelineBlock, TimelineItem,
+    is_terminal, latest_session_run_issue_owner, timeline_blocks_for_session, AppState, AuthStatus,
+    LoadStatus, RunState, TimelineBlock, TimelineItem,
 };
 
 const SIDEBAR_SESSIONS_PER_PAGE: usize = 10;
@@ -98,6 +98,10 @@ pub fn Workspace() -> Element {
         .unwrap_or_else(|| "Orchestral".to_owned());
     let session_metadata = selected.as_ref().map(session_metadata).unwrap_or_default();
     let run = state.current_run().cloned();
+    let issue_run_id = selected
+        .as_ref()
+        .and_then(|session| latest_session_run_issue_owner(&state, session))
+        .map(|run| run.id.clone());
     let manual_run_id = run
         .as_ref()
         .filter(|run| run.recovery_is_manual())
@@ -415,6 +419,7 @@ pub fn Workspace() -> Element {
                             }
                             RunStatusBadge {
                                 run,
+                                issue_run_id,
                                 native_session_state,
                                 native_session_updated_at,
                                 native_turn_status,
@@ -464,6 +469,7 @@ pub fn Workspace() -> Element {
 #[component]
 fn RunStatusBadge(
     run: Option<RunState>,
+    issue_run_id: Option<String>,
     native_session_state: Option<String>,
     native_session_updated_at: Option<i64>,
     native_turn_status: Option<String>,
@@ -477,6 +483,7 @@ fn RunStatusBadge(
     });
     let status = session_run_label(
         run.as_ref(),
+        issue_run_id.as_deref(),
         native_session_state.as_deref(),
         native_session_updated_at,
         native_turn_status.as_deref(),
@@ -1106,12 +1113,19 @@ fn run_label(run: Option<&RunState>, now: f64) -> (String, &'static str) {
 /// active. The mirror remains in the timeline as durable failure evidence.
 fn session_run_label(
     run: Option<&RunState>,
+    issue_run_id: Option<&str>,
     native_session_state: Option<&str>,
     native_session_updated_at: Option<i64>,
     native_turn_status: Option<&str>,
     now: f64,
 ) -> (String, &'static str) {
-    if run.is_some_and(|run| !is_terminal(&run.status)) {
+    // The footer uses causal turn identity to decide whether a failure was
+    // superseded. Same-turn activity can advance the session timestamp or
+    // report a stale native completion; neither may hide that current issue.
+    if run.is_some_and(|run| {
+        !is_terminal(&run.status)
+            || (issue_run_id == Some(run.id.as_str()) && run.history_latest_turn_status.is_none())
+    }) {
         return run_label(run, now);
     }
 
@@ -1153,7 +1167,7 @@ mod tests {
         AgentConnectorView, AgentSessionCapabilitiesView, AgentSessionDetail,
         AgentSessionExecutionProfile,
     };
-    use crate::state::{AgentSessionListState, Message};
+    use crate::state::{latest_session_run_issue, AgentSessionListState, Message};
 
     fn session(id: &str, connector_id: Option<&str>, updated_at_unix_ms: i64) -> SessionView {
         SessionView {
@@ -1475,6 +1489,7 @@ mod tests {
             assert_eq!(
                 session_run_label(
                     Some(current_run),
+                    latest_session_run_issue_owner(&state, session).map(|run| run.id.as_str()),
                     session.state.as_deref(),
                     Some(session.updated_at_unix_ms),
                     history.history_latest_turn_status.as_deref(),
@@ -1494,9 +1509,141 @@ mod tests {
         assert_eq!(
             session_run_label(
                 Some(&run),
+                None,
                 Some("idle"),
                 Some(2_000),
                 Some("completed"),
+                0.0,
+            ),
+            ("失败".to_owned(), "error")
+        );
+    }
+
+    #[test]
+    fn same_turn_activity_cannot_hide_the_issue_until_a_new_turn_takes_over() {
+        use crate::model::AgentSessionChangeView;
+
+        for (status, label, tone) in [
+            ("cancelled", "已取消", "idle"),
+            ("failed", "失败", "error"),
+            ("incomplete", "未完整结束", "warning"),
+        ] {
+            let mut state = AppState::new(true);
+            state.sessions.selected_id = Some("fixture/local\0thread-1".to_owned());
+            let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+                "summary": {
+                    "connector_id": "fixture/local", "session_id": "thread-1",
+                    "state": "idle", "updated_at_unix_ms": 1000
+                },
+                "turns": [{"turn_id": "old-turn", "status": "completed", "activities": []}],
+                "stream_cursor": 1
+            }))
+            .unwrap();
+            state.project_agent_session(detail);
+            let failure = serde_json::json!({"code": status, "message": "execution stopped"});
+            let run = state.ensure_run_source(
+                "controlled-run",
+                Some("thread-1".to_owned()),
+                Some("fixture/local".to_owned()),
+            );
+            run.status = status.to_owned();
+            run.failure = Some(failure.clone());
+            run.cursor = 6;
+            run.updated_at_unix_ms = Some(2000);
+            state.sessions.items[0]
+                .run_ids
+                .push("controlled-run".to_owned());
+
+            let badge = |state: &AppState| {
+                let session = state.selected_session().unwrap();
+                let history = &state.runs[&session.history_run_id().unwrap()];
+                session_run_label(
+                    state.current_run(),
+                    latest_session_run_issue_owner(state, session).map(|run| run.id.as_str()),
+                    session.state.as_deref(),
+                    Some(session.updated_at_unix_ms),
+                    history.history_latest_turn_status.as_deref(),
+                    10_000.0,
+                )
+            };
+            let change = |sequence, turn, turn_status| {
+                serde_json::from_value::<AgentSessionChangeView>(serde_json::json!({
+                    "connector_id": "fixture/local", "session_id": "thread-1",
+                    "sequence": sequence,
+                    "change": {"type": "turn_status", "turn_id": turn, "status": turn_status}
+                }))
+                .unwrap()
+            };
+
+            // The session clock moves beyond the Host terminal timestamp, but
+            // these updates still describe the cancelled/failed native turn.
+            for (sequence, turn_status) in [(2, "active"), (3, "completed")] {
+                state.apply_agent_session_change(change(sequence, "old-turn", turn_status), 10_000);
+                assert!(latest_session_run_issue(&state, &state.sessions.items[0]).is_some());
+                assert_eq!(badge(&state), (label.to_owned(), tone));
+            }
+
+            state.apply_agent_session_change(change(4, "new-turn", "active"), 11_000);
+            assert!(latest_session_run_issue(&state, &state.sessions.items[0]).is_none());
+            assert_eq!(badge(&state), ("Working".to_owned(), "working"));
+            state.apply_agent_session_change(change(5, "new-turn", "completed"), 12_000);
+            assert_eq!(badge(&state), ("完成".to_owned(), "complete"));
+            assert_eq!(state.runs["controlled-run"].failure, Some(failure));
+
+            // A subsequent native failure belongs to native history, even
+            // while the old controlled Run remains the current control target.
+            state.apply_agent_session_change(change(6, "third-turn", "active"), 13_000);
+            let native_failure: AgentSessionChangeView =
+                serde_json::from_value(serde_json::json!({
+                    "connector_id": "fixture/local", "session_id": "thread-1",
+                    "sequence": 7,
+                    "change": {
+                        "type": "turn_status", "turn_id": "third-turn", "status": "failed",
+                        "failure": {"code": "provider_error", "message": "native execution failed"}
+                    }
+                }))
+                .unwrap();
+            state.apply_agent_session_change(native_failure, 14_000);
+            let session = state.selected_session().unwrap();
+            assert_eq!(state.current_run().unwrap().id, "controlled-run");
+            assert_eq!(
+                latest_session_run_issue_owner(&state, session).unwrap().id,
+                session.history_run_id().unwrap()
+            );
+            assert_eq!(badge(&state), ("失败".to_owned(), "error"));
+        }
+    }
+
+    #[test]
+    fn native_only_failure_uses_turn_status_instead_of_history_delivery_status() {
+        let mut state = AppState::new(true);
+        state.sessions.selected_id = Some("fixture/local\0thread-1".to_owned());
+        let detail: AgentSessionDetail = serde_json::from_value(serde_json::json!({
+            "summary": {
+                "connector_id": "fixture/local", "session_id": "thread-1", "state": "idle"
+            },
+            "turns": [{
+                "turn_id": "native-turn", "status": "failed", "activities": [],
+                "failure": {"code": "provider_error", "message": "native execution failed"}
+            }]
+        }))
+        .unwrap();
+        state.project_agent_session(detail);
+        let session = state.selected_session().unwrap();
+        let history = state.current_run().unwrap();
+        assert_eq!(
+            history.status, "delivered",
+            "the history page was delivered"
+        );
+        let issue = latest_session_run_issue_owner(&state, session).unwrap();
+        assert_eq!(issue.id, history.id);
+        assert_eq!(
+            session_run_label(
+                Some(history),
+                Some(issue.id.as_str()),
+                session.state.as_deref(),
+                Some(session.updated_at_unix_ms),
+                history.history_latest_turn_status.as_deref(),
                 0.0,
             ),
             ("失败".to_owned(), "error")

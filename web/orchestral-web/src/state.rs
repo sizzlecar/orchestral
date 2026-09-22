@@ -2308,6 +2308,19 @@ pub fn latest_session_run_issue(
     state: &AppState,
     session: &SessionView,
 ) -> Option<SessionRunIssue> {
+    let run = latest_session_run_issue_owner(state, session)?;
+    run.failure
+        .clone()
+        .map(SessionRunIssue::Failure)
+        .or_else(|| run.error.clone().map(SessionRunIssue::ControlError))
+}
+
+/// The same causal issue owner is used by the session badge and footer. An
+/// issue's presence alone does not identify which Host/native Run it belongs to.
+pub fn latest_session_run_issue_owner<'a>(
+    state: &'a AppState,
+    session: &SessionView,
+) -> Option<&'a RunState> {
     // Content deduplication must not move the live edge backwards: the latest
     // controlled Run may already be represented by native history while an
     // older failed mirror still contributes an unmatched user message.
@@ -2331,10 +2344,7 @@ pub fn latest_session_run_issue(
     } else {
         history?
     };
-    run.failure
-        .clone()
-        .map(SessionRunIssue::Failure)
-        .or_else(|| run.error.clone().map(SessionRunIssue::ControlError))
+    (run.failure.is_some() || run.error.is_some()).then_some(run)
 }
 
 #[derive(Debug, Clone, PartialEq)]
