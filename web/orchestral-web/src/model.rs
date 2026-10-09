@@ -55,8 +55,17 @@ pub struct OutboxEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboxOperation {
-    Start { run_id: String },
-    Steer { run_id: String, command_id: String },
+    Start {
+        run_id: String,
+    },
+    SessionInput {
+        action_id: String,
+        submission_id: String,
+    },
+    Steer {
+        run_id: String,
+        command_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +85,8 @@ pub struct SessionView {
     pub cwd: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub input_action: Option<String>,
     #[serde(default)]
     pub execution_profile: AgentSessionExecutionProfile,
 }
@@ -136,6 +147,8 @@ pub struct AgentSessionActionView {
     pub input_schema: Option<Value>,
     #[serde(default)]
     pub execution: AgentSessionActionExecutionView,
+    #[serde(default)]
+    pub input_channel: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +182,8 @@ pub struct AgentSessionSummary {
     #[serde(default)]
     pub updated_at_unix_ms: Option<i64>,
     pub state: String,
+    #[serde(default)]
+    pub input_action: Option<String>,
     #[serde(default)]
     pub execution_profile: AgentSessionExecutionProfile,
 }
@@ -236,6 +251,7 @@ impl AgentSessionSummary {
             preview: self.preview,
             cwd: self.cwd,
             state: Some(self.state),
+            input_action: self.input_action,
             execution_profile: self.execution_profile,
         }
     }
@@ -292,6 +308,8 @@ pub struct AgentSessionTurn {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionActivity {
     pub activity_id: String,
+    #[serde(default)]
+    pub occurred_at_unix_ms: Option<i64>,
     pub kind: String,
     pub status: String,
     #[serde(default)]
@@ -352,6 +370,26 @@ pub struct EventsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_input_channel_survives_session_projection_and_outbox_storage() {
+        let summary: AgentSessionSummary = serde_json::from_value(serde_json::json!({
+            "connector_id":"fixture/local", "session_id":"session-1", "state":"idle",
+            "input_action":"fixture.input"
+        }))
+        .unwrap();
+        assert_eq!(
+            summary.into_session().input_action.as_deref(),
+            Some("fixture.input")
+        );
+        let operation = OutboxOperation::SessionInput {
+            action_id: "fixture.input".to_owned(),
+            submission_id: "stable-input-1".to_owned(),
+        };
+        let stored = serde_json::to_value(&operation).unwrap();
+        let restored: OutboxOperation = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored, operation);
+    }
 
     #[test]
     fn connector_capabilities_and_action_schema_survive_http_decoding() {

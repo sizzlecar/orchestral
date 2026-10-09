@@ -154,6 +154,10 @@ pub struct AgentSessionActionDescriptor {
     /// be cancelled, and recover after a disconnect.
     #[serde(default)]
     pub execution: AgentSessionActionExecution,
+    /// This action is a text submission channel used by the composer, rather
+    /// than a manually configured session action.
+    #[serde(default)]
+    pub input_channel: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +177,14 @@ impl AgentSessionActionDescriptor {
         {
             return Err(AgentConnectorError::invalid(
                 "session action requires an id, title, and description",
+            ));
+        }
+        if self.input_channel
+            && (self.execution != AgentSessionActionExecution::Immediate
+                || self.input_schema.is_none())
+        {
+            return Err(AgentConnectorError::invalid(
+                "a session input channel requires immediate execution and an input schema",
             ));
         }
         Ok(())
@@ -368,10 +380,37 @@ pub struct AgentSessionSummary {
     #[serde(default)]
     pub updated_at_unix_ms: Option<i64>,
     pub state: AgentSessionState,
+    /// Optional immediate action for text input to an externally owned session.
+    /// Arguments use [`AgentSessionTextInput`]. This sends to the existing
+    /// execution owner without allocating or claiming control of a Host Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_action: Option<AgentSessionActionId>,
     #[serde(default)]
     pub execution_profile: AgentSessionExecutionProfile,
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
+}
+
+/// Immutable, idempotent text submission to a connector-owned input channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionTextInput {
+    pub submission_id: String,
+    pub text: String,
+}
+
+impl AgentSessionTextInput {
+    pub fn validate(&self) -> Result<(), AgentConnectorError> {
+        if self.submission_id.is_empty()
+            || self.submission_id.len() > 256
+            || self.text.trim().is_empty()
+        {
+            return Err(AgentConnectorError::invalid(
+                "session input requires a bounded submission identity and nonempty text",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl AgentSessionSummary {
@@ -379,6 +418,15 @@ impl AgentSessionSummary {
         if &self.connector_id != connector_id || self.session_id.is_empty() {
             return Err(AgentConnectorError::protocol(
                 "connector returned a session with mismatched or empty identity",
+            ));
+        }
+        if self
+            .input_action
+            .as_ref()
+            .is_some_and(AgentSessionActionId::is_empty)
+        {
+            return Err(AgentConnectorError::protocol(
+                "session input action identity must not be empty",
             ));
         }
         if self.cwd.as_ref().is_some_and(|cwd| cwd.trim().is_empty())
@@ -449,6 +497,9 @@ pub enum AgentSessionActivityStatus {
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionActivity {
     pub activity_id: AgentSessionActivityId,
+    /// Native observation time, independent of the opaque activity identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at_unix_ms: Option<i64>,
     pub kind: AgentSessionActivityKind,
     pub status: AgentSessionActivityStatus,
     #[serde(default)]
@@ -463,9 +514,9 @@ pub struct AgentSessionActivity {
 
 impl AgentSessionActivity {
     fn validate(&self) -> Result<(), AgentConnectorError> {
-        if self.activity_id.is_empty() {
+        if self.activity_id.is_empty() || self.occurred_at_unix_ms.is_some_and(|time| time < 0) {
             return Err(AgentConnectorError::protocol(
-                "session activity id must not be empty",
+                "session activity requires an identity and a nonnegative observation time",
             ));
         }
         for content in &self.content {
@@ -1090,6 +1141,20 @@ pub fn paginate_session_detail(
 mod tests {
     use super::*;
 
+    #[test]
+    fn activity_observation_time_is_optional_and_rejects_negative_values() {
+        let legacy = serde_json::json!({"activity_id":"opaque-id","kind":"agent_message","status":"completed","content":[]});
+        let activity: AgentSessionActivity = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(activity.occurred_at_unix_ms, None);
+        activity.validate().unwrap();
+        let mut timed = legacy;
+        timed["occurred_at_unix_ms"] = serde_json::json!(1790000000000i64);
+        let mut activity: AgentSessionActivity = serde_json::from_value(timed).unwrap();
+        activity.validate().unwrap();
+        activity.occurred_at_unix_ms = Some(-1);
+        assert!(activity.validate().is_err());
+    }
+
     fn descriptor() -> AgentConnectorDescriptor {
         AgentConnectorDescriptor {
             connector_id: AgentConnectorId::new("fixture/default"),
@@ -1103,6 +1168,7 @@ mod tests {
                 title: "Compact".to_owned(),
                 description: "Compact session history".to_owned(),
                 input_schema: None,
+                input_channel: false,
                 execution: AgentSessionActionExecution::Run,
             }],
         }
@@ -1114,6 +1180,36 @@ mod tests {
         descriptor.actions.push(descriptor.actions[0].clone());
         let error = descriptor.validate().expect_err("duplicates must fail");
         assert_eq!(error.code, AgentConnectorErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn session_input_channels_require_immediate_execution_and_typed_input() {
+        let mut action = descriptor().actions.remove(0);
+        action.input_channel = true;
+        action.input_schema = Some(serde_json::json!({"type":"object"}));
+        assert!(action.validate().is_err());
+        action.execution = AgentSessionActionExecution::Immediate;
+        action.validate().unwrap();
+        action.input_schema = None;
+        assert!(action.validate().is_err());
+
+        let input: AgentSessionTextInput = serde_json::from_value(serde_json::json!({
+            "submission_id":"request-1", "text":"continue"
+        }))
+        .unwrap();
+        input.validate().unwrap();
+        assert!(
+            serde_json::from_value::<AgentSessionTextInput>(serde_json::json!({
+                "submission_id":"request-1", "text":"continue", "approval":true
+            }))
+            .is_err()
+        );
+        assert!(AgentSessionTextInput {
+            submission_id: String::new(),
+            ..input
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1139,6 +1235,7 @@ mod tests {
                 created_at_unix_ms: None,
                 updated_at_unix_ms: None,
                 state: AgentSessionState::Detached,
+                input_action: None,
                 execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             }],
@@ -1162,6 +1259,7 @@ mod tests {
             created_at_unix_ms: None,
             updated_at_unix_ms: None,
             state: AgentSessionState::Idle,
+            input_action: None,
             execution_profile: AgentSessionExecutionProfile {
                 model: Some("  ".to_owned()),
                 ..Default::default()
@@ -1180,6 +1278,7 @@ mod tests {
         let connector_id = AgentConnectorId::new("fixture/default");
         let activities = (0..40)
             .map(|index| AgentSessionActivity {
+                occurred_at_unix_ms: None,
                 activity_id: AgentSessionActivityId::new(format!("activity-{index}")),
                 kind: AgentSessionActivityKind::Command,
                 status: AgentSessionActivityStatus::Completed,
@@ -1198,6 +1297,7 @@ mod tests {
                 created_at_unix_ms: None,
                 updated_at_unix_ms: None,
                 state: AgentSessionState::Idle,
+                input_action: None,
                 execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             },

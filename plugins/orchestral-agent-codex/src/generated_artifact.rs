@@ -403,6 +403,7 @@ mod tests {
 
     fn activity() -> AgentSessionActivity {
         AgentSessionActivity {
+            occurred_at_unix_ms: None,
             activity_id: AgentSessionActivityId::new("image-1"),
             kind: AgentSessionActivityKind::AgentMessage,
             status: AgentSessionActivityStatus::Completed,

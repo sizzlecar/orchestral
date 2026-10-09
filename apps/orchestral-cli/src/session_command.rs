@@ -183,7 +183,7 @@ impl SessionsCommand {
         } else {
             AgentJournalAccess::ReadOnly
         };
-        let directory = build_agent_directory(None, None, None, journal_access).await?;
+        let directory = build_agent_directory(None, None, None, journal_access, false).await?;
         let stdout = std::io::stdout();
         self.run_with_directory(directory, default_cwd, &mut stdout.lock())
             .await
@@ -679,6 +679,7 @@ mod tests {
                         title: "Rename".to_owned(),
                         description: "Rename session".to_owned(),
                         input_schema: Some(json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
@@ -686,6 +687,7 @@ mod tests {
                         title: "Review".to_owned(),
                         description: "Review changes".to_owned(),
                         input_schema: Some(json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Run,
                     },
                 ],
@@ -748,6 +750,7 @@ mod tests {
             created_at_unix_ms: Some(1),
             updated_at_unix_ms: Some(2),
             state: AgentSessionState::Idle,
+            input_action: None,
             execution_profile: Default::default(),
             extensions: BTreeMap::new(),
         }

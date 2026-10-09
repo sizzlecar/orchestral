@@ -10,6 +10,7 @@ members = [
     "plugins/orchestral-agent-journal-fs",
     "plugins/orchestral-agent-acp",
     "plugins/orchestral-agent-codex",
+    "plugins/orchestral-agent-claude",
     "plugins/orchestral-artifact-r2",
     "plugins/orchestral-blob-fs",
     "plugins/orchestral-model-gemini",
@@ -87,6 +88,7 @@ orchestral-core = { path = "core/orchestral-core", version = "0.4.1" }
 orchestral-runtime = { path = "core/orchestral-runtime", version = "0.4.1" }
 orchestral-agent-acp = { path = "plugins/orchestral-agent-acp", version = "0.4.1" }
 orchestral-agent-codex = { path = "plugins/orchestral-agent-codex", version = "0.4.1" }
+orchestral-agent-claude = { path = "plugins/orchestral-agent-claude", version = "0.4.1" }
 orchestral-artifact-r2 = { path = "plugins/orchestral-artifact-r2", version = "0.4.1" }
 orchestral-model-gemini = { path = "plugins/orchestral-model-gemini", version = "0.4.1" }
 orchestral-model-openai = { path = "plugins/orchestral-model-openai", version = "0.4.1" }

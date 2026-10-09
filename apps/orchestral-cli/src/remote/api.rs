@@ -1761,45 +1761,38 @@ async fn supervise_run(
     let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
     let policy = state.run_supervisors.policy;
     let mut failures = 0_u32;
-    let now = std::time::Instant::now();
-    let initial_age = agent
-        .catalog_runs()
-        .await
-        .ok()
-        .and_then(|runs| {
-            runs.into_iter()
-                .find(|entry| entry.run_id == run_id)
-                .map(|entry| {
-                    chrono::Utc::now()
-                        .timestamp_millis()
-                        .saturating_sub(entry.updated_at_unix_ms)
-                        .max(0) as u64
-                })
-        })
-        .map(Duration::from_millis)
-        .unwrap_or_default();
-    let mut last_progress = now
-        .checked_sub(initial_age.min(policy.inactivity_timeout))
-        .unwrap_or(now);
+    // Telemetry is intentionally not journaled. An old durable RunStarted is
+    // not evidence that the native execution has been idle since that time.
+    // Start one bounded observation window after attaching this supervisor.
+    let mut last_progress = tokio::time::Instant::now();
+    let mut observed_run_seq = 0;
+    let mut live: Option<broadcast::Receiver<AgentControlEvent>> = None;
     let mut watchdog_cancel_command = None;
-    let mut watchdog_stop_requested_at: Option<std::time::Instant> = None;
+    let mut watchdog_stop_requested_at: Option<tokio::time::Instant> = None;
+    let mut watchdog_cancel_failures = 0_u32;
+    let mut watchdog_cancel_unavailable = false;
     loop {
-        // Subscribe before inspecting so a transition committed between the
-        // two operations remains observable by this supervisor.
-        let mut live = match agent.subscribe(&run_id).await {
-            Ok(live) => live,
-            Err(error) => {
-                failures = failures.saturating_add(1);
-                tracing::warn!(
-                    connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
-                    run_id = %run_id.as_str(),
-                    %error,
-                    "could not subscribe to supervised Agent Run"
-                );
-                tokio::time::sleep(run_supervisor_backoff(failures)).await;
-                continue;
-            }
-        };
+        // Retain the receiver across inspections. Resubscribing after every
+        // event drops queued telemetry, including progress behind control chatter.
+        if live.is_none() {
+            live = match agent.subscribe(&run_id).await {
+                Ok(live) => {
+                    last_progress = tokio::time::Instant::now();
+                    Some(live)
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(
+                        connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
+                        run_id = %run_id.as_str(),
+                        %error,
+                        "could not subscribe to supervised Agent Run"
+                    );
+                    tokio::time::sleep(run_supervisor_backoff(failures)).await;
+                    continue;
+                }
+            };
+        }
         let view = match agent.inspect(&run_id).await {
             Ok(view) => view,
             Err(error) => {
@@ -1831,6 +1824,7 @@ async fn supervise_run(
                     // retaining exponential backoff prevents an unbounded
                     // continuity_lost/restored journal storm.
                     failures = failures.saturating_add(1);
+                    last_progress = tokio::time::Instant::now();
                     state.run_supervisors.clear_manual(&key);
                     tracing::info!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
@@ -1869,12 +1863,50 @@ async fn supervise_run(
         failures = 0;
         apply_remembered_approvals(&state, &agent, &run_id, &view.pending_requests).await;
 
+        // Drain activity that arrived during inspection/approval awaits before
+        // deciding to cancel. Durable gaps are recovered from the journal; a
+        // larger sequence alone is not progress (commands/recovery can advance it).
+        let (progress, live_head, closed) =
+            drain_execution_progress(live.as_mut().expect("supervisor receiver is present"));
+        if closed {
+            live = None;
+            // Lost observation is not evidence of native inactivity. Reattach
+            // before starting a new bounded observation window.
+            last_progress = tokio::time::Instant::now();
+            tokio::time::sleep(run_supervisor_backoff(1)).await;
+            continue;
+        }
+        let mut progress = progress;
+        if view.last_run_seq.unwrap_or(0).max(live_head) > observed_run_seq {
+            match agent.events(&run_id, observed_run_seq).await {
+                Ok(records) => {
+                    for record in records {
+                        observed_run_seq = observed_run_seq.max(record.event.run_seq);
+                        progress |= agent_event_is_execution_progress(&record.event.payload);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(run_id = %run_id, %error,
+                        "could not reconcile supervised Run progress; deferring inactivity decision");
+                    tokio::time::sleep(run_supervisor_backoff(1)).await;
+                    continue;
+                }
+            }
+        }
+        if progress {
+            last_progress = tokio::time::Instant::now();
+            watchdog_cancel_failures = 0;
+            if watchdog_stop_requested_at.is_none() {
+                state.run_supervisors.clear_issue(&key);
+            }
+        }
+
         if view.state.status()
             == orchestral_core::agent_protocol::reference::AgentRunStatus::Waiting
         {
             // A blocking input/approval request is healthy quiescence. Its
             // lifetime belongs to the user, not the execution watchdog.
-            last_progress = std::time::Instant::now();
+            last_progress = tokio::time::Instant::now();
             watchdog_cancel_command = None;
             watchdog_stop_requested_at = None;
             state.run_supervisors.clear_issue(&key);
@@ -1888,7 +1920,7 @@ async fn supervise_run(
                 "Agent stop was accepted; waiting for the Provider to confirm a terminal state"
                     .to_owned(),
             );
-            watchdog_stop_requested_at = Some(std::time::Instant::now());
+            watchdog_stop_requested_at = Some(tokio::time::Instant::now());
         } else if let Some(requested_at) = watchdog_stop_requested_at {
             if requested_at.elapsed() >= policy.stop_grace {
                 state.run_supervisors.mark_issue(
@@ -1900,7 +1932,9 @@ async fn supervise_run(
                     ),
                 );
             }
-        } else if last_progress.elapsed() >= policy.inactivity_timeout {
+        } else if !watchdog_cancel_unavailable
+            && last_progress.elapsed() >= policy.inactivity_timeout
+        {
             let reason = format!(
                 "Agent execution produced no model, Tool, output, or request progress for {} seconds; the Host watchdog requested a safe stop",
                 policy.inactivity_timeout.as_secs()
@@ -1944,7 +1978,7 @@ async fn supervise_run(
                         CommandAckState::Accepted { .. } | CommandAckState::Applied { .. }
                     ) =>
                 {
-                    watchdog_stop_requested_at = Some(std::time::Instant::now());
+                    watchdog_stop_requested_at = Some(tokio::time::Instant::now());
                     tracing::warn!(
                         connector_id = connector_id.as_ref().map(AgentConnectorId::as_str),
                         run_id = %run_id.as_str(),
@@ -1961,10 +1995,10 @@ async fn supervise_run(
                             ack.state
                         ),
                     );
-                    return;
+                    watchdog_cancel_unavailable = true;
                 }
                 Err(error) => {
-                    failures = failures.saturating_add(1);
+                    watchdog_cancel_failures = watchdog_cancel_failures.saturating_add(1);
                     state.run_supervisors.mark_issue(
                         key.clone(),
                         "stalled",
@@ -1978,16 +2012,26 @@ async fn supervise_run(
                         %error,
                         "Agent Run watchdog cancellation failed"
                     );
-                    tokio::time::sleep(run_supervisor_backoff(failures)).await;
-                    continue;
+                    if is_retryable_agent_error(&error) {
+                        tokio::time::sleep(run_supervisor_backoff(watchdog_cancel_failures)).await;
+                        continue;
+                    }
+                    // Unsupported ownership/control is a permanent rejection,
+                    // not a reason to reissue Cancel every 100 ms. Continue
+                    // observation so the real native terminal result can arrive.
+                    watchdog_cancel_unavailable = true;
                 }
             }
         }
 
-        match tokio::time::timeout(RUN_SUPERVISOR_POLL_INTERVAL, live.recv()).await {
+        let Some(receiver) = live.as_mut() else {
+            continue;
+        };
+        match tokio::time::timeout(RUN_SUPERVISOR_POLL_INTERVAL, receiver.recv()).await {
             Ok(Ok(event)) => {
                 if agent_control_event_is_execution_progress(&event) {
-                    last_progress = std::time::Instant::now();
+                    last_progress = tokio::time::Instant::now();
+                    watchdog_cancel_failures = 0;
                     if watchdog_stop_requested_at.is_none() {
                         state.run_supervisors.clear_issue(&key);
                     }
@@ -1995,9 +2039,31 @@ async fn supervise_run(
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {}
             Ok(Err(broadcast::error::RecvError::Closed)) => {
+                live = None;
+                last_progress = tokio::time::Instant::now();
                 failures = failures.saturating_add(1);
                 tokio::time::sleep(run_supervisor_backoff(failures)).await;
             }
+        }
+    }
+}
+
+fn drain_execution_progress(
+    receiver: &mut broadcast::Receiver<AgentControlEvent>,
+) -> (bool, u64, bool) {
+    let mut progress = false;
+    let mut durable_head = 0;
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                progress |= agent_control_event_is_execution_progress(&event);
+                if let AgentControlEvent::Durable(record) = event {
+                    durable_head = durable_head.max(record.event.run_seq);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Empty) => return (progress, durable_head, false),
+            Err(broadcast::error::TryRecvError::Closed) => return (progress, durable_head, true),
         }
     }
 }
@@ -2121,7 +2187,7 @@ async fn inspect_run(
 async fn recover_run(
     State(state): State<RemoteApiState>,
     Path(run_id): Path<String>,
-    Query(query): Query<RunTargetQuery>,
+    Query(query): Query<RunRecoveryQuery>,
 ) -> Result<Json<RemoteRunView>, ApiError> {
     let connector_id = query.connector_id.as_deref().map(AgentConnectorId::new);
     let (agent, run_id) = require_run(
@@ -2135,19 +2201,54 @@ async fn recover_run(
         == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
     {
         let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
-        if state.run_supervisors.manual_reason(&key).is_some() {
+        if state.run_supervisors.manual_reason(&key).is_some() && !query.retry_manual {
             current
         } else {
+            // Explicit recovery revisits this same Execution through the
+            // controller's recovery gate. It never releases the Session or
+            // submits the original input as a second Run.
             match agent.recover(&run_id).await {
                 Ok(view) => {
                     state.run_supervisors.clear_manual(&key);
+                    spawn_run_supervisor(
+                        state.clone(),
+                        agent.clone(),
+                        connector_id.clone(),
+                        run_id.clone(),
+                    );
                     view
                 }
-                Err(error) if !is_retryable_agent_error(&error) => {
-                    state.run_supervisors.mark_manual(key, error.to_string());
-                    current
+                Err(error) => {
+                    // Another explicit request or the supervisor may have
+                    // recovered while this caller waited for the Run gate.
+                    // Re-read before interpreting InvalidTransition as a new
+                    // permanent failure or returning a stale Unknown view.
+                    let latest = agent.inspect(&run_id).await?;
+                    if latest.state.status()
+                        != orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
+                    {
+                        state.run_supervisors.clear_manual(&key);
+                        spawn_run_supervisor(
+                            state.clone(),
+                            agent.clone(),
+                            connector_id.clone(),
+                            run_id.clone(),
+                        );
+                        latest
+                    } else if !is_retryable_agent_error(&error) {
+                        state.run_supervisors.mark_manual(key, error.to_string());
+                        latest
+                    } else {
+                        state.run_supervisors.clear_manual(&key);
+                        spawn_run_supervisor(
+                            state.clone(),
+                            agent.clone(),
+                            connector_id.clone(),
+                            run_id.clone(),
+                        );
+                        return Err(error.into());
+                    }
                 }
-                Err(error) => return Err(error.into()),
             }
         }
     } else {
@@ -2162,6 +2263,16 @@ async fn recover_run(
         view,
         agent.initial_input(&run_id).await?,
     )))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RunRecoveryQuery {
+    #[serde(default)]
+    connector_id: Option<String>,
+    /// Only an explicit user recovery action may cross a manual stop.
+    #[serde(default)]
+    retry_manual: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3087,7 +3198,10 @@ impl From<AgentDirectoryError> for ApiError {
                         "agent_connector_unavailable",
                         error.to_string(),
                     ),
-                    AgentConnectorErrorCode::Protocol | AgentConnectorErrorCode::OutcomeUnknown => {
+                    AgentConnectorErrorCode::OutcomeUnknown => {
+                        Self::conflict("agent_connector_outcome_unknown", error.to_string())
+                    }
+                    AgentConnectorErrorCode::Protocol => {
                         Self::internal("agent_connector_failed", error.to_string())
                     }
                     _ => Self::internal("agent_connector_failed", error.to_string()),
@@ -3168,7 +3282,7 @@ mod tests {
     use super::*;
     use orchestral_core::agent_connector::AgentSessionExecutionProfile;
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -3211,6 +3325,17 @@ mod tests {
     use orchestral_runtime::{AgentApprovalBridge, AgentController};
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+
+    #[test]
+    fn uncertain_connector_delivery_is_a_conflict_not_a_retryable_server_failure() {
+        let error = ApiError::from(AgentDirectoryError::Connector(AgentConnectorError::new(
+            orchestral_core::agent_connector::AgentConnectorErrorCode::OutcomeUnknown,
+            "delivery has no correlated receipt",
+            false,
+        )));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "agent_connector_outcome_unknown");
+    }
 
     #[test]
     fn provider_native_request_bodies_do_not_require_run_command_identity() {
@@ -3377,10 +3502,24 @@ mod tests {
         inner: Arc<dyn AgentProvider>,
         finish: Arc<tokio::sync::Notify>,
         rejection: Option<AgentProtocolErrorCode>,
+        watchdog: Option<Arc<WatchdogProbe>>,
+    }
+
+    struct WatchdogProbe {
+        commands: AtomicUsize,
+        events: broadcast::Sender<AgentProviderStreamItem>,
     }
 
     struct UnrecoverableDisconnectProvider {
         inner: Arc<dyn AgentProvider>,
+        probe: Arc<RecoveryProbe>,
+    }
+
+    #[derive(Default)]
+    struct RecoveryProbe {
+        starts: AtomicUsize,
+        recoveries: AtomicUsize,
+        available: AtomicBool,
     }
 
     #[test]
@@ -3561,10 +3700,18 @@ mod tests {
                     },
                 })))
             });
+            let remaining = if let Some(probe) = &self.watchdog {
+                let activity = stream::unfold(probe.events.subscribe(), |mut events| async move {
+                    events.recv().await.ok().map(|event| (Ok(event), events))
+                });
+                stream::select(terminal, activity).boxed()
+            } else {
+                terminal.boxed()
+            };
             Ok(AgentStart {
                 execution: started.execution,
                 admission: started.admission,
-                stream: started.stream.take(1).chain(terminal).boxed(),
+                stream: started.stream.take(1).chain(remaining).boxed(),
             })
         }
 
@@ -3573,6 +3720,13 @@ mod tests {
             _execution: &AgentExecutionRef,
             command: AgentCommandEnvelope,
         ) -> Result<ProviderCommandDisposition, AgentProtocolError> {
+            if let Some(probe) = &self.watchdog {
+                probe.commands.fetch_add(1, Ordering::SeqCst);
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::Unsupported,
+                    "external owner controls this turn",
+                ));
+            }
             Ok(ProviderCommandDisposition {
                 command_id: command.command_id,
                 run_id: command.run_id,
@@ -3607,6 +3761,7 @@ mod tests {
             &self,
             request: orchestral_core::agent_protocol::wire::AgentStartRequest,
         ) -> Result<AgentStart, AgentStartError> {
+            self.probe.starts.fetch_add(1, Ordering::SeqCst);
             let started = self.inner.start(request).await?;
             Ok(AgentStart {
                 execution: started.execution,
@@ -3625,8 +3780,20 @@ mod tests {
 
         async fn recover(
             &self,
-            _request: AgentRecoveryRequest,
+            request: AgentRecoveryRequest,
         ) -> Result<AgentRecovery, AgentProtocolError> {
+            self.probe.recoveries.fetch_add(1, Ordering::SeqCst);
+            if self.probe.available.load(Ordering::SeqCst) {
+                let replay = stream::iter(
+                    request
+                        .committed_provider_prefix
+                        .into_iter()
+                        .map(|event| Ok(AgentProviderStreamItem::Event(Box::new(event)))),
+                )
+                .chain(stream::pending())
+                .boxed();
+                return Ok(AgentRecovery::reattached(replay));
+            }
             Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::ProviderUnavailable,
                 "fixture recovery remains unavailable",
@@ -3645,6 +3812,7 @@ mod tests {
                 created_at_unix_ms: Some(1_000),
                 updated_at_unix_ms: Some(2_000),
                 state: AgentSessionState::Idle,
+                input_action: None,
                 execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             }
@@ -3679,6 +3847,7 @@ mod tests {
                         title: "Fork".to_owned(),
                         description: "Fork a fixture session".to_owned(),
                         input_schema: None,
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
@@ -3686,6 +3855,7 @@ mod tests {
                         title: "Rename".to_owned(),
                         description: "Rename a fixture session".to_owned(),
                         input_schema: Some(serde_json::json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
@@ -3693,6 +3863,7 @@ mod tests {
                         title: "Review".to_owned(),
                         description: "Review fixture changes".to_owned(),
                         input_schema: Some(serde_json::json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Run,
                     },
                 ],
@@ -3740,6 +3911,7 @@ mod tests {
                     failure: None,
                     activities: (0..60)
                         .map(|index| AgentSessionActivity {
+                            occurred_at_unix_ms: None,
                             activity_id: AgentSessionActivityId::new(format!("activity-{index}")),
                             kind: AgentSessionActivityKind::Command,
                             status: AgentSessionActivityStatus::Completed,
@@ -4074,6 +4246,7 @@ mod tests {
         let external_provider = Arc::new(HoldingProvider {
             finish: finish.clone(),
             rejection,
+            watchdog: None,
             inner: external_factory.create(external_scenario, TestProbes::default()),
         });
         let agent_directory = Arc::new(AgentDirectory::new());
@@ -4252,10 +4425,17 @@ mod tests {
     }
 
     async fn unrecoverable_app() -> (Router, String) {
+        let (app, token, _) = unrecoverable_app_with_probe().await;
+        (app, token)
+    }
+
+    async fn unrecoverable_app_with_probe() -> (Router, String, Arc<RecoveryProbe>) {
         let approvals =
             Arc::new(InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap());
+        let probe = Arc::new(RecoveryProbe::default());
         let provider = Arc::new(UnrecoverableDisconnectProvider {
             inner: Arc::new(ApprovalProvider::new(approvals.clone())),
+            probe: probe.clone(),
         });
         let controller = Arc::new(
             AgentController::new(provider, ProviderBindingRef::new("remote-test")).unwrap(),
@@ -4281,6 +4461,7 @@ mod tests {
                 artifact_blob_store: None,
             }),
             claim.token,
+            probe,
         )
     }
 
@@ -4760,7 +4941,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
@@ -5127,6 +5308,92 @@ mod tests {
         registry.finish(&key);
     }
 
+    #[tokio::test]
+    async fn manual_recovery_requires_explicit_retry_and_preserves_execution() {
+        let (app, token, probe) = unrecoverable_app_with_probe().await;
+        for (uri, body) in [
+            (
+                "/sessions",
+                serde_json::json!({"session_id": "manual-session"}),
+            ),
+            (
+                "/sessions/manual-session/runs",
+                serde_json::json!({"run_id": "manual-run", "input": "perform the effect once"}),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized("POST", uri, &token, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        let mut original_execution = None;
+        for _ in 0..50 {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    "GET",
+                    "/runs/manual-run",
+                    &token,
+                    serde_json::Value::Null,
+                ))
+                .await
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if view["recovery"]["mode"] == "manual" {
+                assert_eq!(view["recovery"]["can_start_new_run"], false);
+                original_execution = Some(view["execution"].clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let original_execution = original_execution.expect("fixture entered manual recovery");
+        assert!(!original_execution.is_null());
+        let before = probe.recoveries.load(Ordering::SeqCst);
+        for (uri, expected_calls) in [
+            ("/runs/manual-run/recover", before),
+            ("/runs/manual-run/recover?retry_manual=true", before + 1),
+            ("/runs/manual-run/recover", before + 1),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized("POST", uri, &token, serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(view["state"]["state"], "unknown");
+            assert_eq!(view["recovery"]["mode"], "manual");
+            assert_eq!(view["recovery"]["can_start_new_run"], false);
+            assert_eq!(probe.recoveries.load(Ordering::SeqCst), expected_calls);
+        }
+        probe.available.store(true, Ordering::SeqCst);
+        let request = || {
+            authorized(
+                "POST",
+                "/runs/manual-run/recover?retry_manual=true",
+                &token,
+                serde_json::json!({}),
+            )
+        };
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        for response in [first.unwrap(), second.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(view["execution"], original_execution);
+            assert_ne!(view["state"]["state"], "unknown");
+        }
+        assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.recoveries.load(Ordering::SeqCst), before + 2);
+    }
+
     #[test]
     fn supervision_registry_exposes_and_clears_stall_state() {
         let registry = RunSupervisorRegistry::default();
@@ -5151,6 +5418,137 @@ mod tests {
 
         registry.clear_issue(&key);
         assert!(registry.issue(&key).is_none());
+    }
+
+    fn watchdog_progress(run_id: &RunId, sequence: u64) -> AgentProviderStreamItem {
+        use orchestral_core::agent_protocol::wire::{
+            AgentTelemetry, AgentTelemetryEnvelope, TelemetryId,
+        };
+        AgentProviderStreamItem::Telemetry(AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!("progress-{sequence}")),
+            run_id: run_id.clone(),
+            provider_seq: Some(sequence),
+            payload: AgentTelemetry::ProgressReported {
+                message: "new native activity".to_owned(),
+                fraction: None,
+            },
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_observes_progress_and_attempts_permanent_cancel_only_once() {
+        let factory = SessionfulRecoverFactory::new().unwrap();
+        let scenario = ProviderScenario::standard(&factory.descriptor()).unwrap();
+        let start = scenario.start_request.run.clone();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let probe = Arc::new(WatchdogProbe {
+            commands: AtomicUsize::new(0),
+            events: broadcast::channel(64).0,
+        });
+        let provider = Arc::new(HoldingProvider {
+            inner: factory.create(scenario, TestProbes::default()),
+            finish: finish.clone(),
+            rejection: None,
+            watchdog: Some(probe.clone()),
+        });
+        let controller = Arc::new(
+            AgentController::new(provider, ProviderBindingRef::new("watchdog-test")).unwrap(),
+        );
+        let execution = controller.start(start).await.unwrap();
+        let agent = AgentApi::new(controller);
+        let state = RemoteApiState {
+            agent: agent.clone(),
+            agent_directory: Arc::new(AgentDirectory::new()),
+            native_session_defaults: NativeSessionDefaults::default(),
+            approvals: Arc::new(
+                InMemoryHostApprovalBroker::new(b"0123456789abcdef0123456789abcdef").unwrap(),
+            ),
+            registry: RemoteRegistry::in_memory(None),
+            gateway_authenticator: None,
+            run_supervisors: Arc::new(RunSupervisorRegistry {
+                policy: RunSupervisionPolicy {
+                    inactivity_timeout: Duration::from_secs(60),
+                    stop_grace: Duration::from_secs(30),
+                },
+                ..Default::default()
+            }),
+            session_coordinators: Arc::default(),
+            artifact_resolver: None,
+            artifact_blob_store: None,
+        };
+        let task = tokio::spawn(supervise_run(
+            state,
+            agent.clone(),
+            None,
+            execution.run_id.clone(),
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        for sequence in 1..=10 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            probe
+                .events
+                .send(watchdog_progress(&execution.run_id, sequence))
+                .unwrap();
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                probe.commands.load(Ordering::SeqCst),
+                0,
+                "actual activity keeps execution alive"
+            );
+        }
+        tokio::time::advance(Duration::from_secs(90)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            probe.commands.load(Ordering::SeqCst),
+            1,
+            "a genuinely idle turn still triggers the watchdog"
+        );
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(
+            probe.commands.load(Ordering::SeqCst),
+            1,
+            "ownership rejection must not create a cancel storm"
+        );
+        assert!(
+            !task.is_finished(),
+            "permanent cancel rejection does not stop observing the real turn"
+        );
+        finish.notify_one();
+        task.await.unwrap();
+        assert!(agent
+            .inspect(&execution.run_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal());
+    }
+
+    #[test]
+    fn supervision_drains_all_buffered_progress_even_after_broadcast_lag() {
+        let (sender, mut receiver) = broadcast::channel(2);
+        let run_id = RunId::new("buffered-progress");
+        for sequence in 0..4 {
+            let AgentProviderStreamItem::Telemetry(event) = watchdog_progress(&run_id, sequence)
+            else {
+                unreachable!()
+            };
+            sender.send(AgentControlEvent::Telemetry(event)).unwrap();
+        }
+        assert_eq!(drain_execution_progress(&mut receiver), (true, 0, false));
+        assert_eq!(drain_execution_progress(&mut receiver), (false, 0, false));
+        drop(sender);
+        assert_eq!(drain_execution_progress(&mut receiver), (false, 0, true));
     }
 
     #[test]

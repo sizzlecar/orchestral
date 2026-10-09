@@ -31,6 +31,24 @@ struct AgentDirectoryEntry {
     api: AgentApi,
 }
 
+fn verify_input_action(
+    descriptor: &AgentConnectorDescriptor,
+    summary: &AgentSessionSummary,
+) -> Result<(), AgentConnectorError> {
+    if let Some(id) = &summary.input_action {
+        if !descriptor.action(id).is_some_and(|action| {
+            action.execution == AgentSessionActionExecution::Immediate
+                && action.input_channel
+                && action.input_schema.is_some()
+        }) {
+            return Err(AgentConnectorError::protocol(
+                "session input channel must name a declared immediate action with an input schema",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Process-level registry for installed Agent connectors.
 ///
 /// Connector IDs namespace session IDs. Two different Agents may therefore
@@ -115,6 +133,9 @@ impl AgentDirectory {
         let requested_limit = query.limit;
         let page = entry.connector.list_sessions(query).await?;
         page.validate_for(connector_id, requested_limit)?;
+        for summary in &page.sessions {
+            verify_input_action(&entry.descriptor, summary)?;
+        }
         Ok(page)
     }
 
@@ -130,6 +151,7 @@ impl AgentDirectory {
         self.verify_descriptor(&entry)?;
         let detail = entry.connector.read_session(session_id).await?;
         detail.validate_for(connector_id)?;
+        verify_input_action(&entry.descriptor, &detail.summary)?;
         if detail.summary.session_id != *session_id {
             return Err(AgentConnectorError::protocol(
                 "connector returned a different session than requested",
@@ -153,6 +175,7 @@ impl AgentDirectory {
         self.verify_descriptor(&entry)?;
         let detail = entry.connector.read_session_page(session_id, query).await?;
         detail.validate_for(connector_id)?;
+        verify_input_action(&entry.descriptor, &detail.summary)?;
         if detail.summary.session_id != *session_id {
             return Err(AgentConnectorError::protocol(
                 "connector returned a different session than requested",
@@ -217,6 +240,7 @@ impl AgentDirectory {
         }
         let summary = entry.connector.create_session(request).await?;
         summary.validate_for(connector_id)?;
+        verify_input_action(&entry.descriptor, &summary)?;
         entry
             .api
             .create_session(Some(summary.session_id.clone()))
@@ -238,7 +262,9 @@ impl AgentDirectory {
         let entry = self.entry(connector_id).await?;
         self.verify_descriptor(&entry)?;
         let action = entry.descriptor.action(&request.action_id).ok_or_else(|| {
-            AgentConnectorError::unsupported(format!(
+            // A stale or unknown action identity is a definitive invalid
+            // request, not a transient provider implementation failure.
+            AgentConnectorError::invalid(format!(
                 "connector does not declare action {}",
                 request.action_id
             ))
@@ -249,6 +275,12 @@ impl AgentDirectory {
                 request.action_id
             ))
             .into());
+        }
+        if action.input_channel {
+            let input: orchestral_core::agent_connector::AgentSessionTextInput =
+                serde_json::from_value(request.arguments.clone())
+                    .map_err(|error| AgentConnectorError::invalid(error.to_string()))?;
+            input.validate()?;
         }
         if action.execution == AgentSessionActionExecution::Run {
             // Resolve the session before starting so a forged connector/session
@@ -303,6 +335,7 @@ impl AgentDirectory {
         }
         if let Some(summary) = &outcome.session {
             summary.validate_for(connector_id)?;
+            verify_input_action(&entry.descriptor, summary)?;
         }
         for content in &outcome.content {
             content

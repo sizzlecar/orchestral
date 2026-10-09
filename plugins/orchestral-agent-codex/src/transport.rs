@@ -205,6 +205,24 @@ pub enum CodexTransportError {
     MissingResult,
 }
 
+impl CodexTransportError {
+    /// Older app-servers serialize OS errors only in the JSON-RPC message.
+    /// Match the complete native error suffix, not arbitrary mentions of open
+    /// files. This means observation may be retried; it does not authorize
+    /// replaying a native command whose outcome is unknown.
+    pub(crate) fn is_file_descriptor_exhaustion(&self) -> bool {
+        let Self::Rpc(message) = self else {
+            return false;
+        };
+        [
+            "Too many open files (os error 24)",
+            "Too many open files in system (os error 23)",
+        ]
+        .iter()
+        .any(|suffix| message.trim_end().ends_with(suffix))
+    }
+}
+
 type RpcReply = Result<Value, CodexTransportError>;
 type Pending = Arc<SyncMutex<HashMap<String, oneshot::Sender<RpcReply>>>>;
 

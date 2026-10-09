@@ -130,6 +130,7 @@ struct CodexRun {
     commands: Mutex<BTreeMap<String, (Digest, ProviderCommandDisposition)>>,
     route: Mutex<Option<NativeRunRoute>>,
     observed_item_ids: Mutex<BTreeSet<String>>,
+    observed_item_progress: Mutex<BTreeMap<String, Digest>>,
     cancel_request: Mutex<Option<(CommandId, String)>>,
     telemetry_seq: AtomicU64,
     direct_history_misses: AtomicU16,
@@ -218,6 +219,7 @@ fn new_codex_run(
         commands: Mutex::new(BTreeMap::new()),
         route: Mutex::new(None),
         observed_item_ids: Mutex::new(BTreeSet::new()),
+        observed_item_progress: Mutex::new(BTreeMap::new()),
         cancel_request: Mutex::new(None),
         telemetry_seq: AtomicU64::new(0),
         direct_history_misses: AtomicU16::new(0),
@@ -2610,8 +2612,7 @@ fn observe_external_turn_items(run: &Arc<CodexRun>, turn: &Value) {
                 Some("completed" | "failed" | "interrupted" | "declined")
             );
             item_type != Some("userMessage")
-                && (terminal || item_type != Some("agentMessage"))
-                && (terminal || item_terminal)
+                && (terminal || item_terminal || native_progress_item(item))
         })
         .collect::<Vec<_>>();
     let eligible_len = eligible.len();
@@ -2632,10 +2633,109 @@ fn observe_external_turn_items(run: &Arc<CodexRun>, turn: &Value) {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{}-{index}", item_type.unwrap_or("item")));
-        if lock(&run.observed_item_ids).insert(item_id) {
+        let changed = observe_item_progress(run, &item_id, item);
+        let item_terminal = matches!(
+            item.get("status").and_then(Value::as_str),
+            Some("completed" | "failed" | "interrupted" | "declined")
+        );
+        if (terminal || item_terminal) && lock(&run.observed_item_ids).insert(item_id) {
             handle_completed_item(run, Some(item));
+        } else if changed {
+            publish_native_progress(run);
         }
     }
+}
+
+fn native_progress_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "agentMessage"
+                | "reasoning"
+                | "commandExecution"
+                | "fileChange"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "collabAgentToolCall"
+                | "subAgentActivity"
+                | "contextCompaction"
+                | "webSearch"
+                | "plan"
+        )
+    )
+}
+
+// Hash only semantic activity. Wall-clock duration/updatedAt and repeated
+// inProgress snapshots must never act as execution heartbeats. Text is retained
+// only as a digest here; reasoning is not copied into user-visible output.
+fn observe_item_progress(run: &CodexRun, id: &str, item: &Value) -> bool {
+    let mut semantic = serde_json::Map::new();
+    for key in [
+        "type",
+        "status",
+        "text",
+        "summary",
+        "content",
+        "aggregatedOutput",
+        "exitCode",
+        "changes",
+        "result",
+        "error",
+        "agentsStates",
+        "kind",
+        "items",
+    ] {
+        if let Some(value) = item.get(key) {
+            semantic.insert(key.to_owned(), value.clone());
+        }
+    }
+    let digest = Digest::sha256(serde_json::to_vec(&semantic).expect("JSON activity serializes"));
+    let mut observed = lock(&run.observed_item_progress);
+    if observed.get(id) == Some(&digest) {
+        return false;
+    }
+    observed.insert(id.to_owned(), digest);
+    true
+}
+
+fn publish_native_progress(run: &CodexRun) {
+    publish_telemetry(
+        run,
+        AgentTelemetry::ProgressReported {
+            message: "Codex native execution made progress".to_owned(),
+            fraction: None,
+        },
+    );
+}
+
+async fn observe_recent_direct_items(
+    rpc: &CodexRpcClient,
+    run: &Arc<CodexRun>,
+    turn_id: &str,
+) -> Result<(), AgentProtocolError> {
+    // Active turns need only a bounded live edge. Terminal delivery still reads
+    // all pages; polling a long running turn must not rescan its entire history.
+    let result = rpc
+        .request(
+            "thread/items/list",
+            json!({
+                "threadId": run.execution.session_id.as_str(), "turnId": turn_id,
+                "limit": EXTERNAL_QUEUE_PAGE_LIMIT, "sortDirection": "desc"
+            }),
+        )
+        .await
+        .map_err(transport_to_protocol)?;
+    let entries = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| protocol_error("Codex thread/items/list omitted data", false))?;
+    let items = entries
+        .iter()
+        .rev()
+        .filter_map(|entry| entry.get("item").cloned())
+        .collect::<Vec<_>>();
+    observe_external_turn_items(run, &json!({"status": "inProgress", "items": items}));
+    Ok(())
 }
 
 fn external_turn_is_terminal(turn: &Value) -> bool {
@@ -2761,7 +2861,10 @@ async fn reconcile_bound_direct_turn(
         return Ok(true);
     }
     match turn.get("status").and_then(Value::as_str) {
-        Some("inProgress") => Ok(false),
+        Some("inProgress") => {
+            observe_recent_direct_items(rpc, run, turn_id).await?;
+            Ok(false)
+        }
         Some("completed" | "failed") => {
             restore_direct_turn(rpc, run, turn_id, &turn).await?;
             Ok(true)
@@ -2901,18 +3004,24 @@ async fn monitor_native_run(
         if !belongs_to_run(&message, &run.execution.session_id, &turn_id) {
             continue;
         }
-        // Live notifications own the hot path. Poll only after this turn has
-        // gone quiet; unrelated turns cannot postpone the fallback.
-        poll.as_mut()
-            .reset(tokio::time::Instant::now() + DIRECT_RUN_POLL_INTERVAL);
-        run.direct_history_misses.store(0, Ordering::SeqCst);
         let method = message
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // Only real activity postpones the read-only history fallback. Status
+        // chatter and unrecognized notifications cannot hide lost progress.
+        if native_notification_is_progress(&message) {
+            poll.as_mut()
+                .reset(tokio::time::Instant::now() + DIRECT_RUN_POLL_INTERVAL);
+            run.direct_history_misses.store(0, Ordering::SeqCst);
+        }
         match method {
             "item/agentMessage/delta" => {
-                if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
+                if let Some(delta) = message
+                    .pointer("/params/delta")
+                    .and_then(Value::as_str)
+                    .filter(|delta| !delta.is_empty())
+                {
                     lock(&run.final_response).push_str(delta);
                     publish_telemetry(
                         &run,
@@ -2923,7 +3032,37 @@ async fn monitor_native_run(
                     );
                 }
             }
-            "item/completed" => handle_completed_item(&run, message.pointer("/params/item")),
+            "item/started" => {
+                if let Some(item) = message
+                    .pointer("/params/item")
+                    .filter(|item| native_progress_item(item))
+                {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        if observe_item_progress(&run, id, item) {
+                            publish_native_progress(&run);
+                        }
+                    }
+                }
+            }
+            "item/completed" => {
+                if let Some(item) = message.pointer("/params/item") {
+                    let fresh = item.get("id").and_then(Value::as_str).is_none_or(|id| {
+                        let changed = observe_item_progress(&run, id, item);
+                        lock(&run.observed_item_ids).insert(id.to_owned()) || changed
+                    });
+                    if fresh {
+                        handle_completed_item(&run, Some(item));
+                    }
+                }
+            }
+            "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/commandExecution/outputDelta"
+            | "item/fileChange/outputDelta" => {
+                if native_notification_is_progress(&message) {
+                    publish_native_progress(&run);
+                }
+            }
             "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval" => {
@@ -2958,6 +3097,34 @@ async fn monitor_native_run(
             }
             _ => {}
         }
+    }
+}
+
+fn native_notification_is_progress(message: &Value) -> bool {
+    match message.get("method").and_then(Value::as_str) {
+        Some(
+            "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/commandExecution/outputDelta"
+            | "item/fileChange/outputDelta",
+        ) => message
+            .pointer("/params/delta")
+            .and_then(Value::as_str)
+            .is_some_and(|delta| !delta.is_empty()),
+        Some("item/started" | "item/completed") => message
+            .pointer("/params/item")
+            .is_some_and(native_progress_item),
+        Some(
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "serverRequest/resolved"
+            | "item/tool/call"
+            | "turn/completed",
+        ) => true,
+        _ => false,
     }
 }
 
@@ -3207,6 +3374,7 @@ fn handle_completed_item(run: &Arc<CodexRun>, item: Option<&Value>) {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
                 *lock(&run.final_response) = text.to_owned();
             }
+            publish_native_progress(run);
         }
         Some("commandExecution") => {
             let command = item
@@ -3240,6 +3408,9 @@ fn handle_completed_item(run: &Arc<CodexRun>, item: Option<&Value>) {
                 text: "Codex compacted the native session context".to_owned(),
             }],
         ),
+        Some("reasoning" | "subAgentActivity" | "collabAgentToolCall" | "webSearch" | "plan") => {
+            publish_native_progress(run);
+        }
         _ => {}
     }
 }
@@ -3645,7 +3816,7 @@ fn append_event_locked(run: &CodexRun, durable: &mut Vec<AgentEventDraft>, draft
         .send(Ok(AgentProviderStreamItem::Event(Box::new(draft))));
 }
 
-fn publish_telemetry(run: &Arc<CodexRun>, payload: AgentTelemetry) {
+fn publish_telemetry(run: &CodexRun, payload: AgentTelemetry) {
     let sequence = run.telemetry_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let telemetry = AgentTelemetryEnvelope {
         telemetry_id: TelemetryId::new(format!(
@@ -4106,13 +4277,14 @@ fn start_transport_error(error: CodexTransportError, outcome_unknown: bool) -> A
 }
 
 fn transport_to_protocol(error: CodexTransportError) -> AgentProtocolError {
-    let retryable = matches!(
-        error,
-        CodexTransportError::Io(_)
-            | CodexTransportError::Closed
-            | CodexTransportError::Disconnected(_)
-            | CodexTransportError::Timeout
-    );
+    let retryable = error.is_file_descriptor_exhaustion()
+        || matches!(
+            error,
+            CodexTransportError::Io(_)
+                | CodexTransportError::Closed
+                | CodexTransportError::Disconnected(_)
+                | CodexTransportError::Timeout
+        );
     protocol_error(error.to_string(), retryable)
 }
 
@@ -4154,6 +4326,32 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn native_file_descriptor_exhaustion_keeps_same_run_recovery_retryable() {
+        for native in [
+            "failed to read thread: Too many open files (os error 24)",
+            "failed to open rollout: Too many open files in system (os error 23)",
+        ] {
+            let error = transport_to_protocol(CodexTransportError::Rpc(native.to_owned()));
+            assert_eq!(error.code, AgentProtocolErrorCode::ProviderUnavailable);
+            assert!(error.retryable);
+            // A potentially dispatched start still requires reconciliation;
+            // retryability must never turn it into a safe new submission.
+            assert!(matches!(
+                start_transport_error(CodexTransportError::Rpc(native.to_owned()), true),
+                AgentStartError::OutcomeUnknown(error) if error.retryable
+            ));
+        }
+        for native in [
+            "invalid thread id",
+            "thread already has an active writer",
+            "Too many open files in user input",
+            "Permission denied (os error 13)",
+        ] {
+            assert!(!transport_to_protocol(CodexTransportError::Rpc(native.to_owned())).retryable);
+        }
+    }
 
     #[test]
     fn run_notification_requires_an_explicit_matching_thread() {
@@ -6093,6 +6291,111 @@ mod tests {
     }
 
     #[test]
+    fn active_history_reports_real_reasoning_subagent_compaction_and_message_changes() {
+        let run = test_run("thread-progress", "run-progress");
+        let mut updates = run.telemetry_sender.subscribe();
+        let mut turn = json!({"status": "inProgress", "items": [
+            {"id": "reason", "type": "reasoning", "summary": ["working"]},
+            {"id": "child", "type": "subAgentActivity", "kind": "started", "agentPath": "/root/child", "agentThreadId": "child-thread"},
+            {"id": "compact", "type": "contextCompaction"},
+            {"id": "comment", "type": "agentMessage", "text": "progress report", "phase": "commentary"}
+        ]});
+        observe_external_turn_items(&run, &turn);
+        for _ in 0..4 {
+            assert!(matches!(
+                updates.try_recv().unwrap().payload,
+                AgentTelemetry::ProgressReported { .. }
+            ));
+        }
+        assert!(
+            lock(&run.final_response).is_empty(),
+            "observing activity must not fabricate final output"
+        );
+        turn["items"][1]["durationMs"] = json!(90_000);
+        observe_external_turn_items(&run, &turn);
+        assert!(
+            updates.try_recv().is_err(),
+            "unchanged activity/status/duration is not a heartbeat"
+        );
+        turn["items"][0]["summary"] = json!(["working", "new evidence"]);
+        turn["items"][1]["kind"] = json!("completed");
+        turn["items"][3]["text"] = json!("updated progress report");
+        observe_external_turn_items(&run, &turn);
+        assert!(updates.try_recv().is_ok());
+        assert!(updates.try_recv().is_ok());
+        assert!(updates.try_recv().is_ok());
+        assert!(updates.try_recv().is_err());
+        assert!(!run.terminal.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn native_progress_requires_activity_not_status_chatter_or_empty_delta() {
+        for method in [
+            "item/reasoning/textDelta",
+            "item/reasoning/summaryTextDelta",
+            "item/commandExecution/outputDelta",
+        ] {
+            assert!(native_notification_is_progress(
+                &json!({"method": method, "params": {"delta": "new"}})
+            ));
+            assert!(!native_notification_is_progress(
+                &json!({"method": method, "params": {"delta": ""}})
+            ));
+        }
+        for method in [
+            "thread/status/changed",
+            "turn/tokenUsage/updated",
+            "unknown",
+        ] {
+            assert!(!native_notification_is_progress(
+                &json!({"method": method, "params": {"status": "inProgress"}})
+            ));
+        }
+        for kind in ["reasoning", "subAgentActivity", "contextCompaction"] {
+            assert!(native_notification_is_progress(
+                &json!({"method": "item/started", "params": {"item": {"type": kind}}})
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn active_item_fallback_reads_only_bound_turn_and_deduplicates_snapshots() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let rpc =
+            CodexRpcClient::from_io(client_read, client_write, Duration::from_secs(1), 64 * 1024);
+        let run = test_run("thread-live", "run-live");
+        establish_turn(&run, "turn-live");
+        let mut updates = run.telemetry_sender.subscribe();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_read).lines();
+            for _ in 0..2 {
+                let request = next_request(&mut lines).await;
+                assert_eq!(request["method"], "thread/items/list");
+                assert_eq!(request["params"]["threadId"], "thread-live");
+                assert_eq!(request["params"]["turnId"], "turn-live");
+                assert_eq!(request["params"]["sortDirection"], "desc");
+                server_write_result(&mut server_write, &request, json!({
+                    "data": [{"item": {"id": "live-reason", "type": "reasoning", "summary": ["new work"]}}],
+                    "nextCursor": "older-irrelevant-page"
+                })).await;
+            }
+        });
+        observe_recent_direct_items(&rpc, &run, "turn-live")
+            .await
+            .unwrap();
+        assert!(updates.try_recv().is_ok());
+        observe_recent_direct_items(&rpc, &run, "turn-live")
+            .await
+            .unwrap();
+        assert!(updates.try_recv().is_err());
+        server.await.unwrap();
+        assert!(!run.terminal.load(Ordering::SeqCst));
+        assert!(lock(&run.final_response).is_empty());
+    }
+
+    #[test]
     fn external_history_telemetry_is_bounded_and_keeps_both_edges() {
         let run = test_run("thread-history", "run-history");
         let items = (0..700)
@@ -7601,6 +7904,15 @@ mod tests {
         )
         .await;
         assert_eq!(loaded["params"]["includeTurns"], false);
+        let items = next_request(&mut lines).await;
+        assert_eq!(items["method"], "thread/items/list");
+        assert_eq!(items["params"]["turnId"], "turn-quiet");
+        server_write_result(
+            &mut server_write,
+            &items,
+            json!({"data": [], "nextCursor": null}),
+        )
+        .await;
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }

@@ -37,6 +37,7 @@ impl FixtureConnector {
                 created_at_unix_ms: Some(1_000 + index as i64),
                 updated_at_unix_ms: Some(2_000 + index as i64),
                 state: AgentSessionState::Detached,
+                input_action: None,
                 execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             })
@@ -55,6 +56,7 @@ impl FixtureConnector {
                         title: "Compact".to_owned(),
                         description: "Compact context".to_owned(),
                         input_schema: None,
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
@@ -62,6 +64,7 @@ impl FixtureConnector {
                         title: "Review".to_owned(),
                         description: "Review changes".to_owned(),
                         input_schema: Some(serde_json::json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Run,
                     },
                 ],
@@ -72,6 +75,7 @@ impl FixtureConnector {
 
     fn activity(id: &str, kind: AgentSessionActivityKind, text: &str) -> AgentSessionActivity {
         AgentSessionActivity {
+            occurred_at_unix_ms: None,
             activity_id: AgentSessionActivityId::new(id),
             kind,
             status: AgentSessionActivityStatus::Completed,
@@ -201,6 +205,57 @@ fn fixture_provider() -> Arc<dyn orchestral_core::agent_protocol::spi::AgentProv
     let factory = ScriptedStatelessFactory::conformant().expect("fixture descriptor");
     let scenario = ProviderScenario::standard(&factory.descriptor()).expect("fixture scenario");
     factory.create(scenario, TestProbes::default())
+}
+
+#[tokio::test]
+async fn input_channels_are_declared_and_validate_standard_submission_arguments() {
+    let directory = AgentDirectory::new();
+    let mut connector = FixtureConnector::new("fixture/default", "fixture/provider", 1);
+    let action_id = AgentSessionActionId::new("fixture.input");
+    connector.sessions[0].input_action = Some(action_id.clone());
+    connector
+        .descriptor
+        .actions
+        .push(AgentSessionActionDescriptor {
+            action_id: action_id.clone(),
+            title: "Input".to_owned(),
+            description: "Submit text to the existing owner".to_owned(),
+            input_schema: Some(serde_json::json!({"type":"object"})),
+            execution: AgentSessionActionExecution::Immediate,
+            input_channel: true,
+        });
+    directory
+        .register(Arc::new(connector), fixture_provider())
+        .await
+        .unwrap();
+    let id = AgentConnectorId::new("fixture/default");
+    let page = directory
+        .list_sessions(&id, AgentSessionListQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(page.sessions[0].input_action, Some(action_id.clone()));
+    let request = InvokeAgentSessionActionRequest {
+        session_id: page.sessions[0].session_id.clone(),
+        action_id,
+        arguments: serde_json::json!({"submission_id":"input-1","text":"continue"}),
+        run_id: None,
+    };
+    assert!(directory.invoke_action(&id, request.clone()).await.is_ok());
+    let mut invalid = request;
+    invalid.arguments["text"] = serde_json::json!("");
+    assert!(directory.invoke_action(&id, invalid).await.is_err());
+
+    let mut connector = FixtureConnector::new("other/default", "fixture/provider", 1);
+    connector.sessions[0].input_action = Some(AgentSessionActionId::new("undeclared.input"));
+    let other = AgentConnectorId::new("other/default");
+    directory
+        .register(Arc::new(connector), fixture_provider())
+        .await
+        .unwrap();
+    assert!(directory
+        .list_sessions(&other, AgentSessionListQuery::default())
+        .await
+        .is_err());
 }
 
 #[tokio::test]

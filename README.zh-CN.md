@@ -177,6 +177,11 @@ orchestral resume --last
 ```
 
 需要浏览器访问时，运行 `orchestral serve --pair`。
+PWA 可发现本机 Codex 和 Claude Code 会话。Host 托管的 Claude 会话支持用户输入、
+流式对话、审批和取消。已有 Claude 终端可保留原进程、接收 PWA 消息和查看历史；
+Host 加上 `--claude-approvals` 后，可在 PWA 处理工具审批。发给已有终端的消息保留
+跨会话来源，Claude 会附加同伴请求说明；这些消息不授予审批权限。
+接入配置和控制范围见 [Claude Code 适配器](plugins/orchestral-agent-claude/README.md)。
 
 ## 配置
 

@@ -312,7 +312,7 @@ fn MessageView(
             }
             if optimistic { span { class: "message__meta", "发送中…" } }
             if accepted { span { class: "message__meta", "已接收，等待 Agent 开始" } }
-            if deferred { span { class: "message__meta", "已排队，等待原 Agent 接收" } }
+            if deferred { span { class: "message__meta", "已提交，等待原 Agent 确认" } }
         }
     }
 }

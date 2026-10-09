@@ -20,6 +20,7 @@ path = "src/main.rs"
 orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
 orchestral-agent-codex = { workspace = true }
+orchestral-agent-claude = { workspace = true }
 orchestral-agent-journal-fs = { workspace = true }
 orchestral-artifact-r2 = { workspace = true }
 orchestral-blob-fs = { workspace = true }
@@ -60,6 +61,7 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 ignore = "0.4"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 insta = "1.48.0"
 portable-pty = "0.9"

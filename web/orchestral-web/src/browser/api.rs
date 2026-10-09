@@ -380,9 +380,16 @@ impl ApiClient {
         credential: &ApiCredential,
         run_id: &str,
         connector_id: Option<&str>,
+        retry_manual: bool,
     ) -> Result<Value, ApiError> {
         self.post(
-            &with_connector(&format!("/runs/{}/recover", encode(run_id)), connector_id),
+            &with_connector(
+                &format!(
+                    "/runs/{}/recover?retry_manual={retry_manual}",
+                    encode(run_id)
+                ),
+                connector_id,
+            ),
             credential,
             &json!({}),
         )
