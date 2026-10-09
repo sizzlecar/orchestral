@@ -1,7 +1,9 @@
 //! PermissionRequest hooks bridge the native permission UI to the Host's
 //! session-scoped request contract. Only an explicit user decision is returned.
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,23 +12,31 @@ use orchestral_core::agent_connector::{
     ResolveAgentSessionRequest,
 };
 use orchestral_core::agent_protocol::wire::{
-    AgentSessionId, ApprovalDecision, Digest, PendingRequest, PendingRequestPayload, RequestId,
+    AgentSessionId, ApprovalDecision, PendingRequest, RequestId,
 };
+#[cfg(unix)]
+use orchestral_core::agent_protocol::wire::{Digest, PendingRequestPayload};
+#[cfg(unix)]
 use serde::Deserialize;
+#[cfg(unix)]
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
 
 use crate::ClaudeCodeConnector;
 
+#[cfg(unix)]
 const MAX_FRAME: u64 = 1_048_576;
+#[cfg(unix)]
 const HOOK_TIMEOUT: u64 = 3600;
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct HookCall {
     request_id: String,
     input: HookInput,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct HookInput {
     session_id: String,
@@ -38,6 +48,7 @@ struct HookInput {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Receipt {
     Waiting,
+    #[cfg(unix)]
     Delivered,
     Closed,
 }
@@ -76,6 +87,7 @@ impl NativeApprovals {
             .collect()
     }
 
+    #[cfg(unix)]
     fn open(
         &self,
         call: &HookCall,
@@ -125,6 +137,7 @@ impl NativeApprovals {
         Ok(receiver)
     }
 
+    #[cfg(unix)]
     fn finish(&self, id: &str, delivered: bool) {
         if let Some(entry) = crate::lock(&self.entries).get_mut(&RequestId::new(id)) {
             entry.sender = None;
@@ -171,6 +184,7 @@ impl NativeApprovals {
             loop {
                 let state = *receipt.borrow_and_update();
                 match state {
+                    #[cfg(unix)]
                     Receipt::Delivered => return Ok(()),
                     Receipt::Closed => return Err(closed()),
                     Receipt::Waiting => receipt.changed().await.map_err(|_| closed())?,

@@ -984,6 +984,8 @@ mod tests {
 #[cfg(not(unix))]
 pub(crate) struct PeerInbox;
 #[cfg(not(unix))]
+pub(crate) struct Prepared;
+#[cfg(not(unix))]
 impl PeerInbox {
     pub(crate) fn validate_input(
         &self,
@@ -1006,14 +1008,14 @@ impl PeerInbox {
         &self,
         _: &std::path::Path,
         _: &NativeSession,
-    ) -> Result<(), AgentConnectorError> {
+    ) -> Result<Prepared, AgentConnectorError> {
         Err(AgentConnectorError::unsupported(
             "live Claude input requires Unix",
         ))
     }
     pub(crate) async fn send(
         &self,
-        _: (),
+        _: Prepared,
         _: &std::path::Path,
         _: &AgentSessionId,
         _: &AgentSessionTextInput,
