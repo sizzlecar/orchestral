@@ -830,6 +830,7 @@ impl AgentConnector for CodexConnector {
                         "Compact this session's native context while preserving its history"
                             .to_owned(),
                     input_schema: None,
+                    input_channel: false,
                     execution: AgentSessionActionExecution::Run,
                 },
                 AgentSessionActionDescriptor {
@@ -851,6 +852,7 @@ impl AgentConnector for CodexConnector {
                             "instructions": {"type": "string", "title": "Custom instructions"}
                         }
                     })),
+                    input_channel: false,
                     execution: AgentSessionActionExecution::Run,
                 },
                 AgentSessionActionDescriptor {
@@ -859,6 +861,7 @@ impl AgentConnector for CodexConnector {
                     description: "Create a new session from this session's persisted history"
                         .to_owned(),
                     input_schema: None,
+                    input_channel: false,
                     execution: AgentSessionActionExecution::Immediate,
                 },
                 AgentSessionActionDescriptor {
@@ -871,6 +874,7 @@ impl AgentConnector for CodexConnector {
                         "required": ["name"],
                         "properties": {"name": {"type": "string", "minLength": 1}}
                     })),
+                    input_channel: false,
                     execution: AgentSessionActionExecution::Immediate,
                 },
                 AgentSessionActionDescriptor {
@@ -879,6 +883,7 @@ impl AgentConnector for CodexConnector {
                     description: "Change the sandbox and approval policy used by subsequent turns"
                         .to_owned(),
                     input_schema: Some(permission_settings_schema()),
+                    input_channel: false,
                     execution: AgentSessionActionExecution::Immediate,
                 },
             ],

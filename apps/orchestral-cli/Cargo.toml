@@ -20,6 +20,7 @@ path = "src/main.rs"
 orchestral-core = { workspace = true }
 orchestral-runtime = { workspace = true }
 orchestral-agent-codex = { workspace = true }
+orchestral-agent-claude = { workspace = true }
 orchestral-agent-journal-fs = { workspace = true }
 orchestral-artifact-r2 = { workspace = true }
 orchestral-blob-fs = { workspace = true }

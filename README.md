@@ -185,6 +185,14 @@ orchestral resume --last
 ```
 
 Use `orchestral serve --pair` for browser access.
+The PWA discovers local Codex and Claude Code sessions. Host-owned Claude sessions
+support user input, streaming turns, approvals and cancellation. Existing Claude
+terminals can receive PWA messages and expose history and, with
+`orchestral serve --claude-approvals`, tool approvals. Messages sent to an existing
+terminal retain native peer origin; Claude adds its cross-session explanation.
+They do not confer user approval. See the
+[Claude Code connector](plugins/orchestral-agent-claude/README.md) for setup and
+the supported control boundaries.
 
 ## Configure
 

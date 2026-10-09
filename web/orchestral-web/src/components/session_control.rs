@@ -286,7 +286,7 @@ pub fn SessionActionsPanel() -> Element {
                 }
             }
             div { class: "settings-content session-action-list",
-                for action in connector.actions {
+                for action in connector.actions.into_iter().filter(|action| !action.input_channel) {
                     ActionCard {
                         key: "{action.action_id}",
                         connector_id: connector_id.clone(),

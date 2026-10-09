@@ -3198,7 +3198,10 @@ impl From<AgentDirectoryError> for ApiError {
                         "agent_connector_unavailable",
                         error.to_string(),
                     ),
-                    AgentConnectorErrorCode::Protocol | AgentConnectorErrorCode::OutcomeUnknown => {
+                    AgentConnectorErrorCode::OutcomeUnknown => {
+                        Self::conflict("agent_connector_outcome_unknown", error.to_string())
+                    }
+                    AgentConnectorErrorCode::Protocol => {
                         Self::internal("agent_connector_failed", error.to_string())
                     }
                     _ => Self::internal("agent_connector_failed", error.to_string()),
@@ -3322,6 +3325,17 @@ mod tests {
     use orchestral_runtime::{AgentApprovalBridge, AgentController};
     use tokio::sync::broadcast;
     use tower::ServiceExt;
+
+    #[test]
+    fn uncertain_connector_delivery_is_a_conflict_not_a_retryable_server_failure() {
+        let error = ApiError::from(AgentDirectoryError::Connector(AgentConnectorError::new(
+            orchestral_core::agent_connector::AgentConnectorErrorCode::OutcomeUnknown,
+            "delivery has no correlated receipt",
+            false,
+        )));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "agent_connector_outcome_unknown");
+    }
 
     #[test]
     fn provider_native_request_bodies_do_not_require_run_command_identity() {
@@ -3798,6 +3812,7 @@ mod tests {
                 created_at_unix_ms: Some(1_000),
                 updated_at_unix_ms: Some(2_000),
                 state: AgentSessionState::Idle,
+                input_action: None,
                 execution_profile: Default::default(),
                 extensions: BTreeMap::new(),
             }
@@ -3832,6 +3847,7 @@ mod tests {
                         title: "Fork".to_owned(),
                         description: "Fork a fixture session".to_owned(),
                         input_schema: None,
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
@@ -3839,6 +3855,7 @@ mod tests {
                         title: "Rename".to_owned(),
                         description: "Rename a fixture session".to_owned(),
                         input_schema: Some(serde_json::json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Immediate,
                     },
                     AgentSessionActionDescriptor {
@@ -3846,6 +3863,7 @@ mod tests {
                         title: "Review".to_owned(),
                         description: "Review fixture changes".to_owned(),
                         input_schema: Some(serde_json::json!({"type": "object"})),
+                        input_channel: false,
                         execution: AgentSessionActionExecution::Run,
                     },
                 ],
@@ -3893,6 +3911,7 @@ mod tests {
                     failure: None,
                     activities: (0..60)
                         .map(|index| AgentSessionActivity {
+                            occurred_at_unix_ms: None,
                             activity_id: AgentSessionActivityId::new(format!("activity-{index}")),
                             kind: AgentSessionActivityKind::Command,
                             status: AgentSessionActivityStatus::Completed,
@@ -4922,7 +4941,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()

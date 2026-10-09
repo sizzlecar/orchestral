@@ -3082,6 +3082,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestral-agent-claude"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "libc",
+ "orchestral-core",
+ "orchestral-runtime",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "orchestral-agent-codex"
 version = "0.4.1"
 dependencies = [
@@ -3183,6 +3202,7 @@ dependencies = [
  "include_dir",
  "insta",
  "jsonwebtoken",
+ "orchestral-agent-claude",
  "orchestral-agent-codex",
  "orchestral-agent-journal-fs",
  "orchestral-agent-protocol-testkit",

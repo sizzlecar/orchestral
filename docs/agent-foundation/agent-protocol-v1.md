@@ -22,6 +22,17 @@ AgentRunEnvelope
 
 ## 核心不变量
 
+会话目录中的 `AgentSessionActivity.occurred_at_unix_ms` 是可选的原生事件时间
+（非负 Unix 毫秒）。客户端优先使用这个字段排列原生历史和 Host 控制的 Run；
+活动 ID 始终作为不透明身份处理。旧适配器可以不提供时间字段。
+Claude Code 适配器通过本机历史观察既有会话，将原生跨会话消息作为独立动作，
+并通过 `stream-json` 控制由 Host 启动的进程；发送到已有终端的消息保留 peer 来源，
+不得宣告直接用户输入或审批授权。同一会话保留
+一个执行进程。原生控制细节只在 `plugins/orchestral-agent-claude` 中解释。
+启用原生审批桥后，Claude 的 `PermissionRequest` hook 进入会话级 `PendingRequest`，
+由现有 session request API 返回用户决定。终端先处理会取消 hook 并关闭请求；
+Host 控制的 SDK Run 仍使用自己的 durable request 路径，不产生第二个审批来源。
+
 1. Host 是 `run_seq` 和 durable Journal 的唯一权威；Provider 只能提交无序号 Draft。
 2. `run_id + spec_digest + binding + descriptor_digest` 构成不可变启动身份。
 3. Command 使用 `command_id + digest` 幂等；相同 ID 的不同内容必须拒绝。
@@ -83,3 +94,11 @@ Generic Provider 在 descriptor 的 `extensions["orchestral/input-queue.v1"]` �
 模型请求，`input_tokens` 表示本次输入，`input_tokens_estimated` 区分估算与实报，
 `max_context_tokens` 缺省表示未声明上限。它不代表累计计费量或实时 KV 占用。
 以上扩展沿用 v1 的命令、遥测和摘要规则，不增加未知 core variant。
+
+会话摘要可提供 `input_action`，指向目录中声明了 `input_channel: true`、输入 schema
+和 Immediate 执行方式的动作。标准参数为 `AgentSessionTextInput { submission_id, text }`。
+客户端通过此动作向现有外部进程提交文字，不分配 Host Run，也不声明审批或取消控制权。
+适配器须说明原生输入的来源语义；`input_channel` 只声明输入框的发送动作，
+不赋予客户端原进程的用户身份或审批权限。
+适配器负责持久化发送去重；不确定的结果报告为 `OutcomeUnknown`，客户端不能自动
+换一个身份重发。

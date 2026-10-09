@@ -20,8 +20,8 @@ use crate::model::{
     UploadedArtifact,
 };
 use crate::state::{
-    is_terminal, AgentSessionListState, AgentSessionReconcileCoordinator, AppState, AuthStatus,
-    ConnectorsState, LoadStatus, Notice, SessionsState,
+    contents_text, is_terminal, AgentSessionListState, AgentSessionReconcileCoordinator, AppState,
+    AuthStatus, ConnectorsState, LoadStatus, Notice, SessionsState,
 };
 use crate::tasks::AppTaskScope;
 
@@ -345,7 +345,59 @@ impl AppController {
         };
         let mut delivered = false;
         for entry in entries {
+            let native_session = if let OutboxOperation::SessionInput { submission_id, .. } =
+                &entry.operation
+            {
+                let session = self
+                    .state
+                    .read()
+                    .sessions
+                    .items
+                    .iter()
+                    .find(|session| {
+                        session.id == entry.session_id && session.connector_id == entry.connector_id
+                    })
+                    .cloned();
+                if let Some(session) = &session {
+                    self.state.write().queue_session_input(
+                        session,
+                        submission_id,
+                        entry.input.clone(),
+                        entry.native_anchor_id.clone(),
+                        entry.created_at_unix_ms as f64,
+                    );
+                }
+                session
+            } else {
+                None
+            };
             let result = match &entry.operation {
+                OutboxOperation::SessionInput {
+                    action_id,
+                    submission_id,
+                } => {
+                    let Some(connector_id) = entry.connector_id.as_deref() else {
+                        continue;
+                    };
+                    self.api
+                        .invoke_agent_session_action(
+                            &token,
+                            connector_id,
+                            &entry.session_id,
+                            action_id,
+                            json!({"submission_id":submission_id,"text":entry.input}),
+                            None,
+                        )
+                        .await
+                        .and_then(|outcome| {
+                            serde_json::to_value(outcome).map_err(|error| ApiError {
+                                status: 0,
+                                code: "invalid_action_outcome".to_owned(),
+                                message: error.to_string(),
+                                details: None,
+                            })
+                        })
+                }
                 OutboxOperation::Start { run_id } => match entry.connector_id.as_deref() {
                     Some(connector_id) => {
                         self.api
@@ -392,6 +444,29 @@ impl AppController {
             };
             match result {
                 Ok(response) => {
+                    if let (Some(session), OutboxOperation::SessionInput { submission_id, .. }) =
+                        (&native_session, &entry.operation)
+                    {
+                        self.state.write().settle_session_input(
+                            session,
+                            submission_id,
+                            response
+                                .pointer("/details/delivery_status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("submitted"),
+                        );
+                    }
+                    if matches!(&entry.operation, OutboxOperation::SessionInput { .. }) {
+                        if let Some(content) = response.get("content").and_then(Value::as_array) {
+                            for block in content {
+                                if let Some(text) =
+                                    block.pointer("/body/text").and_then(Value::as_str)
+                                {
+                                    self.notice(text, "info");
+                                }
+                            }
+                        }
+                    }
                     if matches!(&entry.operation, OutboxOperation::Steer { .. }) {
                         if let Err(error) = check_ack(&response, "Outbox 重放") {
                             let _ = storage::delete_outbox(&entry.id).await;
@@ -427,11 +502,43 @@ impl AppController {
                     return false;
                 }
                 Err(error) if error.retryable_submission() => {
+                    if let (Some(session), OutboxOperation::SessionInput { submission_id, .. }) =
+                        (&native_session, &entry.operation)
+                    {
+                        self.state
+                            .write()
+                            .settle_session_input(session, submission_id, "unknown");
+                    }
                     let mut state = self.state.write();
                     state.connection.error = Some("消息已保存，正在确认发送状态".to_owned());
                     return true;
                 }
+                Err(error)
+                    if error.code == "agent_connector_outcome_unknown"
+                        && native_session.is_some() =>
+                {
+                    let _ = storage::delete_outbox(&entry.id).await;
+                    if let (Some(session), OutboxOperation::SessionInput { submission_id, .. }) =
+                        (&native_session, &entry.operation)
+                    {
+                        self.state
+                            .write()
+                            .settle_session_input(session, submission_id, "unknown");
+                    }
+                    self.notice(
+                        "消息状态待确认，会继续核对会话记录；请勿重复发送",
+                        "warning",
+                    );
+                    delivered = true;
+                }
                 Err(error) => {
+                    if let (Some(session), OutboxOperation::SessionInput { submission_id, .. }) =
+                        (&native_session, &entry.operation)
+                    {
+                        self.state
+                            .write()
+                            .reject_session_input(session, submission_id);
+                    }
                     // A definitive HTTP rejection cannot become successful by
                     // replaying the same immutable identity forever. Retain
                     // the user's original composer draft in the immediate
@@ -1366,6 +1473,118 @@ impl AppController {
         };
         let operation_session_key = session.key();
         let native_anchor_id = self.state.read().selected_native_tail_id();
+
+        if let (Some(connector_id), Some(action_id)) = (
+            session.connector_id.as_deref(),
+            session.input_action.as_deref(),
+        ) {
+            if !attachments.is_empty() {
+                self.notice("此会话的原进程输入通道只支持文字", "warning");
+                self.set_busy(false);
+                return false;
+            }
+            let submission_id = match platform::new_uuid() {
+                Ok(id) => id,
+                Err(error) => {
+                    self.notice(&error.message, "error");
+                    self.set_busy(false);
+                    return false;
+                }
+            };
+            let outbox = OutboxEntry {
+                id: format!("session-input:{submission_id}"),
+                connector_id: session.connector_id.clone(),
+                session_id: session.id.clone(),
+                input: input.clone(),
+                attachments: Vec::new(),
+                native_anchor_id,
+                created_at_unix_ms: platform::now() as i64,
+                operation: OutboxOperation::SessionInput {
+                    action_id: action_id.to_owned(),
+                    submission_id: submission_id.clone(),
+                },
+            };
+            if let Err(error) = storage::save_outbox(&outbox).await {
+                self.notice(&format!("发送前无法保存本地 Outbox：{error}"), "error");
+                self.set_busy(false);
+                return false;
+            }
+            self.state.write().queue_session_input(
+                &session,
+                &submission_id,
+                input.clone(),
+                outbox.native_anchor_id.clone(),
+                platform::now(),
+            );
+            self.state.write().ui.timeline_scrolled_away = false;
+            self.follow_timeline_after_render();
+            let result = self
+                .api
+                .invoke_agent_session_action(
+                    &token,
+                    connector_id,
+                    &session.id,
+                    action_id,
+                    json!({"submission_id":submission_id,"text":input}),
+                    None,
+                )
+                .await;
+            let accepted = match result {
+                Ok(outcome) => {
+                    self.state.write().settle_session_input(
+                        &session,
+                        &submission_id,
+                        outcome
+                            .details
+                            .get("delivery_status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("submitted"),
+                    );
+                    if let Err(error) = storage::delete_outbox(&outbox.id).await {
+                        self.notice(&format!("已发送，但清理 Outbox 失败：{error}"), "warning");
+                    }
+                    let message = contents_text(Some(&Value::Array(outcome.content)));
+                    if !message.is_empty() {
+                        self.notice(&message, "info");
+                    }
+                    self.spawn(async move {
+                        self.load_session(operation_session_key).await;
+                    });
+                    true
+                }
+                Err(error) if error.retryable_submission() => {
+                    self.state
+                        .write()
+                        .settle_session_input(&session, &submission_id, "unknown");
+                    self.notice("消息已保存，重连后会确认发送状态", "warning");
+                    true
+                }
+                Err(error) if error.code == "agent_connector_outcome_unknown" => {
+                    let _ = storage::delete_outbox(&outbox.id).await;
+                    self.state
+                        .write()
+                        .settle_session_input(&session, &submission_id, "unknown");
+                    self.notice(
+                        "消息状态待确认，会继续核对会话记录；请勿重复发送",
+                        "warning",
+                    );
+                    true
+                }
+                Err(error) => {
+                    self.state
+                        .write()
+                        .reject_session_input(&session, &submission_id);
+                    let _ = storage::delete_outbox(&outbox.id).await;
+                    self.handle_api_error(error).await;
+                    false
+                }
+            };
+            self.set_busy(false);
+            self.spawn(async move {
+                self.flush_outbox().await;
+            });
+            return accepted;
+        }
 
         let active_run_id = { self.state.read().active_run().map(|run| run.id.clone()) };
         if let Some(run_id) = active_run_id.filter(|_| session.connector_id.is_none()) {
@@ -3045,6 +3264,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: None,
+            input_action: None,
             execution_profile: Default::default(),
         }
     }
@@ -3061,6 +3281,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());
@@ -3174,6 +3395,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: None,
+            input_action: None,
             execution_profile: Default::default(),
         };
         let mut pages = BTreeMap::from([(
@@ -3233,6 +3455,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         };
         let incoming = SessionView {
@@ -3261,6 +3484,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         };
         let incoming_external = SessionView {

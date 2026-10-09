@@ -137,6 +137,7 @@ pub struct StreamedOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolActivity {
     pub id: String,
+    pub occurred_at_unix_ms: Option<i64>,
     pub tool_name: String,
     pub state: String,
     pub evidence: Vec<Value>,
@@ -1026,6 +1027,7 @@ impl RunState {
                     .map(|index| self.activities[index].order)
                     .unwrap_or_else(|| self.next_order());
                 let activity = ToolActivity {
+                    occurred_at_unix_ms: None,
                     id: id.to_owned(),
                     tool_name: payload
                         .get("tool_name")
@@ -1201,6 +1203,89 @@ impl AppState {
             .items
             .iter()
             .find(|session| session.key() == selected)
+    }
+
+    /// Keep native-channel submissions visible before HTTP acceptance and
+    /// reconcile them by client identity, independent of message wording.
+    pub fn queue_session_input(
+        &mut self,
+        session: &SessionView,
+        submission_id: &str,
+        text: String,
+        native_anchor_id: Option<String>,
+        now: f64,
+    ) {
+        let Some(history_id) = session.history_run_id() else {
+            return;
+        };
+        if let Some(current) = self
+            .sessions
+            .items
+            .iter_mut()
+            .find(|item| item.key() == session.key())
+        {
+            if !current.run_ids.contains(&history_id) {
+                current.run_ids.insert(0, history_id.clone());
+            }
+        }
+        let run = self.ensure_run_source(
+            &history_id,
+            Some(session.id.clone()),
+            session.connector_id.clone(),
+        );
+        if run
+            .messages
+            .iter()
+            .any(|message| message.client_id.as_deref() == Some(submission_id))
+        {
+            return;
+        }
+        let order = run.next_order();
+        run.messages.push(Message {
+            id: format!("session-input:{submission_id}"),
+            client_id: Some(submission_id.to_owned()),
+            role: "user".to_owned(),
+            text,
+            order,
+            occurred_at_unix_ms: Some(now as i64),
+            native_anchor_id,
+            optimistic: true,
+            deferred: false,
+            partial: false,
+            steering: false,
+        });
+    }
+
+    pub fn settle_session_input(
+        &mut self,
+        session: &SessionView,
+        submission_id: &str,
+        delivery_status: &str,
+    ) {
+        let Some(run) = session
+            .history_run_id()
+            .and_then(|id| self.runs.get_mut(&id))
+        else {
+            return;
+        };
+        if let Some(message) = run
+            .messages
+            .iter_mut()
+            .find(|message| message.id == format!("session-input:{submission_id}"))
+        {
+            message.optimistic = false;
+            message.deferred = delivery_status != "delivered";
+        }
+    }
+
+    pub fn reject_session_input(&mut self, session: &SessionView, submission_id: &str) {
+        if let Some(run) = session
+            .history_run_id()
+            .and_then(|id| self.runs.get_mut(&id))
+        {
+            run.messages
+                .retain(|message| message.id != format!("session-input:{submission_id}"));
+        }
     }
 
     /// Applies HTTP acceptance for both immediate submission and durable
@@ -1399,6 +1484,7 @@ impl AppState {
             session.preview = detail.summary.preview.clone();
             session.cwd = detail.summary.cwd.clone();
             session.state = Some(detail.summary.state.clone());
+            session.input_action = detail.summary.input_action.clone();
             session.execution_profile = detail.summary.execution_profile.clone();
             if let Some(created_at) = detail.summary.created_at_unix_ms {
                 session.created_at_unix_ms = created_at;
@@ -1969,6 +2055,23 @@ fn project_latest_agent_history(run: &mut RunState, turns: Vec<crate::model::Age
         })
         .collect::<Vec<_>>();
 
+    // The Host may still be claiming this submission when an older snapshot
+    // arrives. Preserve only local native inputs absent from the authoritative
+    // client identities; a native echo or explicit rejection replaces them.
+    let local_inputs = run
+        .messages
+        .iter()
+        .filter(|message| {
+            message.id.starts_with("session-input:")
+                && message
+                    .client_id
+                    .as_ref()
+                    .is_some_and(|id| !incoming_client_ids.contains(id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    incoming.extend(local_inputs.into_iter().map(AgentHistoryItem::Message));
+
     if !run.history_pagination_started {
         // Before the user asks for older pages, the server snapshot is the
         // complete bounded live window. Rebuild it deterministically instead
@@ -2104,8 +2207,10 @@ fn append_agent_history(
 
 fn agent_history_item(activity: crate::model::AgentSessionActivity) -> Option<AgentHistoryItem> {
     let text = contents_text(Some(&Value::Array(activity.content.clone())));
-    let occurred_at_unix_ms =
-        native_activity_timestamp_ms(&activity.activity_id).map(|value| value as i64);
+    let occurred_at_unix_ms = activity
+        .occurred_at_unix_ms
+        .filter(|time| *time >= 0)
+        .or_else(|| native_activity_timestamp_ms(&activity.activity_id).map(|value| value as i64));
     match activity.kind.as_str() {
         "user_message" | "agent_message" if !text.is_empty() => {
             Some(AgentHistoryItem::Message(Message {
@@ -2145,6 +2250,7 @@ fn agent_history_item(activity: crate::model::AgentSessionActivity) -> Option<Ag
             }
             Some(AgentHistoryItem::Activity(ToolActivity {
                 id: activity.activity_id,
+                occurred_at_unix_ms,
                 tool_name: activity.title.unwrap_or_else(|| activity.kind.clone()),
                 state: activity.status,
                 evidence,
@@ -2706,6 +2812,14 @@ fn effective_native_timestamps(items: &[TimelineItem]) -> Vec<Option<f64>> {
 }
 
 fn timeline_item_native_timestamp(item: &TimelineItem) -> Option<f64> {
+    let explicit = match item {
+        TimelineItem::Message(message) => message.occurred_at_unix_ms,
+        TimelineItem::Activity(activity) => activity.occurred_at_unix_ms,
+        _ => None,
+    };
+    if let Some(time) = explicit {
+        return Some(time as f64);
+    }
     let id = timeline_item_native_id(item)?;
     native_activity_timestamp_ms(id).map(|timestamp| timestamp as f64)
 }
@@ -2951,6 +3065,34 @@ mod tests {
         serde_json::json!([{"body": {"kind": "inline", "value": value}}])
     }
 
+    #[test]
+    fn native_history_uses_explicit_times_for_opaque_message_and_tool_ids() {
+        let activity: AgentSessionActivity = serde_json::from_value(serde_json::json!({
+            "activity_id":"opaque-message", "kind":"agent_message", "status":"completed",
+            "occurred_at_unix_ms":1790000000000i64, "content":content("Response")
+        }))
+        .unwrap();
+        let AgentHistoryItem::Message(message) = agent_history_item(activity).unwrap() else {
+            panic!("expected message")
+        };
+        assert_eq!(
+            timeline_item_native_timestamp(&TimelineItem::Message(message)),
+            Some(1790000000000.0)
+        );
+        let activity: AgentSessionActivity = serde_json::from_value(serde_json::json!({
+            "activity_id":"opaque-tool", "kind":"tool_call", "status":"completed",
+            "occurred_at_unix_ms":1790000000500i64, "content":[]
+        }))
+        .unwrap();
+        let AgentHistoryItem::Activity(tool) = agent_history_item(activity).unwrap() else {
+            panic!("expected tool")
+        };
+        assert_eq!(
+            timeline_item_native_timestamp(&TimelineItem::Activity(tool)),
+            Some(1790000000500.0)
+        );
+    }
+
     fn record(sequence: u64, id: &str, payload: Value) -> Value {
         serde_json::json!({
             "event": {
@@ -2988,6 +3130,46 @@ mod tests {
         assert!(coordinator.request(8));
         coordinator.finish(7);
         assert!(!coordinator.request(8));
+    }
+
+    #[test]
+    fn native_input_survives_inflight_snapshots_and_reconciles_by_submission_id() {
+        let mut state = AppState::new(true);
+        let before = agent_detail_at(0, "earlier-message", "earlier task");
+        state.project_agent_session(before.clone());
+        let session = state.sessions.items[0].clone();
+        let history_id = session.history_run_id().unwrap();
+        state.queue_session_input(
+            &session,
+            "submission-1",
+            "same words".to_owned(),
+            Some("earlier-message".to_owned()),
+            500.0,
+        );
+        assert!(state.runs[&history_id].messages.last().unwrap().optimistic);
+        state.project_agent_session(before.clone());
+        assert_eq!(state.runs[&history_id].messages.len(), 2);
+        state.settle_session_input(&session, "submission-1", "submitted");
+        state.project_agent_session(before.clone());
+        let waiting = state.runs[&history_id].messages.last().unwrap();
+        assert!(!waiting.optimistic);
+        assert!(waiting.deferred);
+        let mut accepted = agent_detail_at(0, "native-echo", "same words");
+        accepted.turns[0].activities[0].details = serde_json::json!({"clientId":"submission-1"});
+        state.project_agent_session(accepted);
+        assert_eq!(state.runs[&history_id].messages.len(), 1);
+        assert_eq!(state.runs[&history_id].messages[0].id, "native-echo");
+        assert!(!state.runs[&history_id].messages[0].deferred);
+        state.queue_session_input(
+            &session,
+            "submission-2",
+            "same words".to_owned(),
+            None,
+            600.0,
+        );
+        assert_eq!(state.runs[&history_id].messages.len(), 2);
+        state.reject_session_input(&session, "submission-2");
+        assert_eq!(state.runs[&history_id].messages.len(), 1);
     }
 
     fn agent_detail_at(cursor: u64, activity_id: &str, text: &str) -> AgentSessionDetail {
@@ -3548,6 +3730,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("agent/local\0thread-1".to_owned());
@@ -3579,6 +3762,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("thread-1".to_owned());
@@ -4467,6 +4651,7 @@ mod tests {
             status: "active".to_owned(),
             failure: None,
             activities: vec![AgentSessionActivity {
+                occurred_at_unix_ms: None,
                 activity_id: "native-command-shared".to_owned(),
                 kind: "user_message".to_owned(),
                 status: "completed".to_owned(),
@@ -4815,6 +5000,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("idle".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         });
         let failure = serde_json::json!({
@@ -5194,6 +5380,7 @@ mod tests {
                     turn_id: "turn-1".to_owned(),
                     turn_status: "active".to_owned(),
                     activity: AgentSessionActivity {
+                        occurred_at_unix_ms: None,
                         activity_id: "native-user-c".to_owned(),
                         kind: "user_message".to_owned(),
                         status: "completed".to_owned(),
@@ -5617,6 +5804,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: Some("active".to_owned()),
+            input_action: None,
             execution_profile: Default::default(),
         });
         state.sessions.selected_id = Some("codex/local\0thread-1".to_owned());

@@ -128,7 +128,7 @@ pub fn Workspace() -> Element {
     });
     let has_session_actions = state
         .selected_connector()
-        .is_some_and(|connector| !connector.actions.is_empty());
+        .is_some_and(|connector| connector.actions.iter().any(|action| !action.input_channel));
     let install_available = state.ui.install_available;
     let session_groups = group_sessions(&state);
     let selected_tab = selected
@@ -1180,6 +1180,7 @@ mod tests {
             preview: None,
             cwd: None,
             state: None,
+            input_action: None,
             execution_profile: Default::default(),
         }
     }

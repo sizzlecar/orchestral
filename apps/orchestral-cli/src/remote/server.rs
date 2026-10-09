@@ -45,6 +45,11 @@ pub struct ServeCommand {
     #[arg(long)]
     pair: bool,
 
+    /// Forward native Claude terminal tool permissions to the PWA.
+    /// Installs a PermissionRequest hook in Claude's user settings.
+    #[arg(long)]
+    claude_approvals: bool,
+
     /// Pairing link lifetime.
     #[arg(long, default_value_t = DEFAULT_PAIRING_TTL_SECS)]
     pairing_ttl_secs: u64,
@@ -125,6 +130,7 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         artifact_blob_store.clone(),
         artifact_publisher,
         AgentJournalAccess::SingleWriter,
+        command.claude_approvals,
     )
     .await?;
     let remote_state = RemoteApiState {
@@ -497,6 +503,7 @@ mod tests {
             listen: listen.parse().unwrap(),
             public_url: public_url.map(str::to_owned),
             pair: true,
+            claude_approvals: false,
             pairing_ttl_secs: 300,
             state_file: None,
             allow_insecure_http: false,

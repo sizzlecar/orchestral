@@ -152,6 +152,7 @@ impl AcpConnector {
             created_at_unix_ms: None,
             updated_at_unix_ms: None,
             state: AgentSessionState::Detached,
+            input_action: None,
             execution_profile: Default::default(),
             extensions: BTreeMap::new(),
         };
@@ -418,6 +419,7 @@ impl AgentConnector for AcpConnector {
             created_at_unix_ms: None,
             updated_at_unix_ms: None,
             state: AgentSessionState::Idle,
+            input_action: None,
             execution_profile: Default::default(),
             extensions: BTreeMap::new(),
         };
@@ -523,6 +525,7 @@ fn history_turns(updates: Vec<Value>) -> Result<Vec<AgentSessionTurn>, AgentConn
             .and_then(Value::as_str)
             .map(str::to_owned);
         let activity = AgentSessionActivity {
+            occurred_at_unix_ms: None,
             activity_id: AgentSessionActivityId::new(format!("acp-{stable_id}")),
             kind: activity_kind,
             status: activity_status(&update),

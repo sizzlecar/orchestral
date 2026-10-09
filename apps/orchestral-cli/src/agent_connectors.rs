@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use orchestral_agent_claude::{ClaudeCodeConfig, ClaudeCodeConnector};
 use orchestral_agent_codex::{CodexAppServerConfig, CodexConnector};
 use orchestral_agent_journal_fs::FileAgentJournalStore;
 use orchestral_core::agent_connector::AgentSessionListQuery;
@@ -28,6 +29,7 @@ pub(crate) async fn build_agent_directory(
     artifact_blob_store: Option<Arc<dyn BlobStore>>,
     artifact_publisher: Option<Arc<dyn ArtifactPublisher>>,
     journal_access: AgentJournalAccess,
+    enable_claude_approvals: bool,
 ) -> anyhow::Result<Arc<AgentDirectory>> {
     let directory = Arc::new(AgentDirectory::new());
     let config_root = user_config_root()?;
@@ -98,6 +100,43 @@ pub(crate) async fn build_agent_directory(
             }
         }
     });
+    let claude_root = config_root.join("agent-connectors").join("claude-local");
+    let claude = Arc::new(ClaudeCodeConnector::new(ClaudeCodeConfig {
+        executable: resolve_agent_executable(
+            "claude",
+            std::env::var_os("ORCHESTRAL_CLAUDE_PATH").as_deref(),
+            std::env::var_os("PATH").as_deref(),
+            user_home_dir().as_deref(),
+        ),
+        config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| user_home_dir().map(|home| home.join(".claude")))
+            .unwrap_or_else(|| claude_root.join("native-config")),
+        session_store_dir: claude_root.join("sessions"),
+        request_timeout: std::time::Duration::from_secs(60),
+    }));
+    let claude_journal = Arc::new(
+        match journal_access {
+            AgentJournalAccess::SingleWriter => {
+                FileAgentJournalStore::open_single_writer(claude_root.join("journal"))
+            }
+            AgentJournalAccess::ReadOnly => {
+                FileAgentJournalStore::open_read_only(claude_root.join("journal"))
+            }
+        }
+        .context("open Claude control journal")?,
+    );
+    if enable_claude_approvals {
+        claude
+            .enable_native_approvals(&std::env::current_exe()?)
+            .await
+            .context("enable native Claude PWA approvals")?;
+    }
+    directory
+        .register_with_journal(claude.clone(), claude, claude_journal)
+        .await
+        .context("register Claude Code Agent connector")?;
     Ok(directory)
 }
 
@@ -106,19 +145,32 @@ fn resolve_codex_executable(
     path: Option<&OsStr>,
     home: Option<&Path>,
 ) -> PathBuf {
+    resolve_agent_executable("codex", configured, path, home)
+}
+
+fn resolve_agent_executable(
+    name: &str,
+    configured: Option<&OsStr>,
+    path: Option<&OsStr>,
+    home: Option<&Path>,
+) -> PathBuf {
     if let Some(configured) = configured.filter(|value| !value.is_empty()) {
         return PathBuf::from(configured);
     }
-    let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let executable_name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
     if let Some(candidate) = path.and_then(|path| {
         std::env::split_paths(path)
-            .map(|directory| directory.join(executable_name))
+            .map(|directory| directory.join(&executable_name))
             .find(|candidate| host_executable_file(candidate))
     }) {
         return candidate;
     }
     if let Some(candidate) = home
-        .map(|home| home.join(".local").join("bin").join(executable_name))
+        .map(|home| home.join(".local").join("bin").join(&executable_name))
         .filter(|candidate| host_executable_file(candidate))
     {
         return candidate;

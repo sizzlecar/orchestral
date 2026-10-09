@@ -96,6 +96,11 @@ enum CliCommand {
     Resume(crate::local_sessions::ResumeCommand),
     /// Start the web interface for browser and phone access.
     Serve(crate::remote::ServeCommand),
+    #[command(hide = true)]
+    ClaudePermissionHook {
+        #[arg(long)]
+        socket: PathBuf,
+    },
 }
 
 impl Cli {
@@ -129,6 +134,10 @@ impl Cli {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
+        if let Some(CliCommand::ClaudePermissionHook { socket }) = &self.command {
+            orchestral_agent_claude::run_permission_hook(socket).await;
+            return Ok(());
+        }
         self.validate_reasoning_command()?;
         if let Some(env_file) = &self.env_file {
             load_env_file(env_file)?;
@@ -157,6 +166,9 @@ impl Cli {
             Some(CliCommand::Sessions(command)) => command.run(options.config, options.cwd).await,
             Some(CliCommand::Resume(command)) => command.run(options).await,
             Some(CliCommand::Serve(command)) => crate::remote::serve(command, options).await,
+            Some(CliCommand::ClaudePermissionHook { .. }) => {
+                unreachable!("hook command handled before Host setup")
+            }
             None => crate::agent::run(options).await,
         }
     }
@@ -267,6 +279,7 @@ mod tests {
         assert_eq!(
             Cli::command()
                 .get_subcommands()
+                .filter(|command| !command.is_hide_set())
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
             ["doctor", "mcp", "skills", "sessions", "resume", "serve"]

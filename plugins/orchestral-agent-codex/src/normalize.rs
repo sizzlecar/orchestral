@@ -200,6 +200,7 @@ pub(crate) fn deferred_queue_turn(
         status: AgentSessionTurnStatus::Pending,
         failure: None,
         activities: vec![AgentSessionActivity {
+            occurred_at_unix_ms: None,
             activity_id: AgentSessionActivityId::new(format!("deferred-user-{submission_id}")),
             kind: AgentSessionActivityKind::UserMessage,
             status: AgentSessionActivityStatus::Pending,
@@ -237,6 +238,7 @@ pub(crate) fn session_summary(
         created_at_unix_ms: timestamp_ms(thread.get("createdAt")),
         updated_at_unix_ms: timestamp_ms(thread.get("updatedAt")),
         state: session_state(status),
+        input_action: None,
         execution_profile: Default::default(),
         extensions,
     })
@@ -393,6 +395,7 @@ pub(crate) fn normalize_activity(
         .map(|text| vec![Content::text(truncate_chars(&text, limits.max_text_chars))])
         .unwrap_or_default();
     AgentSessionActivity {
+        occurred_at_unix_ms: None,
         activity_id: AgentSessionActivityId::new(item_id),
         kind,
         status: activity_status(item),
