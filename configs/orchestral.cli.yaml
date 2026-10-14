@@ -10,7 +10,7 @@ agent:
   stream_buffer: 128
   history_limit: 128
   # max_context_tokens: optional Host ceiling; omitted follows model metadata.
-  reserved_output_tokens: 4096
+  # reserved_output_tokens: optional ceiling; omitted follows model output metadata.
   project_instructions:
     enabled: true
     max_bytes: 65536
@@ -63,7 +63,6 @@ providers:
       backend: google
       model: gemini-2.5-flash
       temperature: 0.2
-      max_tokens: 8192
     - name: openrouter-auto
       backend: openrouter
       model: openrouter/auto

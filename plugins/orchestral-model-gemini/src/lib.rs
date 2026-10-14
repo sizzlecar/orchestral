@@ -29,6 +29,7 @@ mod metadata;
 
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const GEMINI_THOUGHT_SIGNATURE_EXTENSION: &str = "google.gemini/thought_signature";
+const GEMINI_FUNCTION_CALL_ID_EXTENSION: &str = "google.gemini/function_call_id";
 
 #[async_trait]
 pub trait GeminiAccessTokenProvider: Send + Sync {
@@ -218,6 +219,7 @@ pub struct GeminiModelBackend {
     metadata_cache: Option<std::path::PathBuf>,
     metadata_discovery: bool,
     background_metadata_refresh: bool,
+    include_thoughts: bool,
     catalog_url: Option<String>,
 }
 
@@ -240,6 +242,7 @@ impl GeminiModelBackend {
             metadata_cache: None,
             metadata_discovery: true,
             background_metadata_refresh: false,
+            include_thoughts: false,
             catalog_url,
         })
     }
@@ -271,6 +274,13 @@ impl GeminiModelBackend {
         self
     }
 
+    /// Request user-visible thought summaries without changing the model's
+    /// thinking effort or budget. Models must support includeThoughts.
+    pub fn with_thought_summaries(mut self, enabled: bool) -> Self {
+        self.include_thoughts = enabled;
+        self
+    }
+
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
         let (system, contents) = encode_messages(&request.messages)?;
         let mut generation = Map::from_iter([
@@ -282,11 +292,18 @@ impl GeminiModelBackend {
                     .unwrap_or(self.config.default_max_output_tokens)),
             ),
         ]);
+        let mut thinking = Map::new();
+        if self.include_thoughts {
+            thinking.insert("includeThoughts".to_owned(), json!(true));
+        }
         if let Some(thinking_level) = self.config.thinking_level {
-            generation.insert(
-                "thinkingConfig".to_owned(),
-                json!({"thinkingLevel": thinking_level.as_wire_value()}),
+            thinking.insert(
+                "thinkingLevel".to_owned(),
+                json!(thinking_level.as_wire_value()),
             );
+        }
+        if !thinking.is_empty() {
+            generation.insert("thinkingConfig".to_owned(), Value::Object(thinking));
         }
         if let Some(schema) = &request.output_schema {
             generation.insert(
@@ -334,13 +351,15 @@ impl ModelTokenMeter for GeminiModelBackend {
                 .thinking_level
                 .map(GeminiThinkingLevel::as_wire_value),
             self.config.default_max_output_tokens,
+            self.include_thoughts,
+            "request-scoped-gemini-call-identity/v1",
             3_u64,
             "observed-prefix-input-delta/v1",
         ))
         .expect("Gemini token meter scalar configuration is serializable");
         ModelTokenMeterDescriptor {
             strategy: "google-gemini/wire-json-upper-bound".to_owned(),
-            version: "2".to_owned(),
+            version: "3".to_owned(),
             accounting: ModelTokenAccounting::ConservativeUpperBound,
             config_digest: Digest::sha256(config),
         }
@@ -419,6 +438,7 @@ impl ModelBackend for GeminiModelBackend {
                     .config
                     .max_context_tokens
                     .or_else(|| metadata.map(|value| value.context_tokens)),
+                max_output_tokens: metadata.and_then(|value| value.output_tokens),
             },
             extensions,
         }
@@ -669,10 +689,16 @@ impl GeminiStreamState {
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
-                    self.emitted_content = true;
-                    self.emit(ModelEvent::TextDelta {
-                        delta: text.to_owned(),
-                    })?;
+                    if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                        self.emit(ModelEvent::ReasoningSummaryDelta {
+                            delta: text.to_owned(),
+                        })?;
+                    } else {
+                        self.emitted_content = true;
+                        self.emit(ModelEvent::TextDelta {
+                            delta: text.to_owned(),
+                        })?;
+                    }
                 }
                 if part.get("functionCall").is_some() {
                     self.emit_function_call(part)?;
@@ -707,11 +733,18 @@ impl GeminiStreamState {
             .filter(|name| !name.is_empty())
             .ok_or_else(|| ModelError::protocol("Gemini functionCall omitted name"))?;
         self.next_call += 1;
-        let id = call
+        let native_id = call
             .get("id")
             .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
+            .filter(|id| !id.is_empty());
+        let id = native_id
+            .map(|id| {
+                format!(
+                    "{}-gemini-native-{}",
+                    self.request_id,
+                    Digest::sha256(id.as_bytes())
+                )
+            })
             .unwrap_or_else(|| {
                 format!(
                     "{}-gemini-call-{}",
@@ -723,7 +756,7 @@ impl GeminiStreamState {
             serde_json::to_string(call.get("args").unwrap_or(&Value::Object(Map::new())))
                 .map_err(|error| ModelError::protocol(error.to_string()))?;
         let call_id = ModelToolCallId::new(id);
-        let extensions = part
+        let mut extensions = part
             .get("thoughtSignature")
             .and_then(Value::as_str)
             .filter(|signature| !signature.is_empty())
@@ -734,6 +767,12 @@ impl GeminiStreamState {
                 )])
             })
             .unwrap_or_default();
+        if let Some(native_id) = native_id {
+            extensions.insert(
+                GEMINI_FUNCTION_CALL_ID_EXTENSION.to_owned(),
+                json!(native_id),
+            );
+        }
         self.emitted_content = true;
         self.emit(ModelEvent::ToolCallStart {
             call_id: call_id.clone(),
@@ -762,7 +801,12 @@ impl GeminiStreamState {
         if self.next_call > 0 && reason == ModelFinishReason::Stop {
             reason = ModelFinishReason::ToolCalls;
         }
-        if !self.emitted_content && reason != ModelFinishReason::ContentFilter {
+        if !self.emitted_content
+            && !matches!(
+                reason,
+                ModelFinishReason::ContentFilter | ModelFinishReason::Length
+            )
+        {
             return Err(empty_generation_error(
                 self.raw_finish_reason.as_deref(),
                 self.last_usage.as_ref(),
@@ -774,13 +818,13 @@ impl GeminiStreamState {
     }
 }
 
-fn gemini_event_stream(
+fn gemini_stream_state(
     request: ModelRequest,
     bytes: HttpByteStream,
     cancellation: CancellationToken,
     max_buffered_events: usize,
-) -> ModelStream {
-    let state = GeminiStreamState {
+) -> GeminiStreamState {
+    GeminiStreamState {
         request_id: request.request_id,
         bytes,
         cancellation,
@@ -797,7 +841,16 @@ fn gemini_event_stream(
         max_buffered_events,
         started: Instant::now(),
         received_bytes: false,
-    };
+    }
+}
+
+fn gemini_event_stream(
+    request: ModelRequest,
+    bytes: HttpByteStream,
+    cancellation: CancellationToken,
+    max_buffered_events: usize,
+) -> ModelStream {
+    let state = gemini_stream_state(request, bytes, cancellation, max_buffered_events);
     stream::unfold(state, |mut state| async move {
         loop {
             if let Some(item) = state.pending.pop_front() {
@@ -858,7 +911,7 @@ fn map_finish_reason(reason: &str) -> ModelFinishReason {
 fn encode_messages(messages: &[ModelMessage]) -> Result<(Vec<String>, Vec<Value>), ModelError> {
     let mut system = Vec::new();
     let mut contents = Vec::new();
-    let mut function_names = HashMap::<String, String>::new();
+    let mut function_names = HashMap::<String, (String, String)>::new();
     for message in messages {
         match message.role {
             ModelRole::System => system.push(flatten_text(&message.content)?),
@@ -880,10 +933,17 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<(Vec<String>, Vec<Value>
                             arguments,
                             extensions,
                         } => {
-                            function_names.insert(call_id.as_str().to_owned(), name.clone());
+                            let native_id = extensions.get(GEMINI_FUNCTION_CALL_ID_EXTENSION)
+                                .map(|value| value.as_str().filter(|id| !id.is_empty()).ok_or_else(||
+                                    ModelError::invalid_request("Gemini function-call identity extension must be a non-empty string")))
+                                .transpose()?.unwrap_or(call_id.as_str());
+                            function_names.insert(
+                                call_id.as_str().to_owned(),
+                                (name.clone(), native_id.to_owned()),
+                            );
                             let mut part = json!({
                                 "functionCall": {
-                                    "id": call_id.as_str(),
+                                    "id": native_id,
                                     "name": name,
                                     "args": arguments,
                                 }
@@ -938,14 +998,15 @@ fn encode_messages(messages: &[ModelMessage]) -> Result<(Vec<String>, Vec<Value>
                             "Tool messages may contain ToolResult blocks only",
                         ));
                     };
-                    let name = function_names.get(call_id.as_str()).ok_or_else(|| {
-                        ModelError::invalid_request(
-                            "Gemini ToolResult has no preceding ToolCall name binding",
-                        )
-                    })?;
+                    let (name, native_id) =
+                        function_names.get(call_id.as_str()).ok_or_else(|| {
+                            ModelError::invalid_request(
+                                "Gemini ToolResult has no preceding ToolCall name binding",
+                            )
+                        })?;
                     parts.push(json!({
                         "functionResponse": {
-                            "id": call_id.as_str(),
+                            "id": native_id,
                             "name": name,
                             "response": {"result": result, "is_error": is_error},
                         }
@@ -1011,138 +1072,15 @@ fn parse_response(
     request: &ModelRequest,
     response: &Value,
 ) -> Result<Vec<ModelStreamEvent>, ModelError> {
-    if let Some(error) = response.get("error") {
-        return Err(ModelError::new(
-            ModelErrorCode::Unavailable,
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Gemini returned an error"),
-        ));
-    }
-    let prompt_blocked = response
-        .pointer("/promptFeedback/blockReason")
-        .and_then(Value::as_str)
-        .is_some_and(|reason| !reason.is_empty());
-    let candidate = response
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first());
-    let Some(candidate) = candidate else {
-        if prompt_blocked {
-            return Ok(sequence_events(
-                request,
-                vec![ModelEvent::Finish {
-                    reason: ModelFinishReason::ContentFilter,
-                }],
-            ));
-        }
-        return Err(ModelError::protocol(
-            "Gemini response contains no candidate",
-        ));
-    };
-    let parts = candidate
-        .pointer("/content/parts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ModelError::protocol("Gemini candidate contains no parts"))?;
-    let mut payloads = Vec::new();
-    let mut tool_count = 0_usize;
-    let mut emitted_content = false;
-    for (index, part) in parts.iter().enumerate() {
-        if let Some(text) = part
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            emitted_content = true;
-            payloads.push(ModelEvent::TextDelta {
-                delta: text.to_owned(),
-            });
-        }
-        if let Some(call) = part.get("functionCall") {
-            emitted_content = true;
-            let name = call
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| ModelError::protocol("Gemini functionCall omitted name"))?;
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    format!("{}-gemini-call-{}", request.request_id.as_str(), index + 1)
-                });
-            let arguments =
-                serde_json::to_string(call.get("args").unwrap_or(&Value::Object(Map::new())))
-                    .map_err(|error| ModelError::protocol(error.to_string()))?;
-            let call_id = ModelToolCallId::new(id);
-            let extensions = part
-                .get("thoughtSignature")
-                .and_then(Value::as_str)
-                .filter(|signature| !signature.is_empty())
-                .map(|signature| {
-                    BTreeMap::from([(
-                        GEMINI_THOUGHT_SIGNATURE_EXTENSION.to_owned(),
-                        Value::String(signature.to_owned()),
-                    )])
-                })
-                .unwrap_or_default();
-            payloads.extend([
-                ModelEvent::ToolCallStart {
-                    call_id: call_id.clone(),
-                    name: name.to_owned(),
-                    extensions,
-                },
-                ModelEvent::ToolCallArgumentsDelta {
-                    call_id: call_id.clone(),
-                    delta: arguments,
-                },
-                ModelEvent::ToolCallEnd { call_id },
-            ]);
-            tool_count += 1;
-        }
-    }
-    let usage = response.get("usageMetadata").map(parse_usage_metadata);
-    if let Some(usage) = usage.as_ref() {
-        payloads.push(ModelEvent::Usage {
-            usage: usage.clone(),
-        });
-    }
-    let raw_finish_reason = candidate.get("finishReason").and_then(Value::as_str);
-    let reason = if tool_count > 0 {
-        ModelFinishReason::ToolCalls
-    } else {
-        raw_finish_reason
-            .map(map_finish_reason)
-            .unwrap_or(ModelFinishReason::Stop)
-    };
-    if !emitted_content && reason != ModelFinishReason::ContentFilter {
-        return Err(empty_generation_error(raw_finish_reason, usage.as_ref()));
-    }
-    payloads.push(ModelEvent::Finish { reason });
-    Ok(sequence_events(request, payloads))
-}
-
-#[cfg(test)]
-fn sequence_events(request: &ModelRequest, payloads: Vec<ModelEvent>) -> Vec<ModelStreamEvent> {
-    payloads
-        .into_iter()
-        .enumerate()
-        .map(|(index, payload)| {
-            let sequence = index as u64 + 1;
-            ModelStreamEvent {
-                request_id: request.request_id.clone(),
-                event_id: ModelEventId::new(format!(
-                    "{}-gemini-{sequence}",
-                    request.request_id.as_str()
-                )),
-                sequence,
-                payload,
-            }
-        })
-        .collect()
+    let mut state = gemini_stream_state(
+        request.clone(),
+        stream::empty().boxed(),
+        CancellationToken::new(),
+        256,
+    );
+    state.handle_frame(response.to_string())?;
+    state.finalize()?;
+    state.pending.into_iter().collect()
 }
 
 fn cancelled_error() -> ModelError {
@@ -1805,6 +1743,116 @@ mod tests {
             encoded[0]["parts"][0]["thoughtSignature"],
             "opaque-signature"
         );
+        assert_eq!(encoded[0]["parts"][0]["functionCall"]["id"], "call-1");
+        assert_eq!(encoded[1]["parts"][0]["functionResponse"]["id"], "call-1");
+    }
+
+    #[test]
+    fn native_call_ids_are_scoped_to_requests_and_stable_on_replay() {
+        let response = json!({"candidates":[{"content":{"parts":[
+            {"functionCall":{"id":"reused-native-id","name":"echo","args":{"value":"first"}}},
+            {"functionCall":{"id":"reused-native-id","name":"echo","args":{"value":"second"}}}
+        ]},"finishReason":"STOP"}]});
+        let ids = |request: &ModelRequest| {
+            parse_response(request, &response)
+                .unwrap()
+                .into_iter()
+                .filter_map(|event| {
+                    if let ModelEvent::ToolCallStart { call_id, .. } = event.payload {
+                        Some(call_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = request();
+        let a = ids(&first);
+        assert_eq!(a, ids(&first), "replay retains execution identity");
+        assert_eq!(
+            a[0], a[1],
+            "duplicate IDs in one response remain detectable"
+        );
+        let mut second = first;
+        second.request_id = ModelRequestId::new("request-2");
+        assert_ne!(
+            a[0],
+            ids(&second)[0],
+            "new model requests own distinct executions"
+        );
+    }
+
+    #[test]
+    fn summaries_do_not_change_default_thinking_effort() {
+        let backend = GeminiModelBackend::new(GeminiModelConfig {
+            backend_id: "summary-fixture".to_owned(),
+            endpoint: "http://localhost".to_owned(),
+            authentication: GeminiAuthentication::ApiKey("fixture".to_owned()),
+            model: "fixture".to_owned(),
+            temperature: 0.0,
+            thinking_level: None,
+            default_max_output_tokens: 128,
+            max_context_tokens: None,
+            timeout: Duration::from_secs(1),
+            max_buffered_events: 16,
+        })
+        .unwrap()
+        .with_thought_summaries(true);
+        let body = backend.build_request_body(&request()).unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_thought_summary_and_length_finish_preserve_usage_without_an_answer() {
+        for summary in [None, Some("Inspecting the interface before editing.")] {
+            let parts = summary
+                .map(|text| vec![json!({"text":text,"thought":true})])
+                .unwrap_or_default();
+            let response = json!({"candidates":[{"content":{"parts":parts},"finishReason":"MAX_TOKENS"}],
+                "usageMetadata":{"promptTokenCount":1500,"thoughtsTokenCount":4096,"candidatesTokenCount":0}});
+            let raw = format!("data: {response}\n\n");
+            let chunks = raw
+                .as_bytes()
+                .chunks(7)
+                .map(|chunk| Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let mut stream = gemini_event_stream(
+                request(),
+                stream::iter(chunks).boxed(),
+                CancellationToken::new(),
+                128,
+            );
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event.unwrap());
+            }
+            for (i, event) in events.iter().enumerate() {
+                event
+                    .validate_for(&request().request_id, i as u64 + 1)
+                    .unwrap();
+            }
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e.payload, ModelEvent::TextDelta { .. })));
+            let summaries = events
+                .iter()
+                .filter_map(|e| match &e.payload {
+                    ModelEvent::ReasoningSummaryDelta { delta } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(summaries, summary.into_iter().collect::<Vec<_>>());
+            assert!(events.iter().any(|e| matches!(&e.payload, ModelEvent::Usage { usage } if usage.input_tokens == Some(1500) && usage.output_tokens == Some(4096))));
+            assert!(matches!(
+                events.last().unwrap().payload,
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Length
+                }
+            ));
+        }
     }
 
     #[test]
@@ -1866,7 +1914,8 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             &event.payload,
             ModelEvent::ToolCallStart { call_id, name, extensions }
-                if call_id.as_str() == "call-1"
+                if call_id.as_str().starts_with("request-1-gemini-native-")
+                    && extensions.get(GEMINI_FUNCTION_CALL_ID_EXTENSION) == Some(&json!("call-1"))
                     && name == "echo"
                     && extensions.get(GEMINI_THOUGHT_SIGNATURE_EXTENSION)
                         == Some(&Value::String("opaque-stream-signature".to_owned()))

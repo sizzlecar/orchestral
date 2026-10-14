@@ -342,7 +342,12 @@ async fn build_agent_host_with_journals(
     agent_config.history_limit = config.agent.history_limit;
     let declared_context_capacity = model_descriptor.capabilities.max_context_tokens;
     agent_config.max_context_tokens = model_context_budget(&config, declared_context_capacity);
-    agent_config.reserved_output_tokens = config.agent.reserved_output_tokens;
+    let (output_budget, output_budget_source) = model_output_budget(
+        &config,
+        profile.as_ref(),
+        model_descriptor.capabilities.max_output_tokens,
+    );
+    agent_config.reserved_output_tokens = output_budget;
     agent_config.minimum_output_reserve_tokens = config.agent.minimum_output_reserve_tokens;
     if let Some(system_prompt) = options
         .system_prompt
@@ -417,11 +422,11 @@ async fn build_agent_host_with_journals(
         context_budget: declared_context_capacity.map(|_| agent_config.max_context_tokens),
         workspaces: std::iter::once(workspaces.primary.clone()).chain(workspaces.additional.clone()).collect(),
         journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&journal_root)?.display().to_string() },
-        context: format!("Declared model/server context limit: {}\nCapacity source: {}\nEffective Host budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
+        context: format!("Declared model/server context limit: {}\nCapacity source: {}\nEffective Host budget: {} tokens\nReserved output: {} tokens ({})\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
             declared_context_capacity.map_or_else(|| "unknown (not reported or configured)".to_owned(), |capacity| format!("{capacity} tokens")),
             model_descriptor.extensions.get("orchestral/context-capacity-source").and_then(serde_json::Value::as_str)
                 .unwrap_or(if declared_context_capacity.is_some() { "backend declaration/configuration" } else { "unknown; Host fallback or explicit budget" }),
-            agent_config.max_context_tokens, config.agent.reserved_output_tokens,
+            agent_config.max_context_tokens, output_budget, output_budget_source,
             if config.agent.compaction.enabled { "automatic" } else { "disabled" },
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
         models: config.providers.models.clone(),
@@ -451,6 +456,7 @@ async fn build_agent_host_with_journals(
     .with_inline_output_limit(model_inline_output_limit(
         &config,
         model_backend.descriptor().capabilities.max_context_tokens,
+        output_budget,
     ));
     let artifact_reader = GuardedArtifactReadExecutor::new_session_scoped(
         artifact_store.clone(),
@@ -727,9 +733,39 @@ fn model_context_budget(config: &OrchestralConfig, declared: Option<u64>) -> u64
     }
 }
 
+fn model_output_budget(
+    config: &OrchestralConfig,
+    profile: Option<&ModelProfile>,
+    declared: Option<u64>,
+) -> (u64, &'static str) {
+    let profile_limit = profile
+        .and_then(|profile| profile.max_tokens)
+        .map(u64::from);
+    let (mut output, mut source) = if let Some(limit) = config.agent.reserved_output_tokens {
+        (limit, "explicit Host ceiling")
+    } else if let Some(limit) = profile_limit {
+        (limit, "explicit model profile")
+    } else if let Some(limit) = declared {
+        (limit, "model metadata")
+    } else {
+        (8192, "unknown model capacity; Host fallback")
+    };
+    for (limit, limit_source) in [
+        (profile_limit, "explicit model profile"),
+        (declared, "model metadata"),
+    ] {
+        if let Some(limit) = limit.filter(|limit| *limit < output) {
+            output = limit;
+            source = limit_source;
+        }
+    }
+    (output, source)
+}
+
 fn model_inline_output_limit(
     config: &OrchestralConfig,
     backend_context_tokens: Option<u64>,
+    reserved_output_tokens: u64,
 ) -> std::num::NonZeroU64 {
     if let Some(limit) = config.tools.max_inline_output_bytes {
         return limit;
@@ -738,7 +774,7 @@ fn model_inline_output_limit(
     // A per-result allowance, not a tokenizer estimate or a guarantee for an
     // entire conversation. Leave room for the request, history and other tools.
     let bytes = context
-        .saturating_sub(config.agent.reserved_output_tokens)
+        .saturating_sub(reserved_output_tokens)
         .div_ceil(4)
         .max(1);
     std::num::NonZeroU64::new(bytes).expect("inline output allowance is positive")
@@ -1627,6 +1663,10 @@ async fn resolve_model(
         .clone()
         .or_else(|| profile.as_ref().map(|profile| profile.model.clone()));
     let (backend, model) = crate::openai_connection::resolve_model(backend, model).await?;
+    // A direct backend/model selection must not inherit another model's
+    // output ceiling, temperature policy, or system prompt.
+    let profile =
+        profile.filter(|profile| profile.backend == backend.name && profile.model == model);
     let candidate = config
         .agent
         .temperature
@@ -1723,6 +1763,7 @@ pub(crate) fn build_model_backend(
                 max_buffered_events,
             })
             .context("build Gemini ModelBackend")?
+            .with_thought_summaries(backend.get_config("include_thoughts").unwrap_or(true))
             .with_background_metadata_refresh()
             .with_metadata_discovery(
                 backend.get_config("discover_model_capabilities").unwrap_or(true),

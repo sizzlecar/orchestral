@@ -15,7 +15,7 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedMetadata {
     pub context_tokens: u64,
-    output_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub source: String,
 }
 
@@ -285,6 +285,7 @@ pub(super) async fn local_snapshot_and_refresh(
             metadata_cache: backend.metadata_cache.clone(),
             metadata_discovery: true,
             background_metadata_refresh: false,
+            include_thoughts: backend.include_thoughts,
             catalog_url: backend.catalog_url.clone(),
         };
         tokio::spawn(async move {

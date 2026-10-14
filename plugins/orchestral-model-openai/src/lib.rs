@@ -350,6 +350,7 @@ impl ModelBackend for OpenAiCompatibleBackend {
                 parallel_tool_calls: true,
                 structured_output: self.config.structured_output,
                 max_context_tokens: self.config.max_context_tokens,
+                max_output_tokens: None,
             },
             extensions,
         }

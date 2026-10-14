@@ -3112,3 +3112,24 @@ svg {
 .send-button { width: auto; min-width: 56px; padding: 0 10px; }
 .composer-hint { font-size: 11px; line-height: 1.5; justify-content: center; }
 .message__meta { font-size: 11px; }
+
+.reasoning-summary .activity-item__summary {
+  grid-template-columns: auto minmax(0, 1fr) 18px;
+}
+
+.reasoning-summary .activity-item__summary::after {
+  grid-column: 3;
+}
+
+.reasoning-summary .activity-item__status {
+  grid-column: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none;
+}
+
+.reasoning-summary > .message__content {
+  padding: 0 11px 11px;
+  color: var(--muted);
+}

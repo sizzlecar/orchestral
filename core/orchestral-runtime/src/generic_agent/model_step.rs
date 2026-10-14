@@ -395,6 +395,29 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             }
             expected_sequence += 1;
             match event.payload {
+                ModelEvent::ReasoningSummaryDelta { delta } => {
+                    publish_telemetry(
+                        &inner,
+                        &run_id,
+                        AgentTelemetryEnvelope {
+                            telemetry_id: TelemetryId::new(format!(
+                                "generic-{}-round-{round}-summary-{}",
+                                run_id.as_str(),
+                                event.sequence
+                            )),
+                            run_id: run_id.clone(),
+                            provider_seq: Some(event.sequence),
+                            payload: orchestral_core::agent_protocol::wire::ReasoningSummaryDelta {
+                                summary_id: OutputId::new(format!(
+                                    "generic-{}-round-{round}-summary",
+                                    run_id.as_str()
+                                )),
+                                delta,
+                            }
+                            .into_telemetry(),
+                        },
+                    );
+                }
                 ModelEvent::TextDelta { delta } => {
                     response.push_str(&delta);
                     publish_telemetry(

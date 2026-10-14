@@ -473,6 +473,28 @@ fn push_entry_lines(
         TranscriptRole::Assistant => {
             push_markdown(lines, "• ", &entry.text, ASSISTANT, false, width)
         }
+        TranscriptRole::Reasoning => {
+            lines.push(Line::styled(
+                if expanded {
+                    "○ Thinking summary · ctrl+o collapse"
+                } else {
+                    "○ Thinking summary · ctrl+o expand"
+                },
+                MUTED,
+            ));
+            let mut content = Vec::new();
+            push_markdown(&mut content, "  ", &entry.text, MUTED, false, width);
+            if expanded {
+                lines.extend(content);
+            } else {
+                let rows = viewport::wrap("reasoning-preview", content, width as usize);
+                lines.extend(
+                    rows.iter()
+                        .skip(rows.len().saturating_sub(3))
+                        .map(|row| row.text.clone()),
+                );
+            }
+        }
         TranscriptRole::System => push_plain(lines, "○ ", &entry.text, MUTED),
         TranscriptRole::Error => push_plain(lines, "■ ", &entry.text, ERROR),
         TranscriptRole::Tool => {
@@ -1555,6 +1577,44 @@ mod tests {
             ],
             diff_omitted: 0,
         }]
+    }
+
+    #[test]
+    fn reasoning_summary_streams_deduplicates_and_expands_without_changing_the_answer() {
+        let mut state = UiState::new("session", "model");
+        let summary = || UiMsg::ReasoningSummaryDelta {
+            delta_id: "delta-1".into(),
+            summary_id: "summary-1".into(),
+            text: "Earlier summary detail.\nSecond detail.\nThird detail.\nLatest visible detail."
+                .into(),
+        };
+        update(&mut state, summary());
+        update(&mut state, summary());
+        update(
+            &mut state,
+            UiMsg::ReasoningSummaryDelta {
+                delta_id: "delta-2".into(),
+                summary_id: "summary-1".into(),
+                text: " Ready.".into(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::OutputCommitted {
+                output_id: "answer".into(),
+                text: "Final answer.".into(),
+            },
+        );
+        assert_eq!(state.transcript.len(), 2);
+        let collapsed = render_to_string(&state, 100, 24);
+        assert!(collapsed.contains("Thinking summary"));
+        assert!(collapsed.contains("Latest visible detail. Ready."));
+        assert!(!collapsed.contains("Earlier summary detail."));
+        state.tools_expanded = true;
+        let expanded = render_to_string(&state, 100, 24);
+        assert!(expanded.contains("Earlier summary detail."));
+        assert!(expanded.contains("Final answer."));
+        assert_eq!(state.transcript[1].text, "Final answer.");
     }
 
     #[test]

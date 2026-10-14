@@ -45,6 +45,7 @@ impl ModelBackend for ScriptedModelBackend {
         ModelDescriptor {
             backend_id: "scripted-conformance-model".to_owned(),
             capabilities: ModelCapabilities {
+                max_output_tokens: None,
                 streaming: true,
                 tool_calls: true,
                 parallel_tool_calls: false,

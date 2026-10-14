@@ -60,6 +60,10 @@ pub struct ModelCapabilities {
     pub structured_output: bool,
     #[serde(default)]
     pub max_context_tokens: Option<u64>,
+    /// Provider-declared per-request output ceiling, including reasoning when
+    /// the provider charges it against the same budget. None means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +164,7 @@ impl ModelDescriptor {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.backend_id.trim().is_empty()
             || self.capabilities.max_context_tokens == Some(0)
+            || self.capabilities.max_output_tokens == Some(0)
             || (self.capabilities.parallel_tool_calls && !self.capabilities.tool_calls)
         {
             return Err(ModelError::invalid_request(
@@ -392,6 +397,11 @@ impl ModelStreamEvent {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ModelEvent {
+    /// Provider-supplied, user-visible reasoning summary. Display telemetry
+    /// only: never Assistant response content or opaque continuation state.
+    ReasoningSummaryDelta {
+        delta: String,
+    },
     TextDelta {
         delta: String,
     },
@@ -427,7 +437,9 @@ pub enum ModelEvent {
 impl ModelEvent {
     pub fn validate(&self) -> Result<(), ModelError> {
         match self {
-            Self::TextDelta { delta } if delta.is_empty() => {
+            Self::TextDelta { delta } | Self::ReasoningSummaryDelta { delta }
+                if delta.is_empty() =>
+            {
                 Err(ModelError::protocol("text delta must not be empty"))
             }
             Self::Continuation { namespace, .. } if namespace.trim().is_empty() => Err(
@@ -637,6 +649,25 @@ mod tests {
             request.validate().expect_err("invalid namespace").code,
             ModelErrorCode::InvalidRequest
         );
+    }
+
+    #[test]
+    fn output_capacity_is_optional_and_reasoning_is_a_distinct_validated_event() {
+        let capabilities: ModelCapabilities =
+            serde_json::from_value(serde_json::json!({"streaming":true,"tool_calls":false,"parallel_tool_calls":false,"structured_output":false})).unwrap();
+        assert_eq!(capabilities.max_output_tokens, None);
+        let event = ModelEvent::ReasoningSummaryDelta {
+            delta: "Reviewing the interface.".into(),
+        };
+        let restored: ModelEvent =
+            serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(restored, event);
+        assert!(event.validate().is_ok());
+        assert!(ModelEvent::ReasoningSummaryDelta {
+            delta: String::new()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

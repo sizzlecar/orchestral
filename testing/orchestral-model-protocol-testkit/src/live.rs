@@ -65,7 +65,7 @@ pub async fn run_live_text_smoke(
         match event.payload {
             ModelEvent::TextDelta { delta } => text.push_str(&delta),
             // Opaque native continuation is not part of the public answer.
-            ModelEvent::Continuation { .. } => {}
+            ModelEvent::Continuation { .. } | ModelEvent::ReasoningSummaryDelta { .. } => {}
             ModelEvent::Usage { usage: observed } => usage = Some(observed),
             ModelEvent::Finish { reason } => finish_reason = Some(reason),
             ModelEvent::ToolCallStart { .. }

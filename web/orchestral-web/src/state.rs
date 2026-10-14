@@ -976,6 +976,49 @@ impl RunState {
         }
 
         match kind {
+            "extension"
+                if payload.get("namespace").and_then(Value::as_str)
+                    == Some("orchestral/reasoning-summary.v1") =>
+            {
+                let payload = &payload["value"];
+                let Some(summary_id) = payload
+                    .get("summary_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                else {
+                    return;
+                };
+                let Some(delta) = payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                else {
+                    return;
+                };
+                let id = format!("reasoning:{summary_id}");
+                if let Some(message) = self
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == id && message.role == "reasoning")
+                {
+                    message.text.push_str(delta);
+                } else {
+                    let order = self.next_order();
+                    self.messages.push(Message {
+                        id,
+                        client_id: None,
+                        role: "reasoning".to_owned(),
+                        text: delta.to_owned(),
+                        order,
+                        occurred_at_unix_ms: None,
+                        native_anchor_id: None,
+                        optimistic: false,
+                        deferred: false,
+                        partial: false,
+                        steering: false,
+                    });
+                }
+            }
             "output_delta" => {
                 let output_id = payload
                     .get("output_id")
@@ -3361,6 +3404,30 @@ mod tests {
             blocks[2],
             TimelineBlock::Entry(TimelineItem::Message(_))
         ));
+    }
+
+    #[test]
+    fn reasoning_summaries_deduplicate_and_stay_separate_from_committed_answers() {
+        let mut run = RunState::new("run-1", None);
+        let summary = serde_json::json!({"telemetry_id":"summary-delta-1", "payload":{
+            "type":"extension","namespace":"orchestral/reasoning-summary.v1","value":{"summary_id":"summary-1","delta":"Checking the API."}
+        }});
+        run.project_telemetry(&summary);
+        run.project_telemetry(&summary);
+        run.project_telemetry(
+            &serde_json::json!({"telemetry_id":"summary-delta-2", "payload":{
+                "type":"extension","namespace":"orchestral/reasoning-summary.v1","value":{"summary_id":"summary-1","delta":" Ready to edit."}
+            }}),
+        );
+        run.project_durable(&record(1, "output", serde_json::json!({"type":"output_committed","output_id":"answer", "content":content("Updated the interface.")})), 1.0);
+        assert_eq!(run.messages.len(), 2);
+        assert_eq!(run.messages[0].role, "reasoning");
+        assert_eq!(run.messages[0].text, "Checking the API. Ready to edit.");
+        assert_eq!(run.messages[1].role, "assistant");
+        assert_eq!(run.messages[1].text, "Updated the interface.");
+        assert!(
+            matches!(&timeline_for_run(&run)[0], TimelineItem::Message(m) if m.role == "reasoning")
+        );
     }
 
     #[test]
