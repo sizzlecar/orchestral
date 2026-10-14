@@ -49,6 +49,25 @@ Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重�
 - 该 checkpoint 只记录调度事实，不授权进程重启后重发请求。恢复仍将未闭合模型尝试
   收束为 `RunIncomplete(Interrupted)`；重试策略和项目指令快照均进入恢复配置摘要。
 
+## 模型容量发现与 Host 预算
+
+`ModelBackend::resolve_descriptor()` 是可选的异步启动阶段：静态适配器直接返回
+`descriptor()`；远端适配器发现元数据后，在该 Backend 生命周期内固定 descriptor，
+再构建 Agent 和恢复配置 digest。推理请求不反复刷新模型能力。
+
+CLI 的 `agent.max_context_tokens` 是可选 Host 上限。省略时采用模型声明容量；显式
+设置时取 Host 与模型上限的较小值。两者均未知时仍采用 128K Host 回退预算，并明确
+显示模型容量未知，不能将回退预算报告为模型原生容量。
+
+Gemini 优先查询原生模型信息。公开 Google/Vertex endpoint 未返回 token 上限时，
+可从 `models.dev` 按 Provider 和完整模型 ID 精确查询。自定义网关默认不套用公开目录。
+缓存位于 Host 配置目录的 `cache/model-metadata`，有效期 5 分钟；刷新失败可沿用既有
+元数据。目录请求不携带 Google 凭证。`discover_model_capabilities: false` 或显式
+backend `max_context_tokens` 可避免自动发现。诊断上下文显示容量来源。
+
+Gemini 规划计数使用字节估算与运行时的实测 input usage 前缀校准；请求前缀、模型配置
+或工具定义改变时放弃该校准。保守 JSON 字节上界继续用于严格 input/cost 预算。
+
 ## 上下文容量拒绝的恢复
 
 `ModelErrorCode::ContextLengthExceeded` 表示后端在生成之前明确拒绝了输入与输出的容量

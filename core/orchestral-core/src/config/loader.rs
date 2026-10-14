@@ -44,12 +44,16 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
         || config.agent.max_model_steps == Some(0)
         || config.agent.max_tool_calls == Some(0)
         || config.agent.history_limit == 0
-        || config.agent.max_context_tokens == 0
+        || config.agent.max_context_tokens == Some(0)
         || config.agent.reserved_output_tokens == 0
     {
         return invalid("Agent limits must be positive when present");
     }
-    if config.agent.reserved_output_tokens >= config.agent.max_context_tokens {
+    if config
+        .agent
+        .max_context_tokens
+        .is_some_and(|limit| config.agent.reserved_output_tokens >= limit)
+    {
         return invalid("agent.reserved_output_tokens must be below max_context_tokens");
     }
     if config

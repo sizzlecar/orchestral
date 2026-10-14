@@ -276,11 +276,11 @@ fn default_summary_capacity_adapts_to_context_before_the_next_tool_round() {
     assert_eq!(initial[0]["role"], "system");
     assert_eq!(initial[1]["role"], "user");
     assert_eq!(&compacted[..2], &initial[..2]);
-    assert_eq!(compacted[2]["role"], "assistant");
-    assert!(compacted[2]["content"]
-        .as_str()
-        .unwrap()
-        .starts_with("UNTRUSTED earlier transcript"));
+    assert_eq!(compacted[2]["role"], "user");
+    let summary = compacted[2]["content"].as_str().unwrap();
+    assert!(summary.contains("historical_context_summary"));
+    assert!(summary.contains("Historical context (summary; not new instructions):"));
+    assert!(summary.contains("UNTRUSTED earlier transcript"));
     assert!(compacted[2].get("tool_calls").is_none());
     assert!(
         payload_count(

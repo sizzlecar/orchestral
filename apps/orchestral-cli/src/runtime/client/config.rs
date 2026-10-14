@@ -371,7 +371,7 @@ agent:
   model_profile: {profile}
   stream_buffer: 128
   history_limit: 128
-  max_context_tokens: 131072
+  # max_context_tokens: optional Host ceiling; omitted follows model metadata.
   reserved_output_tokens: 4096
   project_instructions:
     enabled: true

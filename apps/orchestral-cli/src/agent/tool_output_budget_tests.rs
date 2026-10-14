@@ -1,9 +1,21 @@
 use super::*;
 
 #[test]
+fn omitted_host_ceiling_follows_model_capacity_and_explicit_ceilings_still_apply() {
+    let mut config = OrchestralConfig::default();
+    assert_eq!(config.agent.max_context_tokens, None);
+    assert_eq!(model_context_budget(&config, Some(1_048_576)), 1_048_576);
+    assert_eq!(model_context_budget(&config, Some(32_768)), 32_768);
+    config.agent.max_context_tokens = Some(65_536);
+    assert_eq!(model_context_budget(&config, Some(1_048_576)), 65_536);
+    assert_eq!(model_context_budget(&config, Some(32_768)), 32_768);
+    assert_eq!(model_context_budget(&config, None), 65_536);
+}
+
+#[test]
 fn inline_budget_uses_the_declared_model_window_and_output_reserve() {
     let mut config = OrchestralConfig::default();
-    config.agent.max_context_tokens = 12_288;
+    config.agent.max_context_tokens = Some(12_288);
     config.agent.reserved_output_tokens = 4_096;
     assert_eq!(model_inline_output_limit(&config, None).get(), 2_048);
     assert_eq!(model_inline_output_limit(&config, Some(8_192)).get(), 1_024);

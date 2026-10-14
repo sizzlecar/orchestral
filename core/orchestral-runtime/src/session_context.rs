@@ -2519,13 +2519,7 @@ mod tests {
         let summary = projected
             .messages
             .iter()
-            .filter(|message| {
-                message.role == ModelRole::Assistant
-                    && message
-                        .content
-                        .iter()
-                        .all(|content| matches!(content, ModelContent::Text { .. }))
-            })
+            .filter(|message| placement::is_summary_context(message))
             .flat_map(|message| &message.content)
             .find_map(|content| match content {
                 ModelContent::Text { text } => Some(text),
@@ -2695,13 +2689,7 @@ mod tests {
         let summaries = after
             .messages
             .iter()
-            .filter(|message| {
-                message.role == ModelRole::Assistant
-                    && message
-                        .content
-                        .iter()
-                        .all(|content| matches!(content, ModelContent::Text { .. }))
-            })
+            .filter(|message| placement::is_summary_context(message))
             .collect::<Vec<_>>();
         assert!(!summaries.is_empty());
         let summary = serde_json::to_string(&summaries).unwrap();

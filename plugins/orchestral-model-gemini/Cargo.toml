@@ -19,4 +19,5 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+axum = "0.8"
 orchestral-model-protocol-testkit = { workspace = true }

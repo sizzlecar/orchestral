@@ -199,8 +199,14 @@ async fn merging_shadowed_ranges_preserves_the_position_of_a_later_user_correcti
         .iter()
         .position(|message| *message == user)
         .unwrap();
-    assert_eq!(projection.messages[at - 1], earlier.unwrap());
-    assert_eq!(projection.messages[at + 1], later.unwrap());
+    assert_eq!(
+        projection.messages[at - 1],
+        placement::project_summary(&earlier.unwrap())
+    );
+    assert_eq!(
+        projection.messages[at + 1],
+        placement::project_summary(&later.unwrap())
+    );
     assert_eq!(
         projection
             .messages

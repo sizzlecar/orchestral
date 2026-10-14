@@ -16,14 +16,16 @@ use google_cloud_auth::credentials::service_account::{
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as GoogleCredentialsBuilder};
 use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
-    ModelBackend, ModelCapabilities, ModelContent, ModelDescriptor, ModelError, ModelErrorCode,
-    ModelEvent, ModelEventId, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestId,
-    ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter,
-    ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
+    ModelBackend, ModelCapabilities, ModelContent, ModelContextEstimate, ModelDescriptor,
+    ModelError, ModelErrorCode, ModelEvent, ModelEventId, ModelFinishReason, ModelMessage,
+    ModelRequest, ModelRequestId, ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting,
+    ModelTokenMeter, ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
+
+mod metadata;
 
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const GEMINI_THOUGHT_SIGNATURE_EXTENSION: &str = "google.gemini/thought_signature";
@@ -212,6 +214,10 @@ impl GeminiModelConfig {
 pub struct GeminiModelBackend {
     client: Client,
     config: GeminiModelConfig,
+    metadata: tokio::sync::OnceCell<Option<metadata::ResolvedMetadata>>,
+    metadata_cache: Option<std::path::PathBuf>,
+    metadata_discovery: bool,
+    catalog_url: Option<String>,
 }
 
 impl GeminiModelBackend {
@@ -222,7 +228,37 @@ impl GeminiModelBackend {
             .read_timeout(config.timeout)
             .build()
             .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
-        Ok(Self { client, config })
+        // Custom gateways own their model identities. Do not infer their
+        // capacities from a public provider's catalog.
+        let catalog_url = metadata::public_google_endpoint(&config.endpoint)
+            .then(|| "https://models.dev/api.json".to_owned());
+        Ok(Self {
+            client,
+            config,
+            metadata: tokio::sync::OnceCell::new(),
+            metadata_cache: None,
+            metadata_discovery: true,
+            catalog_url,
+        })
+    }
+
+    /// Persist public capacity metadata between processes. No credentials or
+    /// prompts are stored or sent to the model catalog.
+    pub fn with_metadata_cache(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.metadata_cache = Some(directory.into());
+        self
+    }
+
+    /// Disable optional model metadata requests, retaining explicit capacity.
+    pub fn with_metadata_discovery(mut self, enabled: bool) -> Self {
+        self.metadata_discovery = enabled;
+        self
+    }
+
+    /// Select an optional model catalog used when native metadata lacks limits.
+    pub fn with_model_catalog(mut self, url: Option<String>) -> Self {
+        self.catalog_url = url;
+        self
     }
 
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
@@ -276,6 +312,10 @@ impl GeminiModelBackend {
 }
 
 impl ModelTokenMeter for GeminiModelBackend {
+    fn supports_observed_prefix_estimation(&self) -> bool {
+        true
+    }
+
     fn meter_descriptor(&self) -> ModelTokenMeterDescriptor {
         let config = serde_json::to_vec(&(
             &self.config.model,
@@ -284,11 +324,13 @@ impl ModelTokenMeter for GeminiModelBackend {
                 .thinking_level
                 .map(GeminiThinkingLevel::as_wire_value),
             self.config.default_max_output_tokens,
+            3_u64,
+            "observed-prefix-input-delta/v1",
         ))
         .expect("Gemini token meter scalar configuration is serializable");
         ModelTokenMeterDescriptor {
             strategy: "google-gemini/wire-json-upper-bound".to_owned(),
-            version: "1".to_owned(),
+            version: "2".to_owned(),
             accounting: ModelTokenAccounting::ConservativeUpperBound,
             config_digest: Digest::sha256(config),
         }
@@ -316,11 +358,46 @@ impl ModelTokenMeter for GeminiModelBackend {
             .saturating_add((messages.len() as u64).saturating_mul(16))
             .saturating_add((tools.len() as u64).saturating_mul(32)))
     }
+
+    fn estimate_context_input(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<ModelContextEstimate, ModelError> {
+        let framing = 64_u64
+            .saturating_add((messages.len() as u64).saturating_mul(16))
+            .saturating_add((tools.len() as u64).saturating_mul(32));
+        // Planning only: subsequent requests are calibrated against observed
+        // provider input usage by the runtime's verified-prefix meter. Keep the
+        // byte upper bound unchanged for hard resource/cost reservations.
+        let bytes = self
+            .count_request_input(messages, tools)?
+            .saturating_sub(framing);
+        Ok(ModelContextEstimate {
+            tokens: bytes.div_ceil(3).saturating_add(framing),
+            accounting: ModelTokenAccounting::Estimated,
+        })
+    }
 }
 
 #[async_trait]
 impl ModelBackend for GeminiModelBackend {
     fn descriptor(&self) -> ModelDescriptor {
+        let metadata = self.metadata.get().and_then(Option::as_ref);
+        let mut extensions = BTreeMap::from([(
+            "google-gemini/model".to_owned(),
+            Value::String(self.config.model.clone()),
+        )]);
+        if let Some(metadata) = metadata {
+            extensions.insert(
+                "google-gemini/model_metadata".to_owned(),
+                metadata.description(),
+            );
+            extensions.insert(
+                "orchestral/context-capacity-source".to_owned(),
+                Value::String(metadata.source.clone()),
+            );
+        }
         ModelDescriptor {
             backend_id: self.config.backend_id.clone(),
             capabilities: ModelCapabilities {
@@ -328,13 +405,22 @@ impl ModelBackend for GeminiModelBackend {
                 tool_calls: true,
                 parallel_tool_calls: true,
                 structured_output: true,
-                max_context_tokens: self.config.max_context_tokens,
+                max_context_tokens: self
+                    .config
+                    .max_context_tokens
+                    .or_else(|| metadata.map(|value| value.context_tokens)),
             },
-            extensions: BTreeMap::from([(
-                "google-gemini/model".to_owned(),
-                Value::String(self.config.model.clone()),
-            )]),
+            extensions,
         }
+    }
+
+    async fn resolve_descriptor(&self) -> Result<ModelDescriptor, ModelError> {
+        if self.metadata_discovery && self.config.max_context_tokens.is_none() {
+            self.metadata.get_or_init(|| metadata::discover(self)).await;
+        }
+        let descriptor = self.descriptor();
+        descriptor.validate()?;
+        Ok(descriptor)
     }
 
     async fn start(
@@ -1270,6 +1356,18 @@ mod tests {
         .unwrap();
         let descriptor = backend.meter_descriptor();
         descriptor.validate().unwrap();
+        assert!(backend.supports_observed_prefix_estimation());
+        let planning_request = request();
+        let planning = backend
+            .estimate_context_input(&planning_request.messages, &planning_request.tools)
+            .unwrap();
+        assert_eq!(planning.accounting, ModelTokenAccounting::Estimated);
+        assert!(
+            planning.tokens
+                < backend
+                    .count_request_input(&planning_request.messages, &planning_request.tools)
+                    .unwrap()
+        );
         assert_eq!(
             descriptor.accounting,
             ModelTokenAccounting::ConservativeUpperBound

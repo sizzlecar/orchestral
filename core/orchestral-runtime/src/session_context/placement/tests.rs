@@ -116,7 +116,9 @@ impl Fixture {
 fn saved_summary(record: &AgentSessionRecord) -> ModelMessage {
     match &record.payload {
         AgentSessionEvent::CompactionCommitted { summary, .. }
-        | AgentSessionEvent::ActiveRunCompactionCommitted { summary, .. } => summary.clone(),
+        | AgentSessionEvent::ActiveRunCompactionCommitted { summary, .. } => {
+            project_summary(summary)
+        }
         _ => panic!("expected a durable summary"),
     }
 }
@@ -273,7 +275,7 @@ async fn assistant_summary_and_repeated_compaction_keep_the_original_history_pos
         .await
         .unwrap();
     let mut expected = before.messages[..2].to_vec();
-    assert_eq!(saved_summary(&first).role, ModelRole::Assistant);
+    assert_eq!(saved_summary(&first).role, ModelRole::User);
     expected.push(saved_summary(&first));
     expected.extend_from_slice(&before.messages[6..]);
     assert_eq!(projected.messages, expected);
