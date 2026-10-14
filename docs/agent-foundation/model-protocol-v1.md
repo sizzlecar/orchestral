@@ -11,7 +11,7 @@ Model Protocol 是一次模型请求的最小边界。`ModelBackend` 不拥有 A
 ModelDescriptor
   + ModelRequest(messages, tools, output limit, cancellation)
   → ModelStreamEvent(sequence)
-      TextDelta | ToolCall* | Usage | Finish
+      TextDelta | ReasoningSummaryDelta | ToolCall* | Usage | Finish
 ```
 
 核心类型位于 `orchestral_core::model_protocol`：
@@ -39,7 +39,7 @@ Host 可通过 `agent.model_retry` 配置有限退避，默认最多重试 3 次
 Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重试次数或 Run 状态。
 
 - 仅 `retryable = true` 的 `RateLimited` / `Unavailable` 可以重试；首次事件之前的空流
-  按临时不可用处理。文字、ToolCallStart 或 Finish 会关闭自动重试窗口。只报告 Usage
+  按临时不可用处理。文字、思考摘要、ToolCallStart 或 Finish 会关闭自动重试窗口。只报告 Usage
   的失败尝试可以重试，最后一份用量快照持久化并计入 Run 一次。
 - 取消、Steer 和 Run deadline 可以打断请求或退避等待；被丢弃的尝试会取消底层 stream。
 - Run 设置累计 token/cost 上限时，只自动重试未报告用量的明确限流拒绝。其他失败请求
@@ -58,6 +58,23 @@ Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重�
 CLI 的 `agent.max_context_tokens` 是可选 Host 上限。省略时采用模型声明容量；显式
 设置时取 Host 与模型上限的较小值。两者均未知时仍采用 128K Host 回退预算，并明确
 显示模型容量未知，不能将回退预算报告为模型原生容量。
+
+`ModelCapabilities.max_output_tokens` 声明单次生成的输出上限，未知时省略。CLI 的
+`agent.reserved_output_tokens` 和匹配当前模型的 profile `max_tokens` 都是可选上限；
+省略时采用模型元数据中的输出容量，显式限制则取较小值。两者均未知时使用标明来源的
+8192 Host 回退值。直接切换 backend/model 不继承其他模型 profile 的限额或策略。
+Gemini 的输出用量包含回答与思考 token；`MAX_TOKENS` 即使没有可见回答也转换为
+`Finish(Length)`，保留 Usage，由运行时收束为 `RunIncomplete(OutputTokens)`，不重试。
+
+Gemini CLI 默认请求 `includeThoughts`，不覆盖模型默认思考强度。Provider 明确返回的
+`thought: true` 文字转换为 `ReasoningSummaryDelta`，不进入回答、Session 消息或模型
+续接上下文；`thoughtSignature` 仍作为不透明的 Provider 扩展保留。SDK 使用
+`with_thought_summaries(true)` 显式启用，CLI 自定义网关可设置 `include_thoughts: false`。
+
+Gemini 原始 function-call ID 仅在单次请求内有效。Adapter 以 request ID 和原始 ID
+生成稳定执行身份，防止跨轮冲突；相同请求的重放与同轮重复 ID 仍保留相同身份。
+原始 ID 与签名保存在扩展中，并原样回传 functionCall/functionResponse，不改变 Provider
+续接协议，也不放宽 Tool Effect Journal 的冲突和未知效果保护。
 
 CLI 中 Gemini 的容量解析只读取本地缓存或随包附带的目录快照，不等待联网。缓存位于
 Host 配置目录的 `cache/model-metadata`；超过 5 分钟或缺失时，后台刷新先查询原生

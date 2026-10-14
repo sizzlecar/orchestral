@@ -283,6 +283,25 @@ fn MessageView(
         if accepted { " message--accepted" } else { "" },
         if deferred { " message--deferred" } else { "" }
     );
+    if role == "reasoning" {
+        let preview: String = text
+            .chars()
+            .rev()
+            .take(160)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return rsx! {
+            details { class: "activity-item reasoning-summary", "data-message-id": id,
+                summary { class: "activity-item__summary",
+                    span { class: "activity-item__name", "思考摘要" }
+                    span { class: "activity-item__status", "{preview}" }
+                }
+                div { class: "message__content", dangerous_inner_html: markdown::render(&text) }
+            }
+        };
+    }
     let copy = text.clone();
     let rendered = (role == "assistant" || text.contains("](/api/v1/attachments/"))
         .then(|| markdown::render(&text));

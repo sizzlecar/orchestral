@@ -34,6 +34,7 @@ impl UiPhase {
 pub(crate) enum TranscriptRole {
     User,
     Assistant,
+    Reasoning,
     Tool,
     System,
     Error,
@@ -233,6 +234,11 @@ pub(crate) enum UiMsg {
         order: u64,
         text: String,
     },
+    ReasoningSummaryDelta {
+        delta_id: String,
+        summary_id: String,
+        text: String,
+    },
     OutputCommitted {
         output_id: String,
         text: String,
@@ -343,6 +349,7 @@ pub(crate) struct UiState {
     stream_output_id: Option<String>,
     stream_chunks: BTreeMap<u64, String>,
     seen_delta_ids: BTreeSet<String>,
+    seen_summary_delta_ids: BTreeSet<String>,
     activity_reducer: ActivityReducer,
     active_processes: BTreeSet<u64>,
     last_tick: Option<Instant>,
@@ -397,6 +404,7 @@ impl UiState {
             stream_output_id: None,
             stream_chunks: BTreeMap::new(),
             seen_delta_ids: BTreeSet::new(),
+            seen_summary_delta_ids: BTreeSet::new(),
             activity_reducer: ActivityReducer::default(),
             active_processes: BTreeSet::new(),
             last_tick: None,
@@ -623,6 +631,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         msg,
         UiMsg::RunStarted { .. }
             | UiMsg::StreamDelta { .. }
+            | UiMsg::ReasoningSummaryDelta { .. }
             | UiMsg::ToolActivity { .. }
             | UiMsg::Completed { .. }
             | UiMsg::Failed { .. }
@@ -662,6 +671,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         msg,
         UiMsg::RunStarted { .. }
             | UiMsg::StreamDelta { .. }
+            | UiMsg::ReasoningSummaryDelta { .. }
             | UiMsg::OutputCommitted { .. }
             | UiMsg::ToolActivity { .. }
             | UiMsg::Completed { .. }
@@ -816,6 +826,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::RunStarted { run_id } => {
             if state.run_id.as_deref() != Some(run_id.as_str()) {
+                state.seen_summary_delta_ids.clear();
                 state.context_input_tokens = None;
                 state.working_detail = None;
                 state.request_submission = None;
@@ -842,6 +853,34 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             }
             if state.seen_delta_ids.insert(delta_id) {
                 state.stream_chunks.entry(order).or_insert(text);
+                state.viewport.changed();
+            }
+        }
+        UiMsg::ReasoningSummaryDelta {
+            delta_id,
+            summary_id,
+            text,
+        } => {
+            if !text.is_empty() && state.seen_summary_delta_ids.insert(delta_id) {
+                state.working_detail = Some("Thinking".to_owned());
+                let id = format!("reasoning:{summary_id}");
+                if let Some((index, entry)) =
+                    state.transcript.iter_mut().enumerate().find(|(_, entry)| {
+                        entry.role == TranscriptRole::Reasoning && entry.id.as_deref() == Some(&id)
+                    })
+                {
+                    state.transcript_dirty_from = state.transcript_dirty_from.min(index);
+                    entry.text.push_str(&text);
+                } else {
+                    state.transcript.push(TranscriptEntry {
+                        continuation: false,
+                        id: Some(id),
+                        role: TranscriptRole::Reasoning,
+                        text,
+                        tool_status: None,
+                        tool_details: Vec::new(),
+                    });
+                }
                 state.viewport.changed();
             }
         }

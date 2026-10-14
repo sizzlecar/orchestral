@@ -287,6 +287,18 @@ const server = http.createServer(async (req, res) => {
         "cache-control": "no-cache",
       });
       res.write(": ready\n\n");
+      if (route === "/runs/owner/stream") {
+        const summary = {
+          telemetry_id: "reasoning-fixture-1", run_id: "owner", provider_seq: 1,
+          payload: { type: "extension", namespace: "orchestral/reasoning-summary.v1", value: {
+            summary_id: "summary-fixture", delta: "正在核对接口行为。".repeat(30) + "下一步检查调用结果。",
+          } },
+        };
+        // Reconnection can replay telemetry; summaries must not be duplicated.
+        res.write(`event: telemetry\ndata: ${JSON.stringify(summary)}\n\n`);
+        res.write(`event: telemetry\ndata: ${JSON.stringify(summary)}\n\n`);
+      }
+
       sockets.add(res);
       if (route === "/agent-session/stream") {
         const sessionId = url.searchParams.get("session_id");
@@ -507,6 +519,15 @@ const server = http.createServer(async (req, res) => {
       2,
       "both Host input and native approval must be visible",
     );
+    const reasoning = page.locator(".reasoning-summary");
+    await reasoning.waitFor();
+    assert.equal(await reasoning.count(), 1);
+    assert.equal(await reasoning.getAttribute("open"), null, "summary starts collapsed");
+    await reasoning.locator("summary").click();
+    await reasoning.locator(".message__content").waitFor({ state: "visible" });
+    assert.equal((await reasoning.locator(".message__content").innerText()).trim(), "正在核对接口行为。".repeat(30) + "下一步检查调用结果。");
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "long thinking preview must fit mobile viewport");
+    await reasoning.locator("summary").click();
     const input = page.getByRole("textbox", { name: "消息草稿" });
     await input.fill("保留在会话 A 的草稿");
     await openSession("另一个会话");

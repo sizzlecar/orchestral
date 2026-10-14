@@ -45,21 +45,28 @@ fn validate_config(config: &OrchestralConfig) -> Result<(), ConfigError> {
         || config.agent.max_tool_calls == Some(0)
         || config.agent.history_limit == 0
         || config.agent.max_context_tokens == Some(0)
-        || config.agent.reserved_output_tokens == 0
+        || config.agent.reserved_output_tokens == Some(0)
     {
         return invalid("Agent limits must be positive when present");
     }
-    if config
-        .agent
-        .max_context_tokens
-        .is_some_and(|limit| config.agent.reserved_output_tokens >= limit)
-    {
+    if config.agent.max_context_tokens.is_some_and(|limit| {
+        config
+            .agent
+            .reserved_output_tokens
+            .is_some_and(|output| output >= limit)
+    }) {
         return invalid("agent.reserved_output_tokens must be below max_context_tokens");
     }
     if config
         .agent
         .minimum_output_reserve_tokens
-        .is_some_and(|minimum| minimum == 0 || minimum > config.agent.reserved_output_tokens)
+        .is_some_and(|minimum| {
+            minimum == 0
+                || config
+                    .agent
+                    .reserved_output_tokens
+                    .is_some_and(|output| minimum > output)
+        })
     {
         return invalid("agent.minimum_output_reserve_tokens must be positive and no greater than reserved_output_tokens");
     }
@@ -261,11 +268,13 @@ mod tests {
     fn output_headroom_is_optional_and_bounded_by_the_preferred_reserve() {
         let mut config = OrchestralConfig::default();
         assert_eq!(config.agent.minimum_output_reserve_tokens, None);
-        for minimum in [1, config.agent.reserved_output_tokens] {
+        assert_eq!(config.agent.reserved_output_tokens, None);
+        config.agent.reserved_output_tokens = Some(4096);
+        for minimum in [1, 4096] {
             config.agent.minimum_output_reserve_tokens = Some(minimum);
             assert!(validate_config(&config).is_ok());
         }
-        for minimum in [0, config.agent.reserved_output_tokens + 1] {
+        for minimum in [0, 4097] {
             config.agent.minimum_output_reserve_tokens = Some(minimum);
             assert!(validate_config(&config).is_err());
         }

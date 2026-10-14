@@ -93,6 +93,10 @@ Generic Provider 在 descriptor 的 `extensions["orchestral/input-queue.v1"]` �
 `orchestral/context-usage.v1`，payload 为 `ContextUsageReport`。其中 `request_id` 绑定最近
 模型请求，`input_tokens` 表示本次输入，`input_tokens_estimated` 区分估算与实报，
 `max_context_tokens` 缺省表示未声明上限。它不代表累计计费量或实时 KV 占用。
+模型公开的思考摘要使用 `orchestral/reasoning-summary.v1` 遥测扩展，typed payload 为
+`ReasoningSummaryDelta { summary_id, delta }`。客户端按 telemetry ID 去重、按 summary ID
+追加，单独展示或折叠。它不参与最终交付、上下文回放或工具身份；旧客户端可忽略此扩展。
+摘要是非持久遥测，重新连接或重启不保证补回已经错过的片段。
 以上扩展沿用 v1 的命令、遥测和摘要规则，不增加未知 core variant。
 
 会话摘要可提供 `input_action`，指向目录中声明了 `input_channel: true`、输入 schema

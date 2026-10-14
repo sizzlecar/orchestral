@@ -61,6 +61,7 @@ async fn native_capacity_is_resolved_once_and_wins_over_catalog() {
     assert_eq!(model.descriptor().capabilities.max_context_tokens, None);
     let resolved = model.resolve_descriptor().await.unwrap();
     assert_eq!(resolved.capabilities.max_context_tokens, Some(600_000));
+    assert_eq!(resolved.capabilities.max_output_tokens, Some(16_384));
     assert_eq!(model.resolve_descriptor().await.unwrap(), resolved);
     assert_eq!(model.descriptor(), resolved);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -86,6 +87,7 @@ async fn vertex_catalog_fallback_is_exact_scoped_cached_and_credential_free() {
     let model = make();
     let resolved = model.resolve_descriptor().await.unwrap();
     assert_eq!(resolved.capabilities.max_context_tokens, Some(1_048_576));
+    assert_eq!(resolved.capabilities.max_output_tokens, Some(65_536));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(make().resolve_descriptor().await.unwrap(), resolved);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -176,6 +178,7 @@ async fn bundled_capacity_is_immediate_exact_and_not_applied_to_custom_gateways(
         .unwrap()
         .unwrap();
     assert_eq!(resolved.capabilities.max_context_tokens, Some(1_048_576));
+    assert_eq!(resolved.capabilities.max_output_tokens, Some(65_536));
     assert!(resolved.extensions["orchestral/context-capacity-source"]
         .as_str()
         .unwrap()
@@ -286,6 +289,7 @@ async fn pending_refresh_never_blocks_startup_or_changes_an_active_backend() {
         .unwrap()
         .unwrap();
     assert_eq!(resolved.capabilities.max_context_tokens, Some(600_000));
+    assert_eq!(resolved.capabilities.max_output_tokens, Some(1024));
     tokio::time::timeout(Duration::from_secs(1), entered.notified())
         .await
         .unwrap();

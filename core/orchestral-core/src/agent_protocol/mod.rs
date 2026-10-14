@@ -16,6 +16,7 @@ mod types;
 pub mod wire {
     pub use super::context_usage::ContextUsageReport;
     pub use super::input_queue::QueuedInputOperation;
+    pub use super::reasoning_summary::ReasoningSummaryDelta;
     pub use super::types::{
         AgentAdmission, AgentCapabilities, AgentCommand, AgentCommandEnvelope, AgentDelivery,
         AgentDescriptor, AgentDescriptorEnvelope, AgentEvent, AgentEventAuthority, AgentEventDraft,
@@ -40,6 +41,7 @@ pub mod wire {
 
 mod context_usage;
 mod input_queue;
+mod reasoning_summary;
 
 /// Rust SPI implemented by a complete in-process Agent or an opaque external
 /// Agent adapter. Stream transport types live here; they are not JSON wire

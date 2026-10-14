@@ -16,10 +16,10 @@ fn three_default_tuis_share_a_workspace_and_recover_first_turn_capacity() {
         let count = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let output_cap = request.body["max_tokens"].as_u64().unwrap();
         assert!(
-            output_cap <= 4096,
-            "wire output must fit the default Host reservation"
+            output_cap <= 8192,
+            "unknown model uses the declared Host fallback"
         );
-        let mut response = if output_cap > 2048 {
+        let mut response = if output_cap > 4096 {
             FixtureHttpResponse {
                 status: "400 Bad Request", content_type: "application/json", repeat_handler: false,
                 body: serde_json::to_vec(&json!({"error":{"code":"context_length_exceeded", "message":"input plus output exceeds capacity"}})).unwrap(),

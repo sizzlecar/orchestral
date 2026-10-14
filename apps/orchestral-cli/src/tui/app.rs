@@ -1186,6 +1186,21 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
         state.context_budget = context.max_context_tokens;
         return;
     }
+    if let Some(summary) =
+        orchestral_core::agent_protocol::wire::ReasoningSummaryDelta::from_telemetry(
+            &telemetry.payload,
+        )
+    {
+        update(
+            state,
+            UiMsg::ReasoningSummaryDelta {
+                delta_id: telemetry.telemetry_id.as_str().to_owned(),
+                summary_id: summary.summary_id.as_str().to_owned(),
+                text: summary.delta,
+            },
+        );
+        return;
+    }
     let telemetry_id = telemetry.telemetry_id.as_str().to_owned();
     match telemetry.payload {
         AgentTelemetry::OutputDelta { output_id, delta } => {
