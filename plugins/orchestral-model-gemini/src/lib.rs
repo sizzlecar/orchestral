@@ -220,6 +220,7 @@ pub struct GeminiModelBackend {
     metadata_discovery: bool,
     background_metadata_refresh: bool,
     include_thoughts: bool,
+    response_header_timeout: Duration,
     catalog_url: Option<String>,
 }
 
@@ -237,6 +238,7 @@ impl GeminiModelBackend {
             .then(|| "https://models.dev/api.json".to_owned());
         Ok(Self {
             client,
+            response_header_timeout: config.timeout,
             config,
             metadata: tokio::sync::OnceCell::new(),
             metadata_cache: None,
@@ -279,6 +281,19 @@ impl GeminiModelBackend {
     pub fn with_thought_summaries(mut self, enabled: bool) -> Self {
         self.include_thoughts = enabled;
         self
+    }
+
+    /// Bound waiting for HTTP response headers independently of streamed body
+    /// reads. This is not a total generation deadline; the SDK defaults to the
+    /// configured idle timeout until the Host supplies a separate ceiling.
+    pub fn with_response_header_timeout(mut self, timeout: Duration) -> Result<Self, ModelError> {
+        if timeout.is_zero() {
+            return Err(ModelError::invalid_request(
+                "response header timeout must be positive",
+            ));
+        }
+        self.response_header_timeout = timeout;
+        Ok(self)
     }
 
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
@@ -481,8 +496,19 @@ impl ModelBackend for GeminiModelBackend {
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_error()),
-            response = http_request.send() => response,
+            response = tokio::time::timeout(self.response_header_timeout, http_request.send()) => response,
         }
+        .map_err(|_| {
+            request_timing(
+                ModelError::new(ModelErrorCode::Unavailable, format!(
+                    "Gemini response headers were not received within {:?}", self.response_header_timeout
+                )).with_retryable(true).with_details(json!({
+                    "kind":"timeout", "timeout":true,
+                    "response_header_timeout_ms":self.response_header_timeout.as_millis() as u64,
+                })),
+                "response_headers", started,
+            )
+        })?
         .map_err(|error| request_timing(map_transport_error(error), "response_headers", started))?;
         let status = response.status();
         tracing::debug!(request_id = %request.request_id, elapsed_ms = started.elapsed().as_millis(), %status, "Gemini response headers received");
@@ -1465,6 +1491,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_header_deadline_is_independent_from_body_idle_timeout() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/{*path}",
+            post(|| async { std::future::pending::<String>().await }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = GeminiModelBackend::new(GeminiModelConfig {
+            backend_id: "headers-fixture".into(),
+            endpoint,
+            authentication: GeminiAuthentication::ApiKey("fixture".into()),
+            model: "fixture".into(),
+            temperature: 0.0,
+            thinking_level: None,
+            default_max_output_tokens: 256,
+            max_context_tokens: None,
+            timeout: Duration::from_secs(300),
+            max_buffered_events: 16,
+        })
+        .unwrap()
+        .with_response_header_timeout(Duration::from_millis(100))
+        .unwrap();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.start(request(), CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("stalled headers must time out"),
+        };
+        assert_eq!(error.code, ModelErrorCode::Unavailable);
+        assert!(error.retryable);
+        assert_eq!(error.details["phase"], "response_headers");
+        assert_eq!(error.details["response_header_timeout_ms"], 100);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(backend
+            .with_response_header_timeout(Duration::ZERO)
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn active_stream_may_outlive_its_idle_timeout() {
         let server = PacedSseServer::start(
             vec![
@@ -1488,6 +1561,8 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_buffered_events: 128,
         })
+        .unwrap()
+        .with_response_header_timeout(Duration::from_millis(250))
         .unwrap();
         let started = tokio::time::Instant::now();
         let mut stream = backend

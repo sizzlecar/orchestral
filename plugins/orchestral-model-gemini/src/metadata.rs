@@ -286,6 +286,7 @@ pub(super) async fn local_snapshot_and_refresh(
             metadata_discovery: true,
             background_metadata_refresh: false,
             include_thoughts: backend.include_thoughts,
+            response_header_timeout: backend.response_header_timeout,
             catalog_url: backend.catalog_url.clone(),
         };
         tokio::spawn(async move {

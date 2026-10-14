@@ -398,7 +398,7 @@ providers:
     - name: google
       kind: gemini
       api_key_env: GOOGLE_API_KEY
-      config: {{ stream_idle_timeout_secs: 300 }}
+      config: {{ response_header_timeout_secs: 30, stream_idle_timeout_secs: 300 }}
     - name: openrouter
       kind: openrouter
       endpoint: https://openrouter.ai/api/v1
