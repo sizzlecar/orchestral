@@ -493,7 +493,21 @@ pub(super) async fn route_local_host(
             }
         }
     }
-    next.run(request).await
+    let response = next.run(request).await;
+    if let Some(owner) = &state.local_owner {
+        // Graceful HTTP shutdown alone waits forever for an open SSE body.
+        // Retiring this owner must release every stream's controller/journal
+        // references so switching away does not retain the session lease.
+        let (parts, body) = response.into_parts();
+        return Response::from_parts(
+            parts,
+            Body::from_stream(
+                body.into_data_stream()
+                    .take_until(owner.stopped.clone().cancelled_owned()),
+            ),
+        );
+    }
+    response
 }
 
 #[cfg(test)]

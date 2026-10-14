@@ -374,3 +374,36 @@ async fn colliding_run_ids_cannot_route_a_command_to_another_session() {
     let directory = LocalHostDirectory::at(root.0.clone()).unwrap();
     assert!(directory.owner(None, Some("colliding-run")).await.is_err());
 }
+
+#[tokio::test]
+async fn stopping_owner_closes_existing_sse_connections() {
+    let root = TestRoot::new();
+    let owner = owner(&root.0, "stopping", None).await;
+    let session = AgentSessionId::new("stopping");
+    owner
+        .state
+        .agent
+        .create_session(Some(session.clone()))
+        .await
+        .unwrap();
+    owner
+        .state
+        .agent
+        .start_text(&session, Some(RunId::new("stream-run")), "hello")
+        .await
+        .unwrap();
+    let response = request(
+        &router(owner.state.clone()),
+        &owner.record.token,
+        "GET",
+        "/runs/stream-run/stream?after=0",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    owner.state.local_owner.as_ref().unwrap().stopped.cancel();
+    tokio::time::timeout(Duration::from_millis(250), response.into_body().collect())
+        .await
+        .expect("retired owner must close its SSE body and release its controller")
+        .unwrap();
+}
