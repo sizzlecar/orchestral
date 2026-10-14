@@ -66,9 +66,10 @@ impl ObservedPrefixAnchor {
         if raw.accounting != ModelTokenAccounting::Estimated
             || digest(prefix)? != self.input.messages_digest
             || digest(tools)? != self.input.tools_digest
-            || messages[self.input.messages_len..]
-                .iter()
-                .any(|message| !matches!(message.role, ModelRole::Assistant | ModelRole::Tool))
+            || messages[self.input.messages_len..].iter().any(|message| {
+                !matches!(message.role, ModelRole::Assistant | ModelRole::Tool)
+                    && !placement::is_summary_context(message)
+            })
         {
             return Ok(raw);
         }

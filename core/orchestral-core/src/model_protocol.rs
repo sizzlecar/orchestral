@@ -542,6 +542,14 @@ impl ModelError {
 pub trait ModelBackend: Send + Sync {
     fn descriptor(&self) -> ModelDescriptor;
 
+    /// Resolve optional remote model metadata before constructing an Agent.
+    /// Adapters may cache discovery, but must keep the resolved descriptor
+    /// stable for the lifetime of the backend so recovery identities do not
+    /// change during a Run. Static backends need no discovery implementation.
+    async fn resolve_descriptor(&self) -> Result<ModelDescriptor, ModelError> {
+        Ok(self.descriptor())
+    }
+
     /// Establishes the pull-based event stream before returning. Dropping the
     /// stream does not replace cancellation; adapters must observe the supplied
     /// token and stop their underlying request.
@@ -556,6 +564,10 @@ pub trait ModelBackend: Send + Sync {
 impl ModelBackend for Arc<dyn ModelBackend> {
     fn descriptor(&self) -> ModelDescriptor {
         (**self).descriptor()
+    }
+
+    async fn resolve_descriptor(&self) -> Result<ModelDescriptor, ModelError> {
+        (**self).resolve_descriptor().await
     }
 
     async fn start(

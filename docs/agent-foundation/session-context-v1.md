@@ -35,7 +35,17 @@ history/token 预算内优先恢复它的原文及 User 角色；不能容纳时
 group 必须来自同一 Run 的完整、可压缩工具交换或其摘要。展开原始来源时沿向后引用去重，
 不会把旧记录再次计入模型上下文。用户修正、Skill、安全事实、Artifact 所在交换，以及范围外
 仍有效片段的逻辑位置都不能被跨越。合并前的历史游标仍重放原有上下文；提交和重启回放采用
-相同检查。该投影规则通过 `context_projection_contract = source-positioned-summary/v4` 绑定。
+相同检查。该投影规则通过 `context_projection_contract = source-positioned-summary/v5` 绑定。
+
+Journal 中的 Assistant 文本摘要在模型投影时转换为 User 角色的历史上下文，携带
+`application/vnd.orchestral.session-summary+json` 类型标记及“不是新指令”的说明。
+这同样适用于旧 Session 的摘要回放，避免压缩最新 Tool exchange 后留下模型续写前缀。
+摘要仍在原始历史位置，不改写 journal，不伪造新的用户请求或 Tool 执行结果。
+已有 System 摘要保持兼容。压力计量包含完整投影包装；重复压缩仍读取原始交换。
+
+前缀及工具定义保持不变时，类型化历史摘要可以作为新观察参与实测用量增量估算；普通
+User/Steer、System 更新仍使该估算退回全量。此规则仅用于规划，不改变硬预算和权限，
+通过 `observed_prefix_planning_contract = completed-input-prefix/v2` 绑定恢复配置。
 
 extractive summarizer v7 在小预算下优先保留符合 Artifact 分页输出合同的完整引用、
 `next_offset` 和 `complete`，与来源序号和工具状态一起组成不可拆分的观察记录。该观察

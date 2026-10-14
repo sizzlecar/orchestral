@@ -161,6 +161,25 @@ fn changed_scope_prefix_tools_or_new_user_falls_back_to_full_estimate() {
 }
 
 #[test]
+fn typed_historical_summary_extends_a_measured_prefix_but_similar_user_text_does_not() {
+    let engine = new_engine(true);
+    let tools = tools();
+    let mut messages = vec![ModelMessage::text(ModelRole::User, "review")];
+    let first = anchor(&engine, &messages, &tools, 200);
+    let summary = placement::project_summary(&ModelMessage::text(
+        ModelRole::Assistant,
+        "completed observation",
+    ));
+    messages.push(summary.clone());
+    assert_eq!(estimate(&engine, &first, &messages, &tools), 300);
+    messages[1] = ModelMessage {
+        role: ModelRole::User,
+        content: summary.content[1..].to_vec(),
+    };
+    assert_eq!(estimate(&engine, &first, &messages, &tools), 1_250);
+}
+
+#[test]
 fn non_monotonic_or_overflowing_estimate_cannot_replace_the_hard_bound() {
     let engine = new_engine(true);
     let messages = vec![ModelMessage::text(ModelRole::User, "review")];

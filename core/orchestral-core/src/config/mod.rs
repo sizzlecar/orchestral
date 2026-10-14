@@ -121,8 +121,10 @@ pub struct AgentConfig {
     pub max_tool_calls: Option<u64>,
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
-    #[serde(default = "default_max_context_tokens")]
-    pub max_context_tokens: u64,
+    /// Optional Host ceiling. When omitted, use the selected model's declared
+    /// capacity; the application handles models whose capacity is unknown.
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
     #[serde(default = "default_reserved_output_tokens")]
     pub reserved_output_tokens: u64,
     /// Minimum response room before compacting active context. When omitted,
@@ -150,7 +152,7 @@ impl Default for AgentConfig {
             max_model_steps: None,
             max_tool_calls: None,
             history_limit: default_history_limit(),
-            max_context_tokens: default_max_context_tokens(),
+            max_context_tokens: None,
             reserved_output_tokens: default_reserved_output_tokens(),
             minimum_output_reserve_tokens: None,
             compaction: AgentCompactionConfig::default(),
@@ -201,10 +203,6 @@ fn default_stream_buffer() -> usize {
 
 fn default_history_limit() -> usize {
     128
-}
-
-fn default_max_context_tokens() -> u64 {
-    128 * 1024
 }
 
 fn default_reserved_output_tokens() -> u64 {

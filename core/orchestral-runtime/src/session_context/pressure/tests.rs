@@ -5,6 +5,64 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod live_ranges;
 
+#[tokio::test]
+async fn compacting_the_latest_exchange_leaves_input_context_and_replays_without_changing_history()
+{
+    let fixture = Fixture::new(&[24_000], "Inspect the completed result").await;
+    let original = fixture
+        .store
+        .load_session(&AgentSessionId::new("session-1"))
+        .await
+        .unwrap();
+    let record = fixture
+        .compactor(Arc::new(
+            DeterministicExtractiveSessionSummarizer::new(1024).unwrap(),
+        ))
+        .compact_active_run_for_context(
+            &fixture.engine,
+            fixture.request(2_000),
+            ContextTokenPolicy::UpperBound,
+        )
+        .await
+        .unwrap()
+        .expect("single latest exchange must compact under pressure");
+    let AgentSessionEvent::ActiveRunCompactionCommitted { summary, .. } = &record.payload else {
+        panic!("expected summary event");
+    };
+    // Persisted summaries retain their historical schema. Projection, including
+    // replay of old journals, must not leave an Assistant prefill at the tail.
+    assert_eq!(summary.role, ModelRole::Assistant);
+    let projected = fixture
+        .engine
+        .project(fixture.request(2_000))
+        .await
+        .unwrap();
+    let tail = projected.messages.last().unwrap();
+    assert_eq!(tail.role, ModelRole::User);
+    assert!(placement::is_summary_context(tail));
+    assert!(
+        matches!(&tail.content[1], ModelContent::Text { text } if text.starts_with("Historical context (summary;") && text.contains("UNTRUSTED earlier transcript"))
+    );
+    let records = fixture
+        .store
+        .load_session(&AgentSessionId::new("session-1"))
+        .await
+        .unwrap();
+    assert_eq!(&records[..original.len()], original.as_slice());
+    let replay = AgentSessionContextEngine::new(
+        fixture.store.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    );
+    assert_eq!(
+        replay
+            .project(fixture.request(2_000))
+            .await
+            .unwrap()
+            .messages,
+        projected.messages
+    );
+}
+
 struct Fixture {
     store: Arc<InMemoryAgentSessionJournalStore>,
     engine: AgentSessionContextEngine,

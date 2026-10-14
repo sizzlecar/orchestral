@@ -313,6 +313,10 @@ async fn build_agent_host_with_journals(
         options.credential_file.as_deref(),
         reasoning.clone(),
     )?;
+    let model_descriptor = model_backend
+        .resolve_descriptor()
+        .await
+        .context("resolve model capabilities")?;
 
     let mut agent_config = GenericAgentConfig::new("orchestral/internal", "generic-agent");
     agent_config.input_requests_enabled =
@@ -336,11 +340,8 @@ async fn build_agent_host_with_journals(
         max_tool_calls: config.agent.max_tool_calls,
     };
     agent_config.history_limit = config.agent.history_limit;
-    let declared_context_capacity = model_backend.descriptor().capabilities.max_context_tokens;
-    agent_config.max_context_tokens = declared_context_capacity
-        .map_or(config.agent.max_context_tokens, |capacity| {
-            capacity.min(config.agent.max_context_tokens)
-        });
+    let declared_context_capacity = model_descriptor.capabilities.max_context_tokens;
+    agent_config.max_context_tokens = model_context_budget(&config, declared_context_capacity);
     agent_config.reserved_output_tokens = config.agent.reserved_output_tokens;
     agent_config.minimum_output_reserve_tokens = config.agent.minimum_output_reserve_tokens;
     if let Some(system_prompt) = options
@@ -416,8 +417,10 @@ async fn build_agent_host_with_journals(
         context_budget: declared_context_capacity.map(|_| agent_config.max_context_tokens),
         workspaces: std::iter::once(workspaces.primary.clone()).chain(workspaces.additional.clone()).collect(),
         journal_location: if config.journal.backend == "memory" { "In memory (this process only)".to_owned() } else { std::fs::canonicalize(&journal_root)?.display().to_string() },
-        context: format!("Declared model/server context limit: {}\nEffective Host budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
+        context: format!("Declared model/server context limit: {}\nCapacity source: {}\nEffective Host budget: {} tokens\nReserved output: {} tokens\nCompaction: {}\n\nLoaded project instructions (Host snapshot):\n{}",
             declared_context_capacity.map_or_else(|| "unknown (not reported or configured)".to_owned(), |capacity| format!("{capacity} tokens")),
+            model_descriptor.extensions.get("orchestral/context-capacity-source").and_then(serde_json::Value::as_str)
+                .unwrap_or(if declared_context_capacity.is_some() { "backend declaration/configuration" } else { "unknown; Host fallback or explicit budget" }),
             agent_config.max_context_tokens, config.agent.reserved_output_tokens,
             if config.agent.compaction.enabled { "automatic" } else { "disabled" },
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
@@ -714,6 +717,16 @@ pub(crate) async fn resume_unfinished(
     Ok(resumed)
 }
 
+/// Unknown models retain a conservative Host fallback, separately from a
+/// declared model capacity. An omitted Host ceiling never caps a known model.
+fn model_context_budget(config: &OrchestralConfig, declared: Option<u64>) -> u64 {
+    match (config.agent.max_context_tokens, declared) {
+        (Some(host), Some(model)) => host.min(model),
+        (Some(limit), None) | (None, Some(limit)) => limit,
+        (None, None) => 128 * 1024,
+    }
+}
+
 fn model_inline_output_limit(
     config: &OrchestralConfig,
     backend_context_tokens: Option<u64>,
@@ -721,9 +734,7 @@ fn model_inline_output_limit(
     if let Some(limit) = config.tools.max_inline_output_bytes {
         return limit;
     }
-    let context = backend_context_tokens
-        .unwrap_or(config.agent.max_context_tokens)
-        .min(config.agent.max_context_tokens);
+    let context = model_context_budget(config, backend_context_tokens);
     // A per-result allowance, not a tokenizer estimate or a guarantee for an
     // entire conversation. Leave room for the request, history and other tools.
     let bytes = context
@@ -1699,21 +1710,26 @@ pub(crate) fn build_model_backend(
                     backend.name
                 );
             };
-            let backend = Arc::new(
-                GeminiModelBackend::new(GeminiModelConfig {
-                    backend_id: format!("google-gemini/{}", backend.name),
-                    endpoint,
-                    authentication,
-                    model: model.to_owned(),
-                    temperature,
-                    thinking_level: None,
-                    default_max_output_tokens: max_output_tokens,
-                    max_context_tokens,
-                    timeout,
-                    max_buffered_events,
-                })
-                .context("build Gemini ModelBackend")?,
+            let mut adapter = GeminiModelBackend::new(GeminiModelConfig {
+                backend_id: format!("google-gemini/{}", backend.name),
+                endpoint,
+                authentication,
+                model: model.to_owned(),
+                temperature,
+                thinking_level: None,
+                default_max_output_tokens: max_output_tokens,
+                max_context_tokens,
+                timeout,
+                max_buffered_events,
+            })
+            .context("build Gemini ModelBackend")?
+            .with_metadata_discovery(
+                backend.get_config("discover_model_capabilities").unwrap_or(true),
             );
+            if let Ok(root) = crate::mcp_config::user_config_root() {
+                adapter = adapter.with_metadata_cache(root.join("cache/model-metadata"));
+            }
+            let backend = Arc::new(adapter);
             Ok((backend.clone(), backend))
         }
         "openai" | "openrouter" | "deepseek" | "groq" | "xai" | "mistral" => {

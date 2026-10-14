@@ -36,6 +36,9 @@ mod context_output;
 mod context_reliability;
 #[path = "agent_live_e2e/failure_diagnostics.rs"]
 mod failure_diagnostics;
+#[path = "agent_live_e2e/gemini_context.rs"]
+#[cfg(unix)]
+mod gemini_context;
 #[path = "agent_live_e2e/input_mode.rs"]
 mod input_mode;
 #[path = "agent_live_e2e/model_retry.rs"]
