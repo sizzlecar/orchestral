@@ -1076,6 +1076,20 @@ fn text_parts(content: &[ModelContent]) -> Result<Vec<Value>, ModelError> {
         .iter()
         .map(|content| match content {
             ModelContent::Text { text } => Ok(json!({"text": text})),
+            ModelContent::Data {
+                media_type,
+                value: Value::String(data),
+            } if media_type.starts_with("image/") && !data.trim().is_empty() => {
+                let raw = data
+                    .strip_prefix(&format!("data:{media_type};base64,"))
+                    .unwrap_or(data.as_str());
+                Ok(json!({
+                    "inlineData": {
+                        "mimeType": media_type,
+                        "data": raw,
+                    }
+                }))
+            }
             ModelContent::Json { value } | ModelContent::Data { value, .. } => {
                 Ok(json!({"text": value.to_string()}))
             }

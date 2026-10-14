@@ -198,6 +198,9 @@ pub(crate) enum UiMsg {
         up: bool,
     },
     InsertText(String),
+    AttachImages(Vec<super::clipboard::PastedImage>),
+    PasteClipboard,
+    PasteError(String),
     Backspace,
     Delete,
     MoveCursorLeft,
@@ -331,6 +334,8 @@ pub(crate) struct UiState {
     pub files: std::sync::Arc<Vec<Choice>>,
     pub files_loaded: bool,
     pub references: Vec<FileReference>,
+    pub images: Vec<super::clipboard::ImageAttachment>,
+    pub next_image_id: usize,
     pub completion_selected: usize,
     pub completion_dismissed: bool,
     pub theme: String,
@@ -386,6 +391,8 @@ impl UiState {
             files: Default::default(),
             files_loaded: false,
             references: Vec::new(),
+            images: Vec::new(),
+            next_image_id: 1,
             completion_selected: 0,
             completion_dismissed: false,
             theme: "dark".to_owned(),
@@ -490,9 +497,66 @@ impl UiState {
             .map(|entry| entry.text.as_str())
     }
 
-    fn composer_editable(&self) -> bool {
+    pub(crate) fn composer_editable(&self) -> bool {
         !self.request_submission_pending()
             && !matches!(self.phase, UiPhase::WaitingApproval | UiPhase::Cancelling)
+    }
+
+    pub(crate) fn attach_images(&mut self, pasted: Vec<super::clipboard::PastedImage>) {
+        if pasted.is_empty() {
+            return;
+        }
+        let mut attached_summaries = Vec::with_capacity(pasted.len());
+        for (index, image) in pasted.into_iter().enumerate() {
+            let id = self.next_image_id.max(1);
+            self.next_image_id = id.saturating_add(1);
+            let marker = format!("[Image #{id}]");
+            let attachment = super::clipboard::ImageAttachment {
+                id,
+                marker: marker.clone(),
+                media_type: image.media_type,
+                data_base64: image.data_base64,
+                byte_size: image.byte_size,
+                dimensions: image.dimensions,
+                label: image.label,
+            };
+            attached_summaries.push(format!("{} ({})", attachment.marker, attachment.summary()));
+            let prefix = if index > 0
+                || (self.composer_cursor > 0
+                    && !self.composer[..self.composer_cursor]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+            {
+                " "
+            } else {
+                ""
+            };
+            let inserted = format!("{prefix}{marker}");
+            self.composer.insert_str(self.composer_cursor, &inserted);
+            self.composer_cursor += inserted.len();
+            editor::snap_cursor(&self.composer, &mut self.composer_cursor);
+            self.images.push(attachment);
+        }
+        self.composer_origin = ComposerOrigin::Edited;
+        self.ui_notice = Some(format!("Attached {}", attached_summaries.join(", ")));
+    }
+
+    pub(crate) fn submission_contents(
+        &self,
+        input: &str,
+    ) -> Vec<orchestral_core::agent_protocol::wire::Content> {
+        let mut matched = self
+            .images
+            .iter()
+            .filter_map(|image| input.find(&image.marker).map(|pos| (pos, image.clone())))
+            .collect::<Vec<_>>();
+        matched.sort_by_key(|(pos, image)| (*pos, image.id));
+        let images = matched
+            .into_iter()
+            .map(|(_, image)| image)
+            .collect::<Vec<_>>();
+        super::clipboard::submission_contents(input, &images)
     }
 
     fn clear_stream(&mut self) {
@@ -531,6 +595,19 @@ impl UiState {
     }
 
     fn backspace(&mut self) {
+        self.ui_notice = None;
+        let before = &self.composer[..self.composer_cursor];
+        if let Some(marker_len) = self
+            .images
+            .iter()
+            .find_map(|img| before.ends_with(&img.marker).then_some(img.marker.len()))
+        {
+            let start = self.composer_cursor - marker_len;
+            self.composer.drain(start..self.composer_cursor);
+            self.composer_cursor = start;
+            editor::snap_cursor(&self.composer, &mut self.composer_cursor);
+            return;
+        }
         editor::edit(
             &mut self.composer,
             &mut self.composer_cursor,
@@ -539,6 +616,18 @@ impl UiState {
     }
 
     fn delete(&mut self) {
+        self.ui_notice = None;
+        let after = &self.composer[self.composer_cursor..];
+        if let Some(marker_len) = self
+            .images
+            .iter()
+            .find_map(|img| after.starts_with(&img.marker).then_some(img.marker.len()))
+        {
+            self.composer
+                .drain(self.composer_cursor..self.composer_cursor + marker_len);
+            editor::snap_cursor(&self.composer, &mut self.composer_cursor);
+            return;
+        }
         editor::edit(&mut self.composer, &mut self.composer_cursor, Edit::Delete);
     }
 
@@ -653,6 +742,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             && matches!(
                 msg,
                 UiMsg::InsertText(_)
+                    | UiMsg::AttachImages(_)
                     | UiMsg::Backspace
                     | UiMsg::Delete
                     | UiMsg::MoveCursorLeft
@@ -721,6 +811,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::Complete | UiMsg::SelectCandidate { .. } => {}
         UiMsg::InsertText(text) if state.composer_editable() => state.insert_text(&text),
+        UiMsg::AttachImages(images) if state.composer_editable() => state.attach_images(images),
+        UiMsg::PasteError(message) => state.ui_notice = Some(message),
         UiMsg::Backspace if state.composer_editable() => state.backspace(),
         UiMsg::Delete if state.composer_editable() => state.delete(),
         UiMsg::MoveCursorLeft if state.composer_editable() => state.move_cursor_left(),
@@ -742,6 +834,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             }
         }
         UiMsg::InsertText(_)
+        | UiMsg::AttachImages(_)
+        | UiMsg::PasteClipboard
         | UiMsg::Backspace
         | UiMsg::Delete
         | UiMsg::MoveCursorLeft

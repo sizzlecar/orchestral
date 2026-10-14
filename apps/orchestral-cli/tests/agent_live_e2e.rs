@@ -2963,6 +2963,7 @@ struct PtyHarness {
 struct PtyOutput {
     status: PtyExitStatus,
     bytes: Vec<u8>,
+    size: (u16, u16),
 }
 
 fn physical_screen_contents(screen: &vt100::Screen) -> String {
@@ -2972,6 +2973,27 @@ fn physical_screen_contents(screen: &vt100::Screen) -> String {
         .rows(0, screen.size().1)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn full_scrollback_contents(screen: &mut vt100::Screen) -> String {
+    let (rows, _) = screen.size();
+    let step = usize::from(rows.max(1));
+    screen.set_scrollback(usize::MAX);
+    let max_offset = screen.scrollback();
+    let mut out = String::new();
+    let mut offset = max_offset;
+    loop {
+        screen.set_scrollback(offset);
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&physical_screen_contents(screen));
+        if offset == 0 {
+            break;
+        }
+        offset = offset.saturating_sub(step);
+    }
+    out
 }
 
 #[test]
@@ -3072,11 +3094,13 @@ impl PtyOutput {
             );
         }
         // Main-screen rendering preserves the terminal's native scrollback and
-        // mouse selection; neither alternate screen nor mouse capture may be enabled.
+        // mouse selection; neither alternate screen, mouse capture, nor
+        // destructive Clear(All) may be emitted.
         for forbidden in [
             b"\x1b[?1049h".as_slice(),
             b"\x1b[?1049l".as_slice(),
             b"\x1b[?1000h".as_slice(),
+            b"\x1b[2J".as_slice(),
         ] {
             assert!(
                 !self
@@ -3088,6 +3112,30 @@ impl PtyOutput {
                 self.text()
             );
         }
+        let (cols, rows) = (self.size.0.max(20), self.size.1.max(6));
+        let mut parser = vt100::Parser::new(rows, cols, 1_000);
+        parser.process(b"PRE_TUI_SHELL_LINE\r\n");
+        parser.process(&self.bytes);
+        parser.process(b"RETURNED_PROMPT>");
+        let active_after_exit = physical_screen_contents(parser.screen());
+        assert!(
+            !active_after_exit.contains("do anything"),
+            "composer placeholder was not cleared on exit:\n{active_after_exit}"
+        );
+        let prompt_line = active_after_exit
+            .lines()
+            .find(|line| line.contains("RETURNED_PROMPT>"))
+            .expect("post-exit prompt should be visible");
+        assert_eq!(
+            prompt_line.trim(),
+            "RETURNED_PROMPT>",
+            "post-exit shell prompt overlapped stale TUI text:\n{active_after_exit}"
+        );
+        let full_history = full_scrollback_contents(parser.screen_mut());
+        assert!(
+            full_history.contains("PRE_TUI_SHELL_LINE"),
+            "pre-TUI shell output was erased instead of preserved in scrollback:\n{full_history}"
+        );
         let assert_restored = |enabled: &[u8], disabled: &[u8]| {
             let enter = self
                 .bytes
@@ -3350,8 +3398,13 @@ impl PtyHarness {
             .unwrap();
         }
         drop(self.master);
+        let (rows, cols) = self.screen.screen().size();
         let bytes = self.reader.join().expect("join TUI PTY reader");
-        PtyOutput { status, bytes }
+        PtyOutput {
+            status,
+            bytes,
+            size: (cols, rows),
+        }
     }
 }
 
@@ -4272,7 +4325,18 @@ fn model_request_text(request: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|message| message["content"].as_str())
+        .flat_map(|message| {
+            if let Some(text) = message["content"].as_str() {
+                vec![text.to_owned()]
+            } else if let Some(parts) = message["content"].as_array() {
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str().map(str::to_owned))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

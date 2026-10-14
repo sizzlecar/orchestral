@@ -307,7 +307,13 @@ impl InternalGenericAgentProvider {
             provider_id: config.provider_id.clone(),
             agent_id: config.agent_id.clone(),
             supported_protocol_versions: vec![AGENT_PROTOCOL_V1],
-            accepted_content_types: BTreeSet::from(["text/plain".to_owned()]),
+            accepted_content_types: BTreeSet::from([
+                "text/plain".to_owned(),
+                "image/png".to_owned(),
+                "image/jpeg".to_owned(),
+                "image/webp".to_owned(),
+                "image/gif".to_owned(),
+            ]),
             capabilities: AgentCapabilities {
                 session_reuse: true,
                 structured_output: false,

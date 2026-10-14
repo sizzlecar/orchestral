@@ -34,8 +34,9 @@ impl FrameWriter {
 
     fn flush_now(&mut self) -> io::Result<()> {
         if !self.buffer.is_empty() {
+            let output = replace_fullscreen_clear(&self.buffer);
             let mut lock = self.stdout.lock();
-            lock.write_all(&self.buffer)?;
+            lock.write_all(&output)?;
             lock.flush()?;
             self.buffer.clear();
         } else {
@@ -43,6 +44,37 @@ impl FrameWriter {
         }
         Ok(())
     }
+}
+
+/// Replaces `CSI 2 J` (`ClearType::All`) with per-row `CSI 2 K` (`ClearType::CurrentLine`)
+/// so terminal emulators on the main screen never copy the erased UI frame into scrollback.
+fn replace_fullscreen_clear(buffer: &[u8]) -> Vec<u8> {
+    const CLEAR_ALL: &[u8] = b"\x1b[2J";
+    if !buffer
+        .windows(CLEAR_ALL.len())
+        .any(|window| window == CLEAR_ALL)
+    {
+        return buffer.to_vec();
+    }
+    let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut replacement = Vec::with_capacity(usize::from(rows) * 12 + 8);
+    for row in 1..=rows.max(1) {
+        let _ = write!(replacement, "\x1b[{row};1H\x1b[2K");
+    }
+    replacement.extend_from_slice(b"\x1b[1;1H");
+
+    let mut out = Vec::with_capacity(buffer.len() + replacement.len());
+    let mut index = 0;
+    while index < buffer.len() {
+        if buffer[index..].starts_with(CLEAR_ALL) {
+            out.extend_from_slice(&replacement);
+            index += CLEAR_ALL.len();
+        } else {
+            out.push(buffer[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 impl Write for FrameWriter {
@@ -69,6 +101,7 @@ impl Write for FrameWriter {
 pub(crate) struct TerminalSession {
     terminal: CrosstermTerminal,
     defer_flush: Rc<Cell<bool>>,
+    exit_cursor_row: u16,
     active: bool,
 }
 
@@ -76,13 +109,18 @@ impl TerminalSession {
     pub(crate) fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            Clear(ClearType::All),
-            MoveTo(0, 0),
-            EnableBracketedPaste,
-            Hide
-        ) {
+        let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let init_result = (|| -> io::Result<()> {
+            execute!(stdout, MoveTo(0, rows.saturating_sub(1)))?;
+            for _ in 0..rows.max(1) {
+                stdout.write_all(b"\n")?;
+            }
+            for y in 0..rows.max(1) {
+                execute!(stdout, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
+            }
+            execute!(stdout, MoveTo(0, 0), EnableBracketedPaste, Hide)
+        })();
+        if let Err(error) = init_result {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -98,6 +136,7 @@ impl TerminalSession {
         Ok(Self {
             terminal,
             defer_flush,
+            exit_cursor_row: 0,
             active: true,
         })
     }
@@ -114,6 +153,7 @@ impl TerminalSession {
     ) -> io::Result<DrawOutcome> {
         self.defer_flush.set(true);
         let result = draw_with_scrollback(&mut self.terminal, state, cache);
+        self.exit_cursor_row = cache.exit_cursor_row();
         self.defer_flush.set(false);
         let flush_result = self.terminal.backend_mut().flush();
         let outcome = result?;
@@ -131,8 +171,58 @@ impl TerminalSession {
         }
         self.active = false;
 
-        let mut first_error = self.terminal.show_cursor().err();
-        if let Err(error) = execute!(self.terminal.backend_mut(), DisableBracketedPaste, Show) {
+        let (_, rows) = self
+            .terminal
+            .size()
+            .map(|size| (size.width, size.height))
+            .or_else(|_| crossterm::terminal::size())
+            .unwrap_or((80, 24));
+        let height = rows.max(1);
+        let clean_from = self.exit_cursor_row.min(height);
+        let mut first_error = None;
+        for y in clean_from..height {
+            if let Err(error) = execute!(
+                self.terminal.backend_mut(),
+                MoveTo(0, y),
+                Clear(ClearType::CurrentLine)
+            ) {
+                first_error.get_or_insert(error);
+            }
+        }
+        let target_row = if clean_from >= height {
+            if let Err(error) = execute!(self.terminal.backend_mut(), MoveTo(0, height - 1)) {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = self.terminal.backend_mut().write_all(b"\r\n") {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = execute!(
+                self.terminal.backend_mut(),
+                Clear(ClearType::CurrentLine),
+                Clear(ClearType::FromCursorDown)
+            ) {
+                first_error.get_or_insert(error);
+            }
+            height - 1
+        } else {
+            if let Err(error) = execute!(
+                self.terminal.backend_mut(),
+                MoveTo(0, clean_from),
+                Clear(ClearType::FromCursorDown)
+            ) {
+                first_error.get_or_insert(error);
+            }
+            clean_from
+        };
+        if let Err(error) = execute!(
+            self.terminal.backend_mut(),
+            MoveTo(0, target_row),
+            DisableBracketedPaste,
+            Show
+        ) {
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = self.terminal.show_cursor() {
             first_error.get_or_insert(error);
         }
         if let Err(error) = self.terminal.backend_mut().flush() {

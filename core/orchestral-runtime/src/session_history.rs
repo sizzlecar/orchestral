@@ -144,15 +144,17 @@ impl JournalSessionHistory {
                 entry.run_id.clone(),
             )
         });
-        let title = runs[0]
+        let mut title = runs[0]
             .1
             .registration
             .run()
             .spec
             .input
             .iter()
-            .filter_map(|content| match &content.body {
-                ContentBody::Inline(serde_json::Value::String(text)) => Some(text.as_str()),
+            .filter_map(|content| match (&content.media_type[..], &content.body) {
+                ("text/plain", ContentBody::Inline(serde_json::Value::String(text))) => {
+                    Some(text.as_str())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -163,6 +165,18 @@ impl JournalSessionHistory {
             .chars()
             .take(120)
             .collect::<String>();
+        if title.is_empty()
+            && runs[0]
+                .1
+                .registration
+                .run()
+                .spec
+                .input
+                .iter()
+                .any(|content| content.media_type.starts_with("image/"))
+        {
+            title = "[Image]".to_owned();
+        }
         let origins = runs
             .iter()
             .map(|(_, run)| SessionOrigin::from_extensions(&run.registration.run().spec.extensions))

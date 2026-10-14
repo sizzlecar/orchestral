@@ -347,6 +347,14 @@ impl Content {
         }
     }
 
+    pub fn inline_image(media_type: impl Into<String>, base64_data: impl Into<String>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            schema_id: None,
+            body: ContentBody::Inline(Value::String(base64_data.into())),
+        }
+    }
+
     pub fn validate_integrity(&self) -> Result<(), AgentProtocolError> {
         if self.media_type.trim().is_empty()
             || self.schema_id.as_ref().is_some_and(SchemaRef::is_empty)

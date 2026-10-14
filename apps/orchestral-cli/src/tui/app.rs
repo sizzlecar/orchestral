@@ -155,6 +155,19 @@ pub(crate) async fn run_tui(
                             state.ui_notice = Some(error.to_string()); needs_redraw = true; continue;
                         }
                     }
+                    let message = if matches!(message, UiMsg::PasteClipboard) {
+                        if state.menu.is_none() && state.composer_editable() {
+                            match super::clipboard::read_system_clipboard(&state.workspace_path).await {
+                                Ok(super::clipboard::ClipboardPaste::Images(images)) => UiMsg::AttachImages(images),
+                                Ok(super::clipboard::ClipboardPaste::Text(text)) => UiMsg::InsertText(text),
+                                Err(error) => UiMsg::PasteError(error),
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        message
+                    };
                     let effects = update(&mut state, message);
                     let mut execution = Vec::new();
                     for effect in effects {
@@ -217,7 +230,7 @@ pub(crate) async fn run_tui(
                         process_supervisor = host.process_supervisor.clone();
                         process_events = process_supervisor.subscribe();
                         process_events_open = true;
-                        drafts.insert(state.session_id.clone(), (state.composer.clone(), state.composer_cursor, state.references.clone()));
+                        drafts.insert(state.session_id.clone(), (state.composer.clone(), state.composer_cursor, state.references.clone(), state.images.clone(), state.next_image_id));
                         let mut next_state = UiState::new(next.session_id().as_str(), host.model.clone());
                         next_state.terminal_size = state.terminal_size;
                         next_state.exit_requested = state.exit_requested;
@@ -226,8 +239,9 @@ pub(crate) async fn run_tui(
                         next_state.workspace_path = host.workspace_root.display().to_string();
                         next_state.files = state.files.clone(); next_state.files_loaded = state.files_loaded;
                         next_state.theme = state.theme.clone(); next_state.color_enabled = state.color_enabled;
-                        if let Some((text, cursor, references)) = drafts.remove(next.session_id().as_str()) {
+                        if let Some((text, cursor, references, images, next_image_id)) = drafts.remove(next.session_id().as_str()) {
                             next_state.composer = text; next_state.composer_cursor = cursor; next_state.references = references;
+                            next_state.images = images; next_state.next_image_id = next_image_id;
                         }
                         if let Some(history) = &history {
                             for record in history.runs.iter().flat_map(|run| &run.records) { next_state.input_queue.observe(record); }
@@ -358,7 +372,19 @@ enum ForwardedAgentEvent {
 fn terminal_event_message(event: Event, state: &UiState) -> Option<UiMsg> {
     match event {
         Event::Key(key) => key_message(key, state),
-        Event::Paste(text) => Some(UiMsg::InsertText(text)),
+        Event::Paste(text) => {
+            if state.menu.is_none() && state.composer_editable() {
+                if text.is_empty() {
+                    return Some(UiMsg::PasteClipboard);
+                }
+                match super::clipboard::extract_pasted_images(&text, &state.workspace_path) {
+                    Ok(Some(images)) => return Some(UiMsg::AttachImages(images)),
+                    Ok(None) => {}
+                    Err(error) => return Some(UiMsg::PasteError(error)),
+                }
+            }
+            Some(UiMsg::InsertText(text))
+        }
         // The TUI deliberately does not enable terminal mouse capture. Mouse
         // drag therefore remains the terminal's native text selection/copy
         // gesture; transcript scrolling stays available via PgUp/PgDn.
@@ -421,6 +447,7 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
             KeyCode::Char('k' | 'K') => Some(UiMsg::Edit(Edit::DeleteToEnd)),
             KeyCode::Char('p' | 'P') => Some(UiMsg::ToggleInput),
             KeyCode::Char('o' | 'O') => Some(UiMsg::ToggleTools),
+            KeyCode::Char('v' | 'V') => Some(UiMsg::PasteClipboard),
             KeyCode::Left => Some(UiMsg::Edit(Edit::WordLeft)),
             KeyCode::Right => Some(UiMsg::Edit(Edit::WordRight)),
             _ => None,
@@ -429,6 +456,7 @@ fn key_message(key: KeyEvent, state: &UiState) -> Option<UiMsg> {
     if key.modifiers.contains(KeyModifiers::ALT) {
         return match key.code {
             KeyCode::Enter => Some(UiMsg::SubmitImmediately),
+            KeyCode::Char('v' | 'V') => Some(UiMsg::PasteClipboard),
             KeyCode::Char('b') | KeyCode::Left => Some(UiMsg::Edit(Edit::WordLeft)),
             KeyCode::Char('f') | KeyCode::Right => Some(UiMsg::Edit(Edit::WordRight)),
             KeyCode::Backspace => Some(UiMsg::Edit(Edit::DeleteWord)),
@@ -531,7 +559,8 @@ async fn execute_effects(
                     notice(state, "start-active", "A Run is already active", true);
                     continue;
                 }
-                match client.start_text(input.clone()).await {
+                let contents = state.submission_contents(&input);
+                match client.start_content(contents).await {
                     Ok(handle) => {
                         let run_id = handle.run_id().as_str().to_owned();
                         match observe_run(&handle, agent_tx.clone()).await {
@@ -570,8 +599,9 @@ async fn execute_effects(
                 }
             }
             UiEffect::Steer { run_id, input } => {
+                let contents = state.submission_contents(&input);
                 if let Some(run) = matching_active(active, &run_id, state) {
-                    match run.handle.steer_text(input.clone()).await {
+                    match run.handle.steer_content(contents).await {
                         Ok(ack) => {
                             if !matches!(
                                 ack.state,
@@ -604,11 +634,12 @@ async fn execute_effects(
                     operation,
                     orchestral_core::agent_protocol::wire::QueuedInputOperation::Withdraw { .. }
                 );
+                let contents = state.submission_contents(&input);
                 if let Some(run) = matching_active(active, &run_id, state) {
                     let command = operation.command(
                         CommandId::new(command_id),
                         run.handle.run_id().clone(),
-                        vec![Content::text(input.clone())],
+                        contents,
                     )?;
                     match run.handle.command(command).await {
                         Ok(ack) => {
@@ -643,10 +674,11 @@ async fn execute_effects(
                 request_id,
                 value,
             } => {
+                let contents = state.submission_contents(&value);
                 if let Some(run) = matching_active(active, &run_id, state) {
                     match run
                         .handle
-                        .resolve_input_text(RequestId::new(&request_id), value.clone())
+                        .resolve_input_content(RequestId::new(&request_id), contents)
                         .await
                     {
                         Ok(ack) => {
@@ -1289,10 +1321,28 @@ fn project_ack(state: &mut UiState, ack: CommandAck, operation: &str) {
 }
 
 pub(super) fn display_contents(contents: &[Content]) -> String {
+    let has_text = contents.iter().any(|content| {
+        content.media_type == "text/plain"
+            && matches!(
+                &content.body,
+                ContentBody::Inline(serde_json::Value::String(text)) if !text.is_empty()
+            )
+    });
     contents
         .iter()
-        .map(display_content)
-        .filter(|text| !text.is_empty())
+        .enumerate()
+        .filter_map(|(index, content)| {
+            if content.media_type.starts_with("image/") {
+                if has_text {
+                    None
+                } else {
+                    Some(format!("[Image #{}]", index + 1))
+                }
+            } else {
+                let text = display_content(content);
+                (!text.is_empty()).then_some(text)
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

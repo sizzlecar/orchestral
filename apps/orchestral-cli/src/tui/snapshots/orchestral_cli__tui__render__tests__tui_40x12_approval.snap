@@ -2,7 +2,6 @@
 source: apps/orchestral-cli/src/tui/render.rs
 expression: "render_to_string(&state, 40, 12)"
 ---
-  _>. ORCHESTRAL            ! approval
   › 修复支付重试 🧪，不要重复扣款
 
     • Running 1 command
@@ -13,4 +12,5 @@ expression: "render_to_string(&state, 40, 12)"
   Run workspace tests with cargo
   › a  Allow once
     d  Deny
+  _>. ORCHESTRAL            ! approval
   ↑↓ select · a/d · enter confirm
