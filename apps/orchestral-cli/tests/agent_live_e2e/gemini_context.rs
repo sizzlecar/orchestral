@@ -333,6 +333,108 @@ fn gemini_tui_shows_the_summary_while_waiting_for_the_next_model_response() {
 }
 
 #[test]
+fn gemini_tui_reports_silence_after_partial_output_and_resumes_the_same_stream() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("gemini-midstream-wait");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let mut connection = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < LOCAL_PROCESS_TIMEOUT);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        };
+        connection
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        read_http_fixture_request(&mut connection);
+        let prefix = format!(
+            "data: {}\n\n",
+            json!({
+                "candidates":[{"content":{"parts":[
+                    {"text":"Preparing the response.","thought":true},
+                    {"text":"Partial answer"}
+                ]}}]
+            })
+        );
+        let suffix = format!(
+            "data: {}\n\n",
+            json!({
+                "candidates":[{"content":{"parts":[{"text":" completed."}]},"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":1500,"candidatesTokenCount":32}
+            })
+        );
+        write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", prefix.len() + suffix.len(), prefix).unwrap();
+        connection.flush().unwrap();
+        release_rx.recv_timeout(LOCAL_PROCESS_TIMEOUT).unwrap();
+        connection.write_all(suffix.as_bytes()).unwrap();
+        connection.flush().unwrap();
+    });
+    configure_gemini_fixture(&workspace, &endpoint);
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
+    command.cwd(&workspace.root);
+    command.env("ORCHESTRAL_HOME", workspace.path("user-config"));
+    command.env("GOOGLE_API_KEY", "fixture-key");
+    command.args([
+        "--config",
+        workspace.path("orchestral.yaml").to_str().unwrap(),
+        "--backend",
+        "google",
+        "--model",
+        "fixture-model",
+        "--session-id",
+        "midstream-wait",
+        "--no-mcp",
+        "--no-skills",
+    ]);
+    let mut tui = PtyHarness::spawn_with_size(command, 120, 32);
+    tui.wait_for_screen(
+        |screen| screen.contains("fixture-model"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("Explain the result.");
+    tui.wait_for_screen(
+        |screen| screen.contains("Partial answer"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.wait_for_screen(
+        |screen| screen.contains("Waiting for model output (10s)"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    release_tx.send(()).unwrap();
+    tui.wait_for_screen(
+        |screen| {
+            screen.contains("replied")
+                && screen.contains("Partial answer completed.")
+                && !screen.contains("Waiting for model output")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    output.assert_terminal_restored();
+    server.join().unwrap();
+    assert_eq!(
+        checkpoint_event_count(&workspace, "model_attempt_started"),
+        1
+    );
+    assert_eq!(
+        checkpoint_event_count(&workspace, "model_retry_scheduled"),
+        0
+    );
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+}
+
+#[test]
 fn gemini_recovers_from_stalled_headers_within_the_configured_header_budget() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("gemini-header-timeout");

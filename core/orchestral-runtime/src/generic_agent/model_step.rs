@@ -360,7 +360,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                     }
                     continue 'model_rounds;
                 }
-                item = model_stream.next() => item,
+                item = super::model_retry::next_model_event(&inner, &request, &mut model_stream) => item,
             };
             // A Host stop may be accepted while polling the selected stream
             // item. Give that committed stop precedence over a late provider

@@ -1,5 +1,5 @@
 use super::*;
-use orchestral_core::model_protocol::ModelStream;
+use orchestral_core::model_protocol::{ModelStream, ModelStreamEvent};
 
 pub(super) struct StartedModelStream {
     pub(super) stream: ModelStream,
@@ -50,11 +50,7 @@ pub(super) async fn start_model_with_retry(
         let mut expected_sequence = 1;
         let error = match result {
             Ok(mut stream) => loop {
-                match with_wait_notice(stream.next(), |elapsed| {
-                    report_model_wait(inner, run, "output", elapsed)
-                })
-                .await
-                {
+                match next_model_event(inner, run, &mut stream).await {
                     Some(Ok(first)) => {
                         first
                             .validate_for(&request.request_id, expected_sequence)
@@ -161,6 +157,19 @@ pub(super) async fn start_model_with_retry(
         );
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
+}
+
+/// Keep reporting silence after streaming has begun as well as before the
+/// first event. The pending read stays alive; this never retries inference.
+pub(super) async fn next_model_event(
+    inner: &GenericInner,
+    run: &AgentStartRequest,
+    stream: &mut ModelStream,
+) -> Option<Result<ModelStreamEvent, ModelError>> {
+    with_wait_notice(stream.next(), |elapsed| {
+        report_model_wait(inner, run, "output", elapsed)
+    })
+    .await
 }
 
 // Keep the original request future alive. Reporting progress must never cause

@@ -646,7 +646,8 @@ struct GeminiStreamState {
     terminated: bool,
     max_buffered_events: usize,
     started: Instant,
-    received_bytes: bool,
+    received_body_bytes: u64,
+    last_bytes_at: Option<Instant>,
 }
 
 impl GeminiStreamState {
@@ -672,8 +673,23 @@ impl GeminiStreamState {
 
     fn fail(&mut self, error: ModelError) {
         self.terminated = true;
-        self.pending
-            .push_back(Err(request_timing(error, "response_body", self.started)));
+        let mut error = request_timing(error, "response_body", self.started);
+        if let Some(details) = error.details.as_object_mut() {
+            details.insert(
+                "received_body_bytes".to_owned(),
+                json!(self.received_body_bytes),
+            );
+            details.insert("content_received".to_owned(), json!(self.emitted_content));
+            details.insert(
+                "idle_ms".to_owned(),
+                json!(self
+                    .last_bytes_at
+                    .unwrap_or(self.started)
+                    .elapsed()
+                    .as_millis() as u64),
+            );
+        }
+        self.pending.push_back(Err(error));
     }
 
     fn handle_frame(&mut self, frame: String) -> Result<(), ModelError> {
@@ -866,7 +882,8 @@ fn gemini_stream_state(
         terminated: false,
         max_buffered_events,
         started: Instant::now(),
-        received_bytes: false,
+        received_body_bytes: 0,
+        last_bytes_at: None,
     }
 }
 
@@ -901,9 +918,12 @@ fn gemini_event_stream(
             };
             match next {
                 Some(Ok(chunk)) => {
-                    if !state.received_bytes && !chunk.is_empty() {
-                        tracing::debug!(request_id = %state.request_id, elapsed_ms = state.started.elapsed().as_millis(), "Gemini first response bytes received after headers");
-                        state.received_bytes = true;
+                    if !chunk.is_empty() {
+                        if state.received_body_bytes == 0 {
+                            tracing::debug!(request_id = %state.request_id, elapsed_ms = state.started.elapsed().as_millis(), "Gemini first response bytes received after headers");
+                        }
+                        state.received_body_bytes = state.received_body_bytes.saturating_add(chunk.len() as u64);
+                        state.last_bytes_at = Some(Instant::now());
                     }
                     if let Err(error) = state.decoder.push(&chunk) {
                         state.fail(error);
@@ -1488,6 +1508,62 @@ mod tests {
             assert!(error.details["elapsed_ms"].as_u64().unwrap() >= 100);
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_body_after_partial_output_reports_idle_time_and_received_bytes() {
+        use axum::{body::Body, response::Response, routing::post, Router};
+        let chunk = Bytes::from_static(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Partial answer\"}]}}]}\n\n");
+        let expected_bytes = chunk.len() as u64;
+        let app = Router::new().route(
+            "/{*path}",
+            post(move || {
+                let chunk = chunk.clone();
+                async move {
+                    Response::new(Body::from_stream(
+                        stream::once(std::future::ready(Ok::<_, std::io::Error>(chunk)))
+                            .chain(stream::pending()),
+                    ))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = GeminiModelBackend::new(GeminiModelConfig {
+            backend_id: "partial-body-fixture".into(),
+            endpoint,
+            authentication: GeminiAuthentication::ApiKey("fixture".into()),
+            model: "fixture".into(),
+            temperature: 0.0,
+            thinking_level: None,
+            default_max_output_tokens: 256,
+            max_context_tokens: None,
+            timeout: Duration::from_millis(100),
+            max_buffered_events: 16,
+        })
+        .unwrap();
+        let mut events = backend
+            .start(request(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(events.next().await.unwrap().unwrap().payload,
+            ModelEvent::TextDelta { ref delta } if delta == "Partial answer"));
+        let error = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.details["phase"], "response_body");
+        assert_eq!(error.details["timeout"], true);
+        assert_eq!(error.details["content_received"], true);
+        assert_eq!(error.details["received_body_bytes"], expected_bytes);
+        assert!(error.details["idle_ms"].as_u64().unwrap() >= 100);
+        assert!(
+            events.next().await.is_none(),
+            "partial output must not fabricate Finish"
+        );
+        server.abort();
     }
 
     #[tokio::test]
