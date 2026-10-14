@@ -96,6 +96,8 @@ fn native_restore_child() {
         let before = position().unwrap();
         let mut during = None;
         let mut raw_during = None;
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut session = TerminalSession::enter().unwrap();
             let raw = is_raw_mode_enabled().unwrap();
@@ -120,6 +122,7 @@ fn native_restore_child() {
                 session.restore().unwrap();
             }
         }));
+        std::panic::set_hook(previous_hook);
         assert_eq!(result.is_err(), mode == "unwind");
         let after = position().unwrap();
         let raw_after = is_raw_mode_enabled().unwrap();
