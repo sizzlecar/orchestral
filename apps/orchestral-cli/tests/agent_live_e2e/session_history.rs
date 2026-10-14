@@ -470,8 +470,7 @@ fn tui_resume_replays_user_tool_and_assistant_history_without_repeating_file_eff
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(output.status.success(), "{}", output.stderr_text());
-    let mut tui = PtyHarness::spawn(resume_tui(&workspace, "notes", None));
-    tui.resize(140, 50);
+    let mut tui = PtyHarness::spawn_with_size(resume_tui(&workspace, "notes", None), 140, 50);
     for text in [
         "Resumed session notes",
         "Create the requested note",
@@ -553,12 +552,11 @@ fn interrupted_session_reconciles_open_model_attempt_and_continues_without_repea
     assert!(blocked.stderr_text().contains("active control writer"));
     first.child.kill().unwrap();
     first.finish(Duration::from_secs(5));
-    let mut resumed = PtyHarness::spawn(resume_tui(
-        &workspace,
-        "interrupted",
-        Some("Work on the user's task."),
-    ));
-    resumed.resize(140, 50);
+    let mut resumed = PtyHarness::spawn_with_size(
+        resume_tui(&workspace, "interrupted", Some("Work on the user's task.")),
+        140,
+        50,
+    );
     resumed.wait_for_text("Run incomplete", LOCAL_PROCESS_TIMEOUT);
     resumed.send_paste("Continue from the completed document");
     resumed.wait_for_text("INTERRUPTED_SESSION_CONTINUED", LOCAL_PROCESS_TIMEOUT);

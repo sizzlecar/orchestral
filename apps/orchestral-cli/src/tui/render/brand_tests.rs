@@ -215,7 +215,10 @@ fn minimum_terminal_menu_keeps_selected_choice_visible_and_actionable() {
     update(&mut state, UiMsg::SelectCandidate { up: false });
     let text = render_to_string(&state, 20, 6);
     assert!(text.contains("› Model B"), "{text}");
-    assert!(text.lines().next().unwrap().contains("running"), "{text}");
+    assert!(
+        text.lines().rev().nth(1).unwrap().contains("running"),
+        "{text}"
+    );
     assert!(text.contains("↑↓ enter · esc"), "{text}");
     assert!(matches!(update(&mut state, UiMsg::Submit).as_slice(),
         [UiEffect::MenuChoice { kind: MenuKind::Models, value }] if value == "model-b"));
@@ -237,7 +240,7 @@ fn narrow_header_preserves_complete_mark_and_phase() {
         let mut state = UiState::new("session", "model");
         state.phase = phase;
         let text = render_to_string(&state, 20, 6);
-        let header = text.lines().next().unwrap();
+        let header = text.lines().rev().nth(1).unwrap();
         assert!(header.contains("_>."), "{header}");
         assert!(header.contains(label), "{header}");
     }
@@ -288,10 +291,10 @@ fn brand_palette_keeps_conversation_clean_and_panel_boundaries_visible() {
         })
         .unwrap();
     let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(2, 0)].symbol(), "_");
-    assert_eq!(buffer[(2, 0)].bg, Color::Rgb(131, 255, 107));
-    assert_eq!(buffer[(2, 1)].fg, Color::Rgb(131, 255, 107));
-    assert_eq!(buffer[(2, 1)].bg, Color::Rgb(29, 32, 39));
+    assert_eq!(buffer[(2, 14)].symbol(), "_");
+    assert_eq!(buffer[(2, 14)].bg, Color::Rgb(131, 255, 107));
+    assert_eq!(buffer[(2, 0)].fg, Color::Rgb(131, 255, 107));
+    assert_eq!(buffer[(2, 0)].bg, Color::Rgb(29, 32, 39));
     assert!(buffer
         .content
         .iter()
@@ -336,7 +339,7 @@ fn terminal_and_no_color_modes_preserve_readable_user_colors() {
             render(frame, &state);
         })
         .unwrap();
-    let mark = &terminal.backend().buffer()[(2, 0)];
+    let mark = &terminal.backend().buffer()[(2, 10)];
     assert_eq!(mark.fg, Color::White);
     assert_eq!(mark.bg, Color::Rgb(36, 124, 72));
 }

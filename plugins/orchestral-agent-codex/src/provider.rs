@@ -4036,6 +4036,16 @@ async fn codex_content(
             ("text/plain", ContentBody::Inline(Value::String(text))) => {
                 inline_text.push(text.clone());
             }
+            (media_type, ContentBody::Inline(Value::String(data)))
+                if media_type.starts_with("image/") && !data.trim().is_empty() =>
+            {
+                let data_url = if data.starts_with("data:") {
+                    data.clone()
+                } else {
+                    format!("data:{media_type};base64,{data}")
+                };
+                native_artifacts.push(json!({"type": "image", "url": data_url}));
+            }
             (_, ContentBody::Artifact(artifact)) => {
                 if content.media_type.starts_with("image/") {
                     let blob_store = artifact_blob_store.ok_or_else(|| {

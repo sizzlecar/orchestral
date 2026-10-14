@@ -402,6 +402,13 @@ pub(super) fn agent_input_message(
     agent_content_message(&request.run.spec.input)
 }
 
+pub(super) fn is_supported_inline_image_media_type(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
 pub(super) fn agent_content_message(items: &[Content]) -> Result<ModelMessage, AgentProtocolError> {
     let mut content = Vec::with_capacity(items.len());
     for item in items {
@@ -411,13 +418,27 @@ pub(super) fn agent_content_message(items: &[Content]) -> Result<ModelMessage, A
             {
                 content.push(ModelContent::Text { text: text.clone() });
             }
+            (media_type, ContentBody::Inline(serde_json::Value::String(data)))
+                if is_supported_inline_image_media_type(media_type) && !data.trim().is_empty() =>
+            {
+                content.push(ModelContent::Data {
+                    media_type: media_type.to_owned(),
+                    value: serde_json::Value::String(data.clone()),
+                });
+            }
             _ => {
                 return Err(AgentProtocolError::new(
                     AgentProtocolErrorCode::InvalidSpec,
-                    "text-first Generic Agent accepts inline text/plain input only",
+                    "text-first Generic Agent accepts inline text/plain or supported image/* input only",
                 ));
             }
         }
+    }
+    if content.is_empty() {
+        return Err(AgentProtocolError::new(
+            AgentProtocolErrorCode::InvalidSpec,
+            "Generic Agent input must not be empty",
+        ));
     }
     Ok(ModelMessage {
         role: ModelRole::User,

@@ -79,7 +79,7 @@ fn native_console_restores_modes_and_original_buffer_for_each_exit_path() {
             "{observation}"
         );
         assert_eq!(
-            observation["cursor_after"], observation["cursor_before"],
+            observation["cursor_after"], observation["cursor_during"],
             "{observation}"
         );
     }
@@ -96,6 +96,8 @@ fn native_restore_child() {
         let before = position().unwrap();
         let mut during = None;
         let mut raw_during = None;
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut session = TerminalSession::enter().unwrap();
             let raw = is_raw_mode_enabled().unwrap();
@@ -104,7 +106,7 @@ fn native_restore_child() {
             session
                 .draw(|frame| {
                     frame.render_widget(
-                        ratatui::widgets::Paragraph::new("alternate buffer probe"),
+                        ratatui::widgets::Paragraph::new("main screen buffer probe"),
                         frame.area(),
                     );
                     frame.set_cursor_position((17, 11));
@@ -120,13 +122,15 @@ fn native_restore_child() {
                 session.restore().unwrap();
             }
         }));
+        std::panic::set_hook(previous_hook);
         assert_eq!(result.is_err(), mode == "unwind");
         let after = position().unwrap();
         let raw_after = is_raw_mode_enabled().unwrap();
         assert!(!raw_after, "raw input mode survived {mode}");
         assert_eq!(
-            after, before,
-            "original screen buffer was not restored by {mode}"
+            after,
+            during.unwrap(),
+            "main screen cursor was not preserved by {mode}"
         );
         observations.insert(
             mode.into(),

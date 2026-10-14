@@ -1529,7 +1529,12 @@ fn render_compaction_message(message: &ModelMessage) -> Result<String, SessionCo
                 rendered.push_str("data[");
                 rendered.push_str(media_type);
                 rendered.push_str("]=");
-                rendered.push_str(&canonical_summary_json(value)?);
+                if media_type.starts_with("image/") {
+                    let encoded_len = value.as_str().map_or(0, str::len);
+                    rendered.push_str(&format!("<inline image, {encoded_len} base64 bytes>"));
+                } else {
+                    rendered.push_str(&canonical_summary_json(value)?);
+                }
             }
             ModelContent::ToolCall {
                 call_id,

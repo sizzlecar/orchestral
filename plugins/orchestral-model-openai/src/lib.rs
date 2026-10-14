@@ -855,10 +855,16 @@ fn encode_messages(
     let mut encoded = Vec::new();
     for message in messages {
         match message.role {
-            ModelRole::System | ModelRole::User => {
+            ModelRole::System => {
                 encoded.push(json!({
-                    "role": if matches!(message.role, ModelRole::System) { "system" } else { "user" },
+                    "role": "system",
                     "content": flatten_text(&message.content)?,
+                }));
+            }
+            ModelRole::User => {
+                encoded.push(json!({
+                    "role": "user",
+                    "content": encode_user_content(&message.content)?,
                 }));
             }
             ModelRole::Assistant => {
@@ -944,6 +950,54 @@ fn encode_messages(
         }
     }
     Ok(encoded)
+}
+
+fn encode_user_content(content: &[ModelContent]) -> Result<Value, ModelError> {
+    let has_inline_image = content.iter().any(|item| {
+        matches!(
+            item,
+            ModelContent::Data {
+                media_type,
+                value: Value::String(data),
+            } if media_type.starts_with("image/") && !data.trim().is_empty()
+        )
+    });
+    if !has_inline_image {
+        return flatten_text(content).map(Value::String);
+    }
+    let mut parts = Vec::with_capacity(content.len());
+    for item in content {
+        match item {
+            ModelContent::Text { text } => parts.push(json!({
+                "type": "text",
+                "text": text,
+            })),
+            ModelContent::Data {
+                media_type,
+                value: Value::String(data),
+            } if media_type.starts_with("image/") && !data.trim().is_empty() => {
+                let url = if data.starts_with("data:") {
+                    data.clone()
+                } else {
+                    format!("data:{media_type};base64,{data}")
+                };
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": url },
+                }));
+            }
+            ModelContent::Json { value } | ModelContent::Data { value, .. } => parts.push(json!({
+                "type": "text",
+                "text": value.to_string(),
+            })),
+            _ => {
+                return Err(ModelError::invalid_request(
+                    "this role cannot contain Tool call/result blocks",
+                ))
+            }
+        }
+    }
+    Ok(Value::Array(parts))
 }
 
 fn flatten_text(content: &[ModelContent]) -> Result<String, ModelError> {

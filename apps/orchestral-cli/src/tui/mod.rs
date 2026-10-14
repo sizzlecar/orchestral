@@ -5,6 +5,7 @@
 
 mod activity;
 mod app;
+mod clipboard;
 mod editor;
 mod files;
 mod history;
@@ -27,7 +28,9 @@ mod viewport;
 
 pub(crate) use app::{run_tui, TuiResume};
 pub(crate) use history::history_entries;
-pub(crate) use render::{render_cached, RenderCache};
+#[cfg(test)]
+pub(crate) use render::render_cached;
+pub(crate) use render::RenderCache;
 #[cfg(test)]
 pub(crate) use state::TranscriptEntry;
 pub(crate) use state::{update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};

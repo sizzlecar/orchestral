@@ -143,27 +143,57 @@ pub(crate) fn history_entries(history: &SessionHistory) -> Vec<TranscriptEntry> 
 }
 
 fn contents_text(contents: &[Content]) -> String {
+    let has_text = contents.iter().any(|content| {
+        content.media_type == "text/plain"
+            && matches!(
+                &content.body,
+                ContentBody::Inline(serde_json::Value::String(text)) if !text.is_empty()
+            )
+    });
     contents
         .iter()
-        .map(|content| match &content.body {
-            ContentBody::Inline(serde_json::Value::String(text)) => text.clone(),
-            body => serde_json::to_string(body).unwrap_or_default(),
+        .enumerate()
+        .filter_map(|(index, content)| {
+            if content.media_type.starts_with("image/") {
+                if has_text {
+                    None
+                } else {
+                    Some(format!("[Image #{}]", index + 1))
+                }
+            } else {
+                match &content.body {
+                    ContentBody::Inline(serde_json::Value::String(text)) => Some(text.clone()),
+                    body => serde_json::to_string(body).ok(),
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 fn model_text(message: &ModelMessage) -> String {
+    let has_text = message
+        .content
+        .iter()
+        .any(|content| matches!(content, ModelContent::Text { text } if !text.is_empty()));
     message
         .content
         .iter()
-        .map(|content| match content {
-            ModelContent::Text { text } => text.clone(),
+        .enumerate()
+        .filter_map(|(index, content)| match content {
+            ModelContent::Text { text } => Some(text.clone()),
+            ModelContent::Data { media_type, .. } if media_type.starts_with("image/") => {
+                if has_text {
+                    None
+                } else {
+                    Some(format!("[Image #{}]", index + 1))
+                }
+            }
             ModelContent::ToolCall {
                 name, arguments, ..
-            } => format!("{name}: {arguments}"),
-            ModelContent::ToolResult { result, .. } => result.to_string(),
-            content => serde_json::to_string(content).unwrap_or_default(),
+            } => Some(format!("{name}: {arguments}")),
+            ModelContent::ToolResult { result, .. } => Some(result.to_string()),
+            content => serde_json::to_string(content).ok(),
         })
         .collect::<Vec<_>>()
         .join("\n")

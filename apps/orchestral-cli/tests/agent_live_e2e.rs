@@ -2949,7 +2949,9 @@ fn local_tui_command(
 struct PtyHarness {
     started: Instant,
     recording: Option<Vec<serde_json::Value>>,
+    initial_size: (u16, u16),
     max_size: (u16, u16),
+    resizes: Vec<(usize, u16, u16)>,
     screen: vt100::Parser,
     screen_frames: Vec<String>,
     master: Box<dyn MasterPty + Send>,
@@ -2963,6 +2965,8 @@ struct PtyHarness {
 struct PtyOutput {
     status: PtyExitStatus,
     bytes: Vec<u8>,
+    initial_size: (u16, u16),
+    resizes: Vec<(usize, u16, u16)>,
 }
 
 fn physical_screen_contents(screen: &vt100::Screen) -> String {
@@ -2972,6 +2976,27 @@ fn physical_screen_contents(screen: &vt100::Screen) -> String {
         .rows(0, screen.size().1)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn full_scrollback_contents(screen: &mut vt100::Screen) -> String {
+    let (rows, _) = screen.size();
+    let step = usize::from(rows.max(1));
+    screen.set_scrollback(usize::MAX);
+    let max_offset = screen.scrollback();
+    let mut out = String::new();
+    let mut offset = max_offset;
+    loop {
+        screen.set_scrollback(offset);
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&physical_screen_contents(screen));
+        if offset == 0 {
+            break;
+        }
+        offset = offset.saturating_sub(step);
+    }
+    out
 }
 
 #[test]
@@ -3071,6 +3096,62 @@ impl PtyOutput {
                 self.text()
             );
         }
+        // Main-screen rendering preserves the terminal's native scrollback and
+        // mouse selection; neither alternate screen, mouse capture, nor
+        // destructive Clear(All) may be emitted.
+        for forbidden in [
+            b"\x1b[?1049h".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[2J".as_slice(),
+        ] {
+            assert!(
+                !self
+                    .bytes
+                    .windows(forbidden.len())
+                    .any(|part| part == forbidden),
+                "forbidden terminal sequence {:?} was emitted in PTY output:\n{}",
+                String::from_utf8_lossy(forbidden),
+                self.text()
+            );
+        }
+        let (cols, rows) = (self.initial_size.0.max(20), self.initial_size.1.max(6));
+        let mut parser = vt100::Parser::new(rows, cols, 1_000);
+        parser.process(b"PRE_TUI_SHELL_LINE\r\n");
+        let mut offset = 0usize;
+        for &(resize_at, new_cols, new_rows) in &self.resizes {
+            let clamped = resize_at.min(self.bytes.len());
+            if clamped > offset {
+                parser.process(&self.bytes[offset..clamped]);
+                offset = clamped;
+            }
+            parser
+                .screen_mut()
+                .set_size(new_rows.max(6), new_cols.max(20));
+        }
+        if offset < self.bytes.len() {
+            parser.process(&self.bytes[offset..]);
+        }
+        parser.process(b"RETURNED_PROMPT>");
+        let active_after_exit = physical_screen_contents(parser.screen());
+        assert!(
+            !active_after_exit.contains("do anything"),
+            "composer placeholder was not cleared on exit:\n{active_after_exit}"
+        );
+        let prompt_line = active_after_exit
+            .lines()
+            .find(|line| line.contains("RETURNED_PROMPT>"))
+            .expect("post-exit prompt should be visible");
+        assert_eq!(
+            prompt_line.trim(),
+            "RETURNED_PROMPT>",
+            "post-exit shell prompt overlapped stale TUI text:\n{active_after_exit}"
+        );
+        let full_history = full_scrollback_contents(parser.screen_mut());
+        assert!(
+            full_history.contains("PRE_TUI_SHELL_LINE"),
+            "pre-TUI shell output was erased instead of preserved in scrollback:\n{full_history}"
+        );
         let assert_restored = |enabled: &[u8], disabled: &[u8]| {
             let enter = self
                 .bytes
@@ -3086,11 +3167,6 @@ impl PtyOutput {
         };
         assert_restored(b"\x1b[?2004h", b"\x1b[?2004l");
         assert_restored(b"\x1b[?25l", b"\x1b[?25h");
-        // Windows Server's ConPTY consumes 1049 rather than forwarding it.
-        // The terminal module's native-console test checks the real raw mode
-        // and original buffer restoration for explicit, Drop and unwind paths.
-        #[cfg(unix)]
-        assert_restored(b"\x1b[?1049h", b"\x1b[?1049l");
     }
 }
 
@@ -3159,8 +3235,10 @@ impl PtyHarness {
         Self {
             started: Instant::now(),
             recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
+            initial_size: (cols, rows),
             max_size: (cols, rows),
-            screen: vt100::Parser::new(rows, cols, 0),
+            resizes: Vec::new(),
+            screen: vt100::Parser::new(rows, cols, 1_000),
             screen_frames: Vec::new(),
             master: pair.master,
             child,
@@ -3172,7 +3250,14 @@ impl PtyHarness {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        if self.latest.is_empty() {
+            self.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+        }
+        while let Ok(bytes) = self.updates.try_recv() {
+            self.receive(bytes);
+        }
         self.max_size = (self.max_size.0.max(cols), self.max_size.1.max(rows));
+        self.resizes.push((self.latest.len(), cols, rows));
         self.screen.screen_mut().set_size(rows, cols);
         self.master
             .resize(PtySize {
@@ -3339,7 +3424,12 @@ impl PtyHarness {
         }
         drop(self.master);
         let bytes = self.reader.join().expect("join TUI PTY reader");
-        PtyOutput { status, bytes }
+        PtyOutput {
+            status,
+            bytes,
+            initial_size: self.initial_size,
+            resizes: self.resizes,
+        }
     }
 }
 
@@ -4260,7 +4350,18 @@ fn model_request_text(request: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|message| message["content"].as_str())
+        .flat_map(|message| {
+            if let Some(text) = message["content"].as_str() {
+                vec![text.to_owned()]
+            } else if let Some(parts) = message["content"].as_array() {
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str().map(str::to_owned))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

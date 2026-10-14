@@ -106,6 +106,18 @@ impl AgentClient {
                 "Agent input must not be empty".to_owned(),
             ));
         }
+        self.start_content(vec![Content::text(input)]).await
+    }
+
+    pub async fn start_content(
+        &self,
+        input: Vec<Content>,
+    ) -> Result<AgentRunHandle, AgentSdkError> {
+        if input.is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Agent input must not be empty".to_owned(),
+            ));
+        }
         let sequence = self.next_run.fetch_add(1, Ordering::SeqCst);
         self.start_with_run_id(
             RunId::new(format!(
@@ -113,7 +125,7 @@ impl AgentClient {
                 self.session_id.as_str(),
                 uuid::Uuid::new_v4()
             )),
-            vec![Content::text(input)],
+            input,
         )
         .await
     }
@@ -244,13 +256,20 @@ impl AgentRunHandle {
                 "Steer input must not be empty".to_owned(),
             ));
         }
+        self.steer_content(vec![Content::text(input)]).await
+    }
+
+    pub async fn steer_content(&self, content: Vec<Content>) -> Result<CommandAck, AgentSdkError> {
+        if content.is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Steer input must not be empty".to_owned(),
+            ));
+        }
         let command = AgentCommandEnvelope::new(
             CommandId::new(format!("sdk-steer-{}", uuid::Uuid::new_v4())),
             self.run_id.clone(),
             None,
-            AgentCommand::Steer {
-                content: vec![Content::text(input)],
-            },
+            AgentCommand::Steer { content },
         )?;
         self.command(command).await
     }
@@ -266,14 +285,26 @@ impl AgentRunHandle {
                 "Input resolution must not be empty".to_owned(),
             ));
         }
+        self.resolve_input_content(request_id, vec![Content::text(input)])
+            .await
+    }
+
+    pub async fn resolve_input_content(
+        &self,
+        request_id: RequestId,
+        content: Vec<Content>,
+    ) -> Result<CommandAck, AgentSdkError> {
+        if content.is_empty() {
+            return Err(AgentSdkError::InvalidInput(
+                "Input resolution must not be empty".to_owned(),
+            ));
+        }
         let command = AgentCommandEnvelope::new(
             CommandId::new(format!("sdk-input-{}", uuid::Uuid::new_v4())),
             self.run_id.clone(),
             Some(request_id),
             AgentCommand::ResolveRequest {
-                response: RequestResolution::Input {
-                    content: vec![Content::text(input)],
-                },
+                response: RequestResolution::Input { content },
             },
         )?;
         self.command(command).await

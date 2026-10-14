@@ -788,32 +788,40 @@ fn tui_pty_keeps_reading_anchor_when_later_output_commits() {
         |s| s.contains("history row 079") && s.contains("replied"),
         LOCAL_PROCESS_TIMEOUT,
     );
+    let native_scrollback = full_scrollback_contents(tui.screen.screen_mut());
+    for i in 0..80 {
+        let expected = format!("history row {i:03}");
+        assert!(
+            native_scrollback.contains(&expected),
+            "missing {expected} across native scrollback + screen:\n{native_scrollback}"
+        );
+    }
     tui.send_paste("second request");
     let mut before = tui.wait_for_screen(|s| s.contains("running"), LOCAL_PROCESS_TIMEOUT);
     for _ in 0..2 {
-        let previous_top = before.lines().nth(1).unwrap().trim().to_owned();
+        let previous_top = before.lines().next().unwrap().trim().to_owned();
         tui.send(b"\x1b[5~");
         before = tui.wait_for_screen(
             |s| {
                 s.contains("history · end to follow")
                     && s.lines()
-                        .nth(1)
+                        .next()
                         .is_some_and(|line| line.trim() != previous_top)
             },
             LOCAL_PROCESS_TIMEOUT,
         );
     }
-    let anchor = before.lines().nth(1).unwrap().trim().to_owned();
+    let anchor = before.lines().next().unwrap().trim().to_owned();
     assert!(anchor.contains("history row"), "{before}");
     release.send(()).unwrap();
     let after = tui.wait_for_screen(
         |s| s.contains("replied") && s.contains("new output"),
         LOCAL_PROCESS_TIMEOUT,
     );
-    assert_eq!(after.lines().nth(1).unwrap().trim(), anchor);
+    assert_eq!(after.lines().next().unwrap().trim(), anchor);
     tui.resize(100, 30);
     let resized = tui.wait_for_screen(
-        |s| s.lines().nth(1).is_some_and(|line| line.trim() == anchor),
+        |s| s.lines().next().is_some_and(|line| line.trim() == anchor),
         LOCAL_PROCESS_TIMEOUT,
     );
     assert!(!resized.contains("new answer row 079"));
@@ -827,6 +835,112 @@ fn tui_pty_keeps_reading_anchor_when_later_output_commits() {
     assert!(output.status.success());
     output.assert_terminal_restored();
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn tui_pty_pastes_images_from_paths_and_clipboard_as_multimodal_content() {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
+
+    const ONE_BY_ONE_PNG: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I',
+        b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("tui-image-paste");
+    let diagram_path = workspace.path("Screen Shot 1.png");
+    let clipboard_path = workspace.path("clipboard-shot.png");
+    fs::write(&diagram_path, ONE_BY_ONE_PNG).unwrap();
+    fs::write(&clipboard_path, ONE_BY_ONE_PNG).unwrap();
+    let expected_data_url = format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(ONE_BY_ONE_PNG)
+    );
+
+    let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(move |request| {
+        let user_msg = request.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("user message");
+        let parts = user_msg["content"]
+            .as_array()
+            .expect("multimodal user content array");
+        assert_eq!(parts.len(), 2, "only [Image #1] should be sent: {parts:?}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "[Image #1] Describe this diagram");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], expected_data_url);
+        openai_text_response("IMAGE_INSPECTED_OK")
+    })]);
+    workspace.configure_local_openai(&endpoint);
+
+    let mut command = local_tui_command(
+        &workspace,
+        "image-paste-session",
+        "Follow the user's request.",
+    );
+    command.env("ORCHESTRAL_TUI_CLIPBOARD_IMAGE", &clipboard_path);
+    let mut tui = PtyHarness::spawn(command);
+    tui.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
+
+    // 1. Bracketed paste of a local image file path attaches [Image #1].
+    let pasted_path = diagram_path.to_string_lossy().into_owned();
+    tui.send(format!("\x1b[200~{pasted_path}\x1b[201~").as_bytes());
+    tui.wait_for_screen(
+        |s| s.contains("› [Image #1]") && s.contains("Attached [Image #1]"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+
+    // 2. Ctrl+V pastes from the system clipboard as [Image #2].
+    tui.send(b"\x16");
+    tui.wait_for_screen(
+        |s| s.contains("› [Image #1] [Image #2]") && s.contains("Attached [Image #2]"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+
+    // 3. Backspace deletes [Image #2] atomically, then one more backspace deletes the space.
+    tui.send(b"\x7f\x7f");
+    tui.wait_for_screen(
+        |s| s.contains("› [Image #1]") && !s.contains("[Image #2]"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+
+    // 4. Add text and submit.
+    tui.send(b" Describe this diagram\r");
+    tui.wait_for_screen(
+        |s| s.contains("IMAGE_INSPECTED_OK") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+
+    // 5. Verify /resume shows the clean placeholder and never leaks raw base64.
+    tui.send_paste("/resume");
+    let resume_screen = tui.wait_for_screen(
+        |s| {
+            s.contains("Sessions · this workspace")
+                && s.contains("[Image #1] Describe this diagram")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(!resume_screen.contains("iVBORw0KGgo"));
+    tui.send(b"\r");
+    let resumed_transcript = tui.wait_for_screen(
+        |s| s.contains("Resumed ·") && s.contains("IMAGE_INSPECTED_OK"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(resumed_transcript.contains("[Image #1] Describe this diagram"));
+    assert!(!resumed_transcript.contains("iVBORw0KGgo"));
+
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success());
+    output.assert_terminal_restored();
+    assert_eq!(server.join().unwrap().len(), 1);
 }
 
 // Inspect long read-only panels through the same paging keys used by a person.
@@ -944,7 +1058,10 @@ fn tui_pty_skill_catalog_keeps_details_and_preferences_out_of_the_conversation()
         |s| {
             s.contains("report-builder")
                 && s.contains('…')
-                && s.lines().next().is_some_and(|line| line.contains("ready"))
+                && s.lines()
+                    .rev()
+                    .nth(1)
+                    .is_some_and(|line| line.contains("ready"))
         },
         LOCAL_PROCESS_TIMEOUT,
     );

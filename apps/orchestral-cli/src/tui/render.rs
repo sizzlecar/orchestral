@@ -31,13 +31,33 @@ const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 mod welcome;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ScrollbackCursor {
+    #[default]
+    Start,
+    Before(Anchor),
+    SettledEnd {
+        settled_entries: usize,
+    },
+}
+
 #[derive(Default)]
 pub(crate) struct RenderCache {
     key: Option<(String, u16, bool)>,
     revision: u64,
     offsets: Vec<usize>,
     committed_rows: usize,
+    settled_rows: usize,
+    scrollback_emitted: usize,
+    scrollback_cursor: ScrollbackCursor,
+    exit_cursor_row: u16,
     rows: Vec<Row>,
+}
+
+impl RenderCache {
+    pub(crate) fn exit_cursor_row(&self) -> u16 {
+        self.exit_cursor_row
+    }
 }
 
 #[cfg(test)]
@@ -45,23 +65,34 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) -> Option<Anchor> {
     render_cached(frame, state, &mut RenderCache::default())
 }
 
-pub(crate) fn render_cached(
-    frame: &mut Frame<'_>,
+pub(crate) type DrawOutcome = ((u16, u16), Option<Anchor>);
+
+pub(crate) fn draw_with_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
     state: &UiState,
     cache: &mut RenderCache,
-) -> Option<Anchor> {
-    let area = frame.area();
-    if area.width < 20 || area.height < 6 {
-        frame.render_widget(
-            Paragraph::new("_>. Orchestral\nResize to at least 20×6")
-                .style(ERROR)
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        apply_theme(frame, state);
-        return state.viewport.anchor.clone();
+) -> Result<DrawOutcome, B::Error> {
+    terminal.autoresize()?;
+    let size = terminal.size()?;
+    let area = Rect::new(0, 0, size.width, size.height);
+    let scrollback = pending_scrollback_lines(area, state, cache);
+    if !scrollback.is_empty() && size.width > 0 && size.height > 0 {
+        emit_scrollback_lines(terminal, &scrollback, size.width, size.height, state)?;
     }
+    let mut actual_size = (size.width, size.height);
+    let mut anchor = state.viewport.anchor.clone();
+    terminal.draw(|frame| {
+        actual_size = (frame.area().width, frame.area().height);
+        anchor = render_cached(frame, state, cache);
+    })?;
+    Ok((actual_size, anchor))
+}
 
+fn is_idle_welcome(state: &UiState) -> bool {
+    state.phase == UiPhase::Idle && state.transcript.is_empty() && state.run_id.is_none()
+}
+
+fn layout_areas(area: Rect, state: &UiState) -> [Rect; 7] {
     let completion = super::interaction::completion(state);
     let menu = state.menu.as_ref().or(completion.as_ref());
     // The header still shows the run phase when a tiny screen needs these rows
@@ -89,46 +120,144 @@ pub(crate) fn render_cached(
         } else {
             0
         };
-    let rows = Layout::vertical([
-        Constraint::Length(1),
+    Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(status_height),
         Constraint::Length(pending_height),
         Constraint::Length(queue_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
+        Constraint::Length(1),
     ])
-    .split(area);
+    .areas(area)
+}
 
-    render_header(frame, rows[0], state);
-    let anchor =
-        if state.phase == UiPhase::Idle && state.transcript.is_empty() && state.run_id.is_none() {
-            welcome::render(frame, rows[1], state);
-            None
-        } else {
-            render_transcript(frame, rows[1], state, cache)
-        };
-    render_working_status(frame, rows[2], state);
+fn pending_scrollback_lines(
+    area: Rect,
+    state: &UiState,
+    cache: &mut RenderCache,
+) -> Vec<Line<'static>> {
+    if area.width < 20 || area.height < 6 || is_idle_welcome(state) {
+        return Vec::new();
+    }
+    let rows = layout_areas(area, state);
+    let inner = Block::default()
+        .padding(Padding::horizontal(CONTENT_PADDING))
+        .inner(rows[0]);
+    let width = inner.width.max(1);
+    update_transcript_cache(state, cache, width);
+    let (top, next_anchor) = viewport::window(&cache.rows, inner.height as usize, &state.viewport);
+    let settled_top = top.min(cache.settled_rows);
+    if next_anchor.is_some() || settled_top <= cache.scrollback_emitted {
+        return Vec::new();
+    }
+    let emitted = cache.rows[cache.scrollback_emitted..settled_top]
+        .iter()
+        .map(|row| row.text.clone())
+        .collect();
+    cache.scrollback_emitted = settled_top;
+    cache.scrollback_cursor =
+        scrollback_cursor_at(&cache.rows, &cache.offsets, cache.settled_rows, settled_top);
+    emitted
+}
+
+fn emit_scrollback_lines<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    lines: &[Line<'static>],
+    width: u16,
+    height: u16,
+    state: &UiState,
+) -> Result<(), B::Error> {
+    use ratatui::backend::ClearType;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+    use ratatui::widgets::Widget;
+
+    let chunk_max = usize::from(height.max(1));
+    for chunk in lines.chunks(chunk_max) {
+        let chunk_height = u16::try_from(chunk.len()).unwrap_or(height);
+        let chunk_area = Rect::new(0, 0, width, chunk_height);
+        let mut buffer = Buffer::empty(chunk_area);
+        Paragraph::new(chunk.to_vec())
+            .block(Block::default().padding(Padding::horizontal(CONTENT_PADDING)))
+            .render(chunk_area, &mut buffer);
+        apply_theme_to_buffer(&mut buffer, state);
+
+        let empty = Buffer::empty(chunk_area);
+        let backend = terminal.backend_mut();
+        for y in 0..chunk_height {
+            backend.set_cursor_position(Position::new(0, y))?;
+            backend.clear_region(ClearType::CurrentLine)?;
+        }
+        backend.draw(empty.diff_iter(&buffer))?;
+        backend.set_cursor_position(Position::new(0, height.saturating_sub(1)))?;
+        backend.append_lines(chunk_height)?;
+    }
+
+    let backend = terminal.backend_mut();
+    for y in 0..height {
+        backend.set_cursor_position(Position::new(0, y))?;
+        backend.clear_region(ClearType::CurrentLine)?;
+    }
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
+}
+
+pub(crate) fn render_cached(
+    frame: &mut Frame<'_>,
+    state: &UiState,
+    cache: &mut RenderCache,
+) -> Option<Anchor> {
+    let area = frame.area();
+    if area.width < 20 || area.height < 6 {
+        frame.render_widget(
+            Paragraph::new("_>. Orchestral\nResize to at least 20×6")
+                .style(ERROR)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        apply_theme(frame, state);
+        return state.viewport.anchor.clone();
+    }
+
+    let completion = super::interaction::completion(state);
+    let menu = state.menu.as_ref().or(completion.as_ref());
+    let rows = layout_areas(area, state);
+
+    let anchor = if is_idle_welcome(state) {
+        cache.exit_cursor_row = 0;
+        welcome::render(frame, rows[0], state);
+        None
+    } else {
+        render_transcript(frame, rows[0], state, cache)
+    };
+    render_working_status(frame, rows[1], state);
     if let Some(menu) = menu {
-        render_menu(frame, rows[3], menu);
+        render_menu(frame, rows[2], menu);
     } else if let Some(pending) = &state.pending {
         render_pending(
             frame,
-            rows[3],
+            rows[2],
             pending,
             state.approval_choice,
             state.approval_scroll,
         );
     }
-    render_input_queue(frame, rows[4], state);
-    render_composer(frame, rows[5], state);
+    render_input_queue(frame, rows[3], state);
+    render_composer(frame, rows[4], state);
+    render_header(frame, rows[5], state);
     render_footer(frame, rows[6], state);
     apply_theme(frame, state);
     anchor
 }
 
 fn apply_theme(frame: &mut Frame<'_>, state: &UiState) {
-    for cell in &mut frame.buffer_mut().content {
+    apply_theme_to_buffer(frame.buffer_mut(), state);
+}
+
+fn apply_theme_to_buffer(buffer: &mut ratatui::buffer::Buffer, state: &UiState) {
+    for cell in &mut buffer.content {
         let safe = super::text::plain(cell.symbol());
         if let std::borrow::Cow::Owned(safe) = safe {
             cell.set_symbol(&safe);
@@ -367,20 +496,22 @@ fn compact_label(text: &str, width: usize) -> String {
     result
 }
 
-fn render_transcript(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &UiState,
-    cache: &mut RenderCache,
-) -> Option<Anchor> {
-    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
-    let inner = block.inner(area);
-    let width = inner.width.max(1);
+fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16) {
     let key = (state.session_id.clone(), width, state.tools_expanded);
     if cache.key.as_ref() != Some(&key) {
+        let same_session = cache
+            .key
+            .as_ref()
+            .is_some_and(|(session_id, _, _)| session_id == &state.session_id);
+        let scrollback_cursor = if same_session {
+            std::mem::take(&mut cache.scrollback_cursor)
+        } else {
+            ScrollbackCursor::Start
+        };
         *cache = RenderCache {
             key: Some(key),
             revision: state.transcript_revision.wrapping_sub(1),
+            scrollback_cursor,
             ..Default::default()
         };
     }
@@ -408,6 +539,29 @@ fn render_transcript(
         }
         cache.committed_rows = cache.rows.len();
         let stream = state.streamed_text();
+        let first_unsettled = state
+            .transcript
+            .iter()
+            .enumerate()
+            .position(|(idx, entry)| {
+                (entry.role == TranscriptRole::Tool
+                    && entry.tool_status == Some(ActivityStatus::Running))
+                    || (entry.role == TranscriptRole::Reasoning
+                        && idx + 1 == state.transcript.len()
+                        && matches!(state.phase, UiPhase::Running)
+                        && stream.is_empty())
+            });
+        cache.settled_rows = first_unsettled
+            .and_then(|idx| cache.offsets.get(idx).copied())
+            .unwrap_or(cache.committed_rows);
+        let settled_entries = first_unsettled.unwrap_or(state.transcript.len());
+        cache.scrollback_emitted = resolve_scrollback_cursor(
+            &cache.rows,
+            &cache.offsets,
+            cache.settled_rows,
+            settled_entries,
+            &cache.scrollback_cursor,
+        );
         if !stream.is_empty() {
             let mut lines = Vec::new();
             if !cache.rows.is_empty() {
@@ -434,8 +588,83 @@ fn render_transcript(
         }
         cache.revision = state.transcript_revision;
     }
+}
+
+fn scrollback_cursor_at(
+    rows: &[Row],
+    offsets: &[usize],
+    settled_rows: usize,
+    emitted: usize,
+) -> ScrollbackCursor {
+    let emitted = emitted.min(settled_rows).min(rows.len());
+    if emitted == 0 {
+        ScrollbackCursor::Start
+    } else if emitted < settled_rows {
+        ScrollbackCursor::Before(rows[emitted].anchor.clone())
+    } else {
+        let settled_entries = offsets
+            .iter()
+            .take_while(|&&offset| offset < settled_rows)
+            .count();
+        ScrollbackCursor::SettledEnd { settled_entries }
+    }
+}
+
+fn resolve_scrollback_cursor(
+    rows: &[Row],
+    offsets: &[usize],
+    settled_rows: usize,
+    total_settled_entries: usize,
+    cursor: &ScrollbackCursor,
+) -> usize {
+    let settled = &rows[..settled_rows.min(rows.len())];
+    match cursor {
+        ScrollbackCursor::Start => 0,
+        ScrollbackCursor::Before(anchor) => settled
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.anchor.entry == anchor.entry)
+            .take_while(|(_, row)| {
+                (row.anchor.line, row.anchor.column) <= (anchor.line, anchor.column)
+            })
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        ScrollbackCursor::SettledEnd { settled_entries } => {
+            if *settled_entries >= total_settled_entries {
+                settled.len()
+            } else {
+                offsets
+                    .get(*settled_entries)
+                    .copied()
+                    .unwrap_or(settled.len())
+                    .min(settled.len())
+            }
+        }
+    }
+}
+
+fn render_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &UiState,
+    cache: &mut RenderCache,
+) -> Option<Anchor> {
+    let block = Block::default().padding(Padding::horizontal(CONTENT_PADDING));
+    let inner = block.inner(area);
+    let width = inner.width.max(1);
+    update_transcript_cache(state, cache, width);
     let rows = &cache.rows;
-    let (top, anchor) = viewport::window(rows, inner.height as usize, &state.viewport);
+    let (raw_top, anchor) = viewport::window(rows, inner.height as usize, &state.viewport);
+    let top = if anchor.is_none() {
+        raw_top.max(cache.scrollback_emitted)
+    } else {
+        raw_top
+    };
+    let visible_rows = rows.len().saturating_sub(top).min(inner.height as usize);
+    cache.exit_cursor_row = inner
+        .y
+        .saturating_add(u16::try_from(visible_rows).unwrap_or(inner.height));
     frame.render_widget(
         Paragraph::new(
             rows.iter()
@@ -1064,7 +1293,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 layout
                     .lines
                     .into_iter()
-                    .map(|line| Line::styled(line, ASSISTANT))
+                    .map(|line| composer_styled_line(&line, &state.images))
                     .collect::<Vec<_>>(),
             ))
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
@@ -1097,6 +1326,41 @@ struct ComposerLayout {
     lines: Vec<String>,
     cursor_row: usize,
     cursor_column: usize,
+}
+
+fn composer_styled_line(line: &str, images: &[super::clipboard::ImageAttachment]) -> Line<'static> {
+    if images.is_empty() {
+        return Line::styled(line.to_owned(), ASSISTANT);
+    }
+    let mut spans = Vec::new();
+    let mut remaining = line;
+    while !remaining.is_empty() {
+        let next_match = images
+            .iter()
+            .filter_map(|image| {
+                remaining
+                    .find(&image.marker)
+                    .map(|pos| (pos, image.marker.as_str()))
+            })
+            .min_by_key(|(pos, _)| *pos);
+        let Some((pos, marker)) = next_match else {
+            spans.push(Span::styled(remaining.to_owned(), ASSISTANT));
+            break;
+        };
+        if pos > 0 {
+            spans.push(Span::styled(remaining[..pos].to_owned(), ASSISTANT));
+        }
+        spans.push(Span::styled(
+            marker.to_owned(),
+            ACCENT.add_modifier(Modifier::BOLD),
+        ));
+        remaining = &remaining[pos + marker.len()..];
+    }
+    if spans.is_empty() {
+        Line::styled(String::new(), ASSISTANT)
+    } else {
+        Line::from(spans)
+    }
 }
 
 impl ComposerLayout {
@@ -1775,7 +2039,7 @@ mod tests {
             .expect("render long CJK composer");
 
         let cursor = terminal.backend().cursor_position();
-        assert_eq!(cursor.y, 10, "cursor should stay above the footer");
+        assert_eq!(cursor.y, 9, "cursor should stay above the footer");
         assert_eq!(
             terminal.backend().buffer()[(cursor.x.saturating_sub(2), cursor.y)].symbol(),
             "末",
@@ -2037,6 +2301,119 @@ mod tests {
         assert_eq!(super::fmt_elapsed_compact(0), "0s");
         assert_eq!(super::fmt_elapsed_compact(61), "1m 01s");
         assert_eq!(super::fmt_elapsed_compact(3_661), "1h 01m 01s");
+    }
+
+    #[test]
+    fn overflowed_transcript_emits_to_native_scrollback_without_duplicating_on_resize() {
+        let mut state = UiState::new("session-native-scrollback", "model");
+        update(
+            &mut state,
+            UiMsg::InsertText("first request 中文".to_owned()),
+        );
+        update(&mut state, UiMsg::Submit);
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run-1".to_owned(),
+            },
+        );
+        let body = (0..30)
+            .map(|i| format!("scrollback line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        update(
+            &mut state,
+            UiMsg::OutputCommitted {
+                output_id: "out-1".to_owned(),
+                text: body.clone(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::Completed {
+                final_text: Some(body),
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut cache = super::RenderCache::default();
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+
+        let scrollback = buffer_to_string(terminal.backend().scrollback());
+        let visible = buffer_to_string(terminal.backend().buffer());
+        let combined = format!("{scrollback}{visible}");
+        assert!(scrollback.contains("› first request 中文"), "{scrollback}");
+        assert!(!scrollback.contains("_>. ORCHESTRAL"), "{scrollback}");
+        for i in 0..30 {
+            let expected = format!("scrollback line {i:02}");
+            assert!(
+                combined.contains(&expected),
+                "missing {expected} across scrollback + visible:\n{combined}"
+            );
+        }
+        assert!(visible.contains("scrollback line 29"), "{visible}");
+        assert!(!visible.contains("scrollback line 00"), "{visible}");
+        assert!(
+            !visible
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("_>. ORCHESTRAL"),
+            "{visible}"
+        );
+
+        let emitted_height = terminal.backend().scrollback().area.height;
+        assert!(emitted_height > 0);
+
+        // Redrawing and resizing larger within the same session must not re-emit past history.
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        assert_eq!(terminal.backend().scrollback().area.height, emitted_height);
+        terminal.backend_mut().resize(80, 14);
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        assert_eq!(terminal.backend().scrollback().area.height, emitted_height);
+
+        // Shrinking from 80x24 to 60x12 must emit newly overflowed lines (11..=22) without gaps.
+        let mut shrink_terminal_80x24 = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut shrink_cache = super::RenderCache::default();
+        super::draw_with_scrollback(&mut shrink_terminal_80x24, &state, &mut shrink_cache).unwrap();
+        let scrollback_80x24 = buffer_to_string(shrink_terminal_80x24.backend().scrollback());
+        let mut shrink_terminal_60x12 = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        super::draw_with_scrollback(&mut shrink_terminal_60x12, &state, &mut shrink_cache).unwrap();
+        let scrollback_60x12 = buffer_to_string(shrink_terminal_60x12.backend().scrollback());
+        let shrink_visible = buffer_to_string(shrink_terminal_60x12.backend().buffer());
+        assert!(
+            scrollback_60x12.contains("scrollback line 11")
+                && scrollback_60x12.contains("scrollback line 22"),
+            "shrinking to 60x12 did not emit newly overflowed lines 11..=22:\n{scrollback_60x12}"
+        );
+        let shrink_combined = format!("{scrollback_80x24}{scrollback_60x12}{shrink_visible}");
+        for i in 0..30 {
+            let expected = format!("scrollback line {i:02}");
+            assert!(
+                shrink_combined.contains(&expected),
+                "missing {expected} after 80x24 -> 60x12 shrink:\n{shrink_combined}"
+            );
+        }
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        let width = buffer.area.width;
+        let height = buffer.area.height;
+        let mut output = String::new();
+        for y in 0..height {
+            let mut line = String::new();
+            let mut x = 0;
+            while x < width {
+                let symbol = buffer[(x, y)].symbol();
+                line.push_str(symbol);
+                x = x.saturating_add(
+                    u16::try_from(UnicodeWidthStr::width(symbol).max(1)).unwrap_or(1),
+                );
+            }
+            output.push_str(line.trim_end());
+            output.push('\n');
+        }
+        output
     }
 
     pub(super) fn render_to_string(state: &UiState, width: u16, height: u16) -> String {
