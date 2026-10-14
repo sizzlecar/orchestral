@@ -41,6 +41,8 @@ mod failure_diagnostics;
 mod gemini_context;
 #[path = "agent_live_e2e/input_mode.rs"]
 mod input_mode;
+#[path = "agent_live_e2e/local_host.rs"]
+mod local_host;
 #[path = "agent_live_e2e/model_retry.rs"]
 mod model_retry;
 #[path = "agent_live_e2e/project_instructions.rs"]
@@ -2924,6 +2926,7 @@ fn local_tui_command(
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
     command.cwd(&workspace.root);
     command.env("OPENAI_API_KEY", "fixture-key");
+    command.env("ORCHESTRAL_HOME", workspace.path("user-config"));
     command.args([
         "--config",
         workspace

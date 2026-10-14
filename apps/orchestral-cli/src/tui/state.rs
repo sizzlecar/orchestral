@@ -231,6 +231,10 @@ pub(crate) enum UiMsg {
     RunStarted {
         run_id: String,
     },
+    RemoteRunStarted {
+        run_id: String,
+        input: String,
+    },
     StreamDelta {
         delta_id: String,
         output_id: String,
@@ -741,6 +745,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
     if matches!(
         msg,
         UiMsg::RunStarted { .. }
+            | UiMsg::RemoteRunStarted { .. }
             | UiMsg::StreamDelta { .. }
             | UiMsg::ReasoningSummaryDelta { .. }
             | UiMsg::ToolActivity { .. }
@@ -782,6 +787,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
     if matches!(
         msg,
         UiMsg::RunStarted { .. }
+            | UiMsg::RemoteRunStarted { .. }
             | UiMsg::StreamDelta { .. }
             | UiMsg::ReasoningSummaryDelta { .. }
             | UiMsg::OutputCommitted { .. }
@@ -939,6 +945,11 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                     state.animation_frame = state.animation_frame.wrapping_add(1);
                 }
             }
+        }
+        UiMsg::RemoteRunStarted { run_id, input } => {
+            state.input_history.push(&input);
+            begin_run(state, input);
+            state.run_id = Some(run_id);
         }
         UiMsg::RunStarted { run_id } => {
             if state.run_id.as_deref() != Some(run_id.as_str()) {
@@ -1215,6 +1226,32 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
     Vec::new()
 }
 
+fn begin_run(state: &mut UiState, input: String) {
+    if state.transcript.is_empty() {
+        state.session_title = input
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(60)
+            .collect();
+    }
+    state.transcript.push(TranscriptEntry::user(input.clone()));
+    state.activity_reducer.begin_run();
+    state.request_submission = None;
+    state.resolved_requests.clear();
+    state.clear_stream();
+    state.pending = None;
+    state.working_detail = None;
+    state.working_elapsed = Duration::ZERO;
+    state.animation_frame = 0;
+    state.active_processes.clear();
+    state.last_tick = None;
+    state.run_id = None;
+    state.phase = UiPhase::Running;
+    state.viewport.follow();
+}
+
 fn submit(state: &mut UiState, immediately: bool) -> Vec<UiEffect> {
     if state.request_submission_pending() {
         state.ui_notice = Some("Response submitted; waiting for confirmation".to_owned());
@@ -1256,29 +1293,7 @@ fn submit(state: &mut UiState, immediately: bool) -> Vec<UiEffect> {
         let Some(input) = state.take_composer() else {
             return Vec::new();
         };
-        if state.transcript.is_empty() {
-            state.session_title = input
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(60)
-                .collect();
-        }
-        state.transcript.push(TranscriptEntry::user(input.clone()));
-        state.activity_reducer.begin_run();
-        state.request_submission = None;
-        state.resolved_requests.clear();
-        state.clear_stream();
-        state.pending = None;
-        state.working_detail = None;
-        state.working_elapsed = Duration::ZERO;
-        state.animation_frame = 0;
-        state.active_processes.clear();
-        state.last_tick = None;
-        state.run_id = None;
-        state.phase = UiPhase::Running;
-        state.viewport.follow();
+        begin_run(state, input.clone());
         return vec![UiEffect::StartRun { input }];
     }
 

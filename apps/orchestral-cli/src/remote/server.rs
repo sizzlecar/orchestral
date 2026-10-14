@@ -145,6 +145,8 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         gateway_authenticator: gateway_authenticator.clone(),
         run_supervisors: Arc::default(),
         session_coordinators: Arc::default(),
+        local_hosts: Some(Arc::new(super::local_hosts::LocalHostDirectory::open()?)),
+        local_owner: None,
         artifact_resolver,
         artifact_blob_store,
     };

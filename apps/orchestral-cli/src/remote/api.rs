@@ -213,6 +213,8 @@ pub struct RemoteApiState {
     pub(super) session_coordinators: Arc<AgentSessionCoordinatorRegistry>,
     pub artifact_resolver: Option<Arc<dyn ArtifactResolver>>,
     pub artifact_blob_store: Option<Arc<dyn BlobStore>>,
+    pub(crate) local_hosts: Option<Arc<super::local_hosts::LocalHostDirectory>>,
+    pub(crate) local_owner: Option<Arc<super::local_hosts::LocalHostOwner>>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +226,7 @@ enum RemotePrincipal {
 #[derive(Debug, Clone)]
 struct RequestLogContext {
     request_id: String,
+    local_terminal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +241,7 @@ struct SseLifecycleLog {
     run_id: Option<String>,
     opened_at: Instant,
     close_reason: Option<&'static str>,
+    local_terminal: bool,
 }
 
 impl SseLifecycleLog {
@@ -285,6 +289,7 @@ impl SseLifecycleLog {
             run_id: run_id.map(str::to_owned),
             opened_at: Instant::now(),
             close_reason: None,
+            local_terminal: request.local_terminal,
         };
         tracing::info!(
             request_id = %lifecycle.request_id,
@@ -318,6 +323,9 @@ impl SseLifecycleLog {
 
 impl Drop for SseLifecycleLog {
     fn drop(&mut self) {
+        if self.local_terminal {
+            return;
+        }
         let lifetime_ms = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
             request_id = %self.request_id,
@@ -381,6 +389,10 @@ pub fn router(state: RemoteApiState) -> Router {
             "/runs/{run_id}/requests/{request_id}/approval",
             post(resolve_approval),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::local_hosts::route_local_host,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
     Router::new()
@@ -389,7 +401,10 @@ pub fn router(state: RemoteApiState) -> Router {
         .merge(protected)
         .layer(DefaultBodyLimit::max(256 * 1_024))
         .layer(middleware::from_fn(no_store))
-        .layer(middleware::from_fn(log_request))
+        .layer(middleware::from_fn_with_state(
+            state.local_owner.is_some(),
+            log_request,
+        ))
         .with_state(state)
 }
 
@@ -1717,11 +1732,30 @@ async fn start_run(
     let session_id = AgentSessionId::new(session_id);
     state.agent.create_session(Some(session_id.clone())).await?;
     let run_id = RunId::new(request.run_id);
-    let handle = state
-        .agent
-        .start_text(&session_id, Some(run_id.clone()), request.input)
-        .await?;
-    spawn_remembered_approval_driver(state.clone(), run_id.clone());
+    let handle = if let Some(owner) = &state.local_owner {
+        use super::local_hosts::LocalRunStartError;
+        owner
+            .start(run_id.as_str().to_owned(), request.input)
+            .await
+            .map_err(|error| match error {
+                LocalRunStartError::Unavailable => ApiError::service_unavailable(
+                    "local_host_unavailable",
+                    "The terminal owning this session is unavailable.",
+                ),
+                LocalRunStartError::Busy => ApiError::conflict(
+                    "local_host_busy",
+                    "The terminal has an active Run or session operation. Retry after it finishes.",
+                ),
+                LocalRunStartError::Agent(error) => ApiError::from(error),
+            })?
+    } else {
+        let handle = state
+            .agent
+            .start_text(&session_id, Some(run_id.clone()), request.input)
+            .await?;
+        spawn_remembered_approval_driver(state.clone(), run_id.clone());
+        handle
+    };
     let view = RemoteRunView::new(
         &state,
         None,
@@ -1741,6 +1775,10 @@ pub(super) fn spawn_run_supervisor(
     connector_id: Option<AgentConnectorId>,
     run_id: RunId,
 ) {
+    // The terminal already drives approvals and reconciliation for this controller.
+    if state.local_owner.is_some() {
+        return;
+    }
     let key = RunSupervisorRegistry::key(connector_id.as_ref(), &run_id);
     if !state.run_supervisors.begin(&key) {
         return;
@@ -2934,6 +2972,25 @@ async fn session_views(state: &RemoteApiState) -> Result<Vec<SessionView>, Agent
         session.updated_at_unix_ms = session.updated_at_unix_ms.max(updated);
         session.run_ids.push(run.run_id.as_str().to_owned());
     }
+    if let Some(owner) = &state.local_owner {
+        sessions.retain(|id, _| id == &owner.session.id);
+        sessions
+            .entry(owner.session.id.clone())
+            .or_insert_with(|| owner.session.clone());
+    }
+    if let Some(directory) = &state.local_hosts {
+        for session in directory
+            .sessions()
+            .await
+            .map_err(|error| AgentSdkError::InvalidInput(error.to_string()))?
+        {
+            if sessions.insert(session.id.clone(), session).is_some() {
+                return Err(AgentSdkError::InvalidInput(
+                    "session is claimed by both gateway and terminal Host".to_owned(),
+                ));
+            }
+        }
+    }
     let mut sessions = sessions.into_values().collect::<Vec<_>>();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
     Ok(sessions)
@@ -3003,9 +3060,14 @@ async fn authenticate(
     Ok(next.run(request).await)
 }
 
-async fn log_request(mut request: Request<axum::body::Body>, next: Next) -> Response {
+async fn log_request(
+    State(local_terminal): State<bool>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
     let context = RequestLogContext {
         request_id: uuid::Uuid::new_v4().to_string(),
+        local_terminal,
     };
     let method = request.method().clone();
     let route = request
@@ -3021,6 +3083,15 @@ async fn log_request(mut request: Request<axum::body::Body>, next: Next) -> Resp
         .unwrap_or("-")
         .to_owned();
     request.extensions_mut().insert(context.clone());
+    if local_terminal {
+        // HTTP access logs must not write into the live terminal viewport.
+        // The public gateway remains the request/command audit surface.
+        use tracing::instrument::WithSubscriber;
+        return next
+            .run(request)
+            .with_subscriber(tracing::subscriber::NoSubscriber::default())
+            .await;
+    }
 
     let started_at = Instant::now();
     let span = tracing::info_span!(
@@ -4264,6 +4335,8 @@ mod tests {
                 gateway_authenticator: None,
                 run_supervisors: Arc::default(),
                 session_coordinators: Arc::default(),
+                local_hosts: None,
+                local_owner: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4315,6 +4388,8 @@ mod tests {
                 gateway_authenticator,
                 run_supervisors: Arc::default(),
                 session_coordinators: Arc::default(),
+                local_hosts: None,
+                local_owner: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4386,6 +4461,8 @@ mod tests {
                 gateway_authenticator: None,
                 run_supervisors: Arc::default(),
                 session_coordinators: Arc::default(),
+                local_hosts: None,
+                local_owner: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4417,6 +4494,8 @@ mod tests {
                 gateway_authenticator: None,
                 run_supervisors: Arc::default(),
                 session_coordinators: Arc::default(),
+                local_hosts: None,
+                local_owner: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4457,6 +4536,8 @@ mod tests {
                 gateway_authenticator: None,
                 run_supervisors: Arc::default(),
                 session_coordinators: Arc::default(),
+                local_hosts: None,
+                local_owner: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -5473,6 +5554,8 @@ mod tests {
                 ..Default::default()
             }),
             session_coordinators: Arc::default(),
+            local_hosts: None,
+            local_owner: None,
             artifact_resolver: None,
             artifact_blob_store: None,
         };

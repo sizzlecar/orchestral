@@ -111,6 +111,15 @@ impl ApiClient {
         self.get("/sessions", credential).await
     }
 
+    pub async fn session(
+        &self,
+        credential: &ApiCredential,
+        session_id: &str,
+    ) -> Result<SessionView, ApiError> {
+        self.get(&format!("/sessions/{}", encode(session_id)), credential)
+            .await
+    }
+
     pub async fn create_session(
         &self,
         credential: &ApiCredential,
