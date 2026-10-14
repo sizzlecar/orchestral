@@ -2949,7 +2949,9 @@ fn local_tui_command(
 struct PtyHarness {
     started: Instant,
     recording: Option<Vec<serde_json::Value>>,
+    initial_size: (u16, u16),
     max_size: (u16, u16),
+    resizes: Vec<(usize, u16, u16)>,
     screen: vt100::Parser,
     screen_frames: Vec<String>,
     master: Box<dyn MasterPty + Send>,
@@ -2963,7 +2965,8 @@ struct PtyHarness {
 struct PtyOutput {
     status: PtyExitStatus,
     bytes: Vec<u8>,
-    size: (u16, u16),
+    initial_size: (u16, u16),
+    resizes: Vec<(usize, u16, u16)>,
 }
 
 fn physical_screen_contents(screen: &vt100::Screen) -> String {
@@ -3112,10 +3115,23 @@ impl PtyOutput {
                 self.text()
             );
         }
-        let (cols, rows) = (self.size.0.max(20), self.size.1.max(6));
+        let (cols, rows) = (self.initial_size.0.max(20), self.initial_size.1.max(6));
         let mut parser = vt100::Parser::new(rows, cols, 1_000);
         parser.process(b"PRE_TUI_SHELL_LINE\r\n");
-        parser.process(&self.bytes);
+        let mut offset = 0usize;
+        for &(resize_at, new_cols, new_rows) in &self.resizes {
+            let clamped = resize_at.min(self.bytes.len());
+            if clamped > offset {
+                parser.process(&self.bytes[offset..clamped]);
+                offset = clamped;
+            }
+            parser
+                .screen_mut()
+                .set_size(new_rows.max(6), new_cols.max(20));
+        }
+        if offset < self.bytes.len() {
+            parser.process(&self.bytes[offset..]);
+        }
         parser.process(b"RETURNED_PROMPT>");
         let active_after_exit = physical_screen_contents(parser.screen());
         assert!(
@@ -3219,7 +3235,9 @@ impl PtyHarness {
         Self {
             started: Instant::now(),
             recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
+            initial_size: (cols, rows),
             max_size: (cols, rows),
+            resizes: Vec::new(),
             screen: vt100::Parser::new(rows, cols, 1_000),
             screen_frames: Vec::new(),
             master: pair.master,
@@ -3232,7 +3250,14 @@ impl PtyHarness {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        if self.latest.is_empty() {
+            self.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+        }
+        while let Ok(bytes) = self.updates.try_recv() {
+            self.receive(bytes);
+        }
         self.max_size = (self.max_size.0.max(cols), self.max_size.1.max(rows));
+        self.resizes.push((self.latest.len(), cols, rows));
         self.screen.screen_mut().set_size(rows, cols);
         self.master
             .resize(PtySize {
@@ -3398,12 +3423,12 @@ impl PtyHarness {
             .unwrap();
         }
         drop(self.master);
-        let (rows, cols) = self.screen.screen().size();
         let bytes = self.reader.join().expect("join TUI PTY reader");
         PtyOutput {
             status,
             bytes,
-            size: (cols, rows),
+            initial_size: self.initial_size,
+            resizes: self.resizes,
         }
     }
 }

@@ -584,6 +584,28 @@ impl UiState {
         self.composer.insert_str(self.composer_cursor, text);
         self.composer_cursor += text.len();
         editor::snap_cursor(&self.composer, &mut self.composer_cursor);
+        if self.menu.is_none() && self.composer_cursor == self.composer.len() {
+            let candidate_start = self
+                .images
+                .iter()
+                .filter_map(|img| {
+                    self.composer
+                        .rfind(&img.marker)
+                        .map(|pos| pos + img.marker.len())
+                })
+                .max()
+                .unwrap_or(0);
+            let candidate = &self.composer[candidate_start..];
+            if super::clipboard::looks_like_completed_image_path(candidate) {
+                if let Ok(Some(images)) =
+                    super::clipboard::extract_pasted_images(candidate, &self.workspace_path)
+                {
+                    self.composer.truncate(candidate_start);
+                    self.composer_cursor = self.composer.len();
+                    self.attach_images(images);
+                }
+            }
+        }
     }
 
     fn move_cursor_left(&mut self) {

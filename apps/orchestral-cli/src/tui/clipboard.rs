@@ -253,6 +253,27 @@ fn parse_image_path_candidates(trimmed: &str, workspace_root: &str) -> Vec<PathB
     resolved
 }
 
+pub(crate) fn looks_like_completed_image_path(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let unquoted = if let Some(rest) = trimmed.strip_prefix('\'') {
+        let Some(inner) = rest.strip_suffix('\'') else {
+            return false;
+        };
+        inner
+    } else if let Some(rest) = trimmed.strip_prefix('"') {
+        let Some(inner) = rest.strip_suffix('"') else {
+            return false;
+        };
+        inner
+    } else {
+        trimmed
+    };
+    has_supported_image_extension(unquoted)
+}
+
 fn resolve_existing_image_path(raw: &str, workspace_root: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
