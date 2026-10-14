@@ -163,3 +163,141 @@ fn metadata_never_guesses_missing_model_limits_or_combines_input_and_output() {
         .is_some());
     assert!(backend("http://127.0.0.1/v1beta").catalog_url.is_none());
 }
+
+#[tokio::test]
+async fn bundled_capacity_is_immediate_exact_and_not_applied_to_custom_gateways() {
+    let mut model = backend(
+        "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google",
+    )
+    .with_background_metadata_refresh();
+    model.config.model = "gemini-4-argon".to_owned();
+    let resolved = tokio::time::timeout(Duration::from_secs(1), model.resolve_descriptor())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.capabilities.max_context_tokens, Some(1_048_576));
+    assert!(resolved.extensions["orchestral/context-capacity-source"]
+        .as_str()
+        .unwrap()
+        .starts_with("bundled models.dev snapshot"));
+    let mut gateway = backend("http://127.0.0.1:1").with_background_metadata_refresh();
+    gateway.config.model = "gemini-4-argon".to_owned();
+    assert_eq!(
+        gateway
+            .resolve_descriptor()
+            .await
+            .unwrap()
+            .capabilities
+            .max_context_tokens,
+        None
+    );
+    let mut unknown = backend("https://generativelanguage.googleapis.com/v1beta")
+        .with_background_metadata_refresh();
+    unknown.config.model = "not-in-the-bundled-catalog".to_owned();
+    assert_eq!(
+        unknown
+            .resolve_descriptor()
+            .await
+            .unwrap()
+            .capabilities
+            .max_context_tokens,
+        None
+    );
+}
+
+#[tokio::test]
+async fn pending_refresh_never_blocks_startup_or_changes_an_active_backend() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = Router::new().route(
+        "/{*path}",
+        get({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"inputTokenLimit":600_000,"outputTokenLimit":1024}))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = std::env::temp_dir().join(format!(
+        "orchestral-background-metadata-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let make = || {
+        backend(&endpoint)
+            .with_metadata_cache(&root)
+            .with_background_metadata_refresh()
+    };
+    let active = make();
+    let snapshot = tokio::time::timeout(Duration::from_secs(1), active.resolve_descriptor())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.capabilities.max_context_tokens, None);
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(active.resolve_descriptor().await.unwrap(), snapshot);
+    release.notify_one();
+    let path = cache_path(&active).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while cached(&path).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        active.descriptor(),
+        snapshot,
+        "refresh must not change an active Run's identity"
+    );
+    assert_eq!(
+        make()
+            .resolve_descriptor()
+            .await
+            .unwrap()
+            .capabilities
+            .max_context_tokens,
+        Some(600_000)
+    );
+
+    let mut value: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+    value["fetched_at"] = json!(1);
+    tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
+        .await
+        .unwrap();
+    let stale = make();
+    let resolved = tokio::time::timeout(Duration::from_secs(1), stale.resolve_descriptor())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.capabilities.max_context_tokens, Some(600_000));
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !matches!(cached(&path).await, Some((_, true))) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stale.descriptor(), resolved);
+    task.abort();
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}

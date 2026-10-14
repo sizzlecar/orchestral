@@ -13,7 +13,7 @@ fn gemini_parts_response(parts: Vec<Value>) -> FixtureHttpResponse {
 }
 
 #[test]
-fn gemini_discovers_capacity_compacts_latest_tool_result_and_continues_without_reexecution() {
+fn gemini_compacts_latest_tool_result_and_continues_without_reexecution() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("gemini-context-continuation");
     fs::write(
@@ -22,11 +22,6 @@ fn gemini_discovers_capacity_compacts_latest_tool_result_and_continues_without_r
     )
     .unwrap();
     let (endpoint, server) = spawn_fixture_http_server(vec![
-        Box::new(|request| {
-            assert_eq!(request.method, "GET");
-            assert_eq!(request.path, "/models/fixture-model");
-            json_response(json!({"inputTokenLimit":16_000,"outputTokenLimit":1024}))
-        }),
         Box::new(|request| {
             assert_eq!(
                 request.body["contents"].as_array().unwrap().last().unwrap()["role"],
@@ -80,10 +75,7 @@ fn gemini_discovers_capacity_compacts_latest_tool_result_and_continues_without_r
         }),
     ]);
     workspace.rewrite_config(|config| {
-        config["agent"]
-            .as_mapping_mut()
-            .unwrap()
-            .remove(serde_yaml::Value::String("max_context_tokens".to_owned()));
+        config["agent"]["max_context_tokens"] = serde_yaml::to_value(16_000).unwrap();
         config["agent"]["reserved_output_tokens"] = serde_yaml::to_value(1024).unwrap();
         config["agent"]["compaction"]["summary_max_chars"] = serde_yaml::to_value(1024).unwrap();
         config["tools"]["max_inline_output_bytes"] = serde_yaml::to_value(128 * 1024).unwrap();
@@ -94,9 +86,11 @@ fn gemini_discovers_capacity_compacts_latest_tool_result_and_continues_without_r
             .find(|backend| backend["name"].as_str() == Some("google"))
             .unwrap();
         google["endpoint"] = serde_yaml::Value::String(endpoint);
+        google["config"]["discover_model_capabilities"] = serde_yaml::Value::Bool(false);
     });
     let mut command = root_command(&workspace);
     command
+        .env("ORCHESTRAL_HOME", workspace.path("user-config"))
         .env("GOOGLE_API_KEY", "fixture-key")
         .args([
             "--backend",
@@ -115,5 +109,5 @@ fn gemini_discovers_capacity_compacts_latest_tool_result_and_continues_without_r
         fs::read_to_string(workspace.path("marker.txt")).unwrap(),
         "once\n"
     );
-    assert_eq!(server.join().unwrap().len(), 4);
+    assert_eq!(server.join().unwrap().len(), 3);
 }

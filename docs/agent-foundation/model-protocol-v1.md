@@ -59,11 +59,23 @@ CLI 的 `agent.max_context_tokens` 是可选 Host 上限。省略时采用模型
 设置时取 Host 与模型上限的较小值。两者均未知时仍采用 128K Host 回退预算，并明确
 显示模型容量未知，不能将回退预算报告为模型原生容量。
 
-Gemini 优先查询原生模型信息。公开 Google/Vertex endpoint 未返回 token 上限时，
-可从 `models.dev` 按 Provider 和完整模型 ID 精确查询。自定义网关默认不套用公开目录。
-缓存位于 Host 配置目录的 `cache/model-metadata`，有效期 5 分钟；刷新失败可沿用既有
-元数据。目录请求不携带 Google 凭证。`discover_model_capabilities: false` 或显式
-backend `max_context_tokens` 可避免自动发现。诊断上下文显示容量来源。
+CLI 中 Gemini 的容量解析只读取本地缓存或随包附带的目录快照，不等待联网。缓存位于
+Host 配置目录的 `cache/model-metadata`；超过 5 分钟或缺失时，后台刷新先查询原生
+模型信息（最多 5 秒），未返回 token 上限再查询目录（最多 30 秒）。刷新失败不阻塞
+操作，过期缓存仍可使用。新数据写入缓存，供下次构建 Backend 使用；不会改变活动
+Backend 的容量或恢复身份。没有缓存和目录记录时容量仍为 unknown，不猜测模型上限。
+
+公开 Google/Vertex endpoint 按 Provider 和完整模型 ID 精确匹配 `models.dev`。
+随包快照由 `python3 scripts/update_gemini_catalog.py` 从该 API 生成，只包含 Google
+模型限制及来源、更新时间；自定义网关和自定义目录不套用这个公开快照。目录请求不携带
+Google 凭证。`discover_model_capabilities: false` 或显式 backend `max_context_tokens`
+可避免自动发现。诊断上下文显示容量来源。SDK 默认仍提供显式等待发现的模式；通过
+`with_background_metadata_refresh()` 和持久缓存启用与 CLI 相同的非阻塞策略。
+
+模型请求或首个内容事件等待超过 10 秒时，运行时以 ProgressReported 报告等待状态，
+不重发请求，不改变重试及取消语义。Gemini 错误详情记录 authentication、response_headers、
+error_body 或 response_body 阶段及耗时；正文耗时从收到响应头起算。调试日志仅记录请求 ID、
+阶段和耗时，不记录提示词或凭据。
 
 Gemini 规划计数使用字节估算与运行时的实测 input usage 前缀校准；请求前缀、模型配置
 或工具定义改变时放弃该校准。保守 JSON 字节上界继续用于严格 input/cost 预算。

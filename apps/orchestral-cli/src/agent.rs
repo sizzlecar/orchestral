@@ -1723,6 +1723,7 @@ pub(crate) fn build_model_backend(
                 max_buffered_events,
             })
             .context("build Gemini ModelBackend")?
+            .with_background_metadata_refresh()
             .with_metadata_discovery(
                 backend.get_config("discover_model_capabilities").unwrap_or(true),
             );

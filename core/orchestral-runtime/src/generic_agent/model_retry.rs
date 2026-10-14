@@ -41,15 +41,20 @@ pub(super) async fn start_model_with_retry(
         }
         let attempt_cancellation = cancellation.child_token();
         let guard = attempt_cancellation.clone().drop_guard();
-        let result = inner
-            .backend
-            .start(request.clone(), attempt_cancellation)
-            .await;
+        let result = with_wait_notice(
+            inner.backend.start(request.clone(), attempt_cancellation),
+            |elapsed| report_model_wait(inner, run, "response", elapsed),
+        )
+        .await;
         let mut usage = None;
         let mut expected_sequence = 1;
         let error = match result {
             Ok(mut stream) => loop {
-                match stream.next().await {
+                match with_wait_notice(stream.next(), |elapsed| {
+                    report_model_wait(inner, run, "output", elapsed)
+                })
+                .await
+                {
                     Some(Ok(first)) => {
                         first
                             .validate_for(&request.request_id, expected_sequence)
@@ -155,5 +160,88 @@ pub(super) async fn start_model_with_retry(
             },
         );
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+// Keep the original request future alive. Reporting progress must never cause
+// a second inference request, change retry policy, or delay cancellation.
+async fn with_wait_notice<T>(
+    future: impl std::future::Future<Output = T>,
+    mut notify: impl FnMut(Duration),
+) -> T {
+    let started = tokio::time::Instant::now();
+    let period = Duration::from_secs(10);
+    let mut timer = tokio::time::interval_at(started + period, period);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = timer.tick() => notify(started.elapsed()),
+        }
+    }
+}
+
+fn report_model_wait(
+    inner: &GenericInner,
+    run: &AgentStartRequest,
+    phase: &str,
+    elapsed: Duration,
+) {
+    let run_id = &run.run.spec.run_id;
+    publish_telemetry(
+        inner,
+        run_id,
+        AgentTelemetryEnvelope {
+            telemetry_id: TelemetryId::new(format!("model-wait-{}", uuid::Uuid::new_v4())),
+            run_id: run_id.clone(),
+            provider_seq: None,
+            payload: AgentTelemetry::ProgressReported {
+                message: format!("Waiting for model {phase} ({}s)", elapsed.as_secs()),
+                fraction: None,
+            },
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_reports_progress_without_restarting_or_delaying_the_request() {
+        let mut notices = Vec::new();
+        let result = with_wait_notice(
+            async {
+                tokio::time::sleep(Duration::from_secs(25)).await;
+                7
+            },
+            |elapsed| notices.push(elapsed.as_secs()),
+        )
+        .await;
+        assert_eq!(result, 7);
+        assert_eq!(notices, vec![10, 20]);
+        notices.clear();
+        with_wait_notice(std::future::ready(()), |elapsed| {
+            notices.push(elapsed.as_secs())
+        })
+        .await;
+        assert!(notices.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_wait_drops_its_notifications_too() {
+        let mut notices = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            with_wait_notice(std::future::pending::<()>(), |elapsed| {
+                notices.push(elapsed.as_secs())
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(notices, vec![10]);
     }
 }
