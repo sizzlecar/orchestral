@@ -95,9 +95,12 @@ Gemini CLI 默认只等待 HTTP 响应头 30 秒，可通过 Google backend 的
 `Unavailable` 进入现有有界重试策略，不重放已经执行的工具；它只能缩短挂起请求的
 恢复等待，不能保证上游推理延迟。SDK 可显式调用 `with_response_header_timeout`。
 
-模型请求或首个内容事件等待超过 10 秒时，运行时以 ProgressReported 报告等待状态，
+模型请求、首个内容事件或流中后续事件等待超过 10 秒时，运行时以 ProgressReported
+报告等待状态；收到后续内容时 UI 恢复内容展示。这一提示保留原有待完成读取，
 不重发请求，不改变重试及取消语义。Gemini 错误详情记录 authentication、response_headers、
-error_body 或 response_body 阶段及耗时；正文耗时从收到响应头起算。调试日志仅记录请求 ID、
+error_body 或 response_body 阶段及耗时；正文耗时从收到响应头起算。正文错误另记录已收到的
+字节数、是否收到正文内容及最后一次收到字节后的空闲时长，以区分整体耗时和流停顿。
+调试日志仅记录请求 ID、
 阶段和耗时，不记录提示词或凭据。
 
 Gemini 规划计数使用字节估算与运行时的实测 input usage 前缀校准；请求前缀、模型配置
