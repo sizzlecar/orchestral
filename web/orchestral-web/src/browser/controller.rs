@@ -49,6 +49,7 @@ struct AgentSessionObservationTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveTransportPlan {
     agent_session: Option<AgentSessionObservationTarget>,
+    builtin_session: Option<String>,
     run_id: Option<String>,
 }
 
@@ -67,8 +68,16 @@ fn selected_agent_observation_target(state: &AppState) -> Option<AgentSessionObs
 fn live_transport_plan(state: &AppState) -> LiveTransportPlan {
     LiveTransportPlan {
         agent_session: selected_agent_observation_target(state),
+        builtin_session: selected_builtin_session(state),
         run_id: state.observable_run().map(|run| run.id.clone()),
     }
+}
+
+fn selected_builtin_session(state: &AppState) -> Option<String> {
+    state
+        .selected_session()
+        .filter(|session| state.connection.online && session.connector_id.is_none())
+        .map(|session| session.id.clone())
 }
 
 fn agent_observation_is_current(state: &AppState, target: &AgentSessionObservationTarget) -> bool {
@@ -2165,6 +2174,8 @@ impl AppController {
         let plan = live_transport_plan(&self.state.read());
         if plan.agent_session.is_some() {
             self.start_selected_agent_observer(initial_observer_errors);
+        } else if let Some(session_id) = &plan.builtin_session {
+            self.start_builtin_session_observer(session_id.clone());
         } else {
             let controller = self;
             controller.stop_agent_session_observer();
@@ -2174,10 +2185,117 @@ impl AppController {
         } else {
             let controller = self;
             controller.stop_run_stream();
-            if plan.agent_session.is_none() {
+            if plan.agent_session.is_none() && plan.builtin_session.is_none() {
                 controller.stop_stream_and_set_idle();
             }
         }
+    }
+
+    // A Run stream ends at completion. Keep observing the selected Session so
+    // a later terminal turn is discovered without a page reload.
+    fn start_builtin_session_observer(mut self, session_id: String) {
+        self.stop_agent_session_observer();
+        let Ok(controller) = web_sys::AbortController::new() else {
+            self.notice("浏览器无法启动会话自动刷新", "error");
+            return;
+        };
+        self.agent_session_stream_abort
+            .set(Some(controller.clone()));
+        let generation = *self.agent_session_stream_generation.read();
+        self.spawn(async move {
+            let mut errors = 0_u32;
+            let observed_state = self.state;
+            loop {
+                let current = || {
+                    !controller.signal().aborted()
+                        && *self.agent_session_stream_generation.read() == generation
+                        && selected_builtin_session(&observed_state.read()).as_deref()
+                            == Some(&session_id)
+                };
+                if !current() {
+                    return;
+                }
+                let delay = if errors == 0 {
+                    agent_observation_interval_ms("idle", platform::is_document_visible())
+                } else {
+                    agent_observation_backoff_ms(errors)
+                };
+                TimeoutFuture::new(delay).await;
+                if !current() {
+                    return;
+                }
+                let Some(token) = self.token.read().clone() else {
+                    return;
+                };
+                let result = self.api.session(&token, &session_id).await;
+                if !current() {
+                    return;
+                }
+                match result {
+                    Ok(session) => {
+                        errors = 0;
+                        let previous_run =
+                            self.state.read().observable_run().map(|run| run.id.clone());
+                        let missing = {
+                            let mut state = self.state.write();
+                            let missing = session
+                                .run_ids
+                                .iter()
+                                .filter(|id| {
+                                    state.runs.get(*id).is_none_or(|run| {
+                                        run.view.is_none() || run.cursor < run.server_cursor
+                                    })
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            merge_session_page(&mut state.sessions.items, vec![session]);
+                            if self.stream_abort.read().is_none() {
+                                mark_observation_healthy(&mut state, "observing");
+                            }
+                            missing
+                        };
+                        for run_id in missing {
+                            if !current() {
+                                return;
+                            }
+                            self.load_run_snapshot(&run_id, &session_id, None).await;
+                        }
+                        if !current() {
+                            return;
+                        }
+                        let run_id = self.state.read().observable_run().map(|run| run.id.clone());
+                        if let Some(run_id) = run_id {
+                            if previous_run.as_ref() != Some(&run_id)
+                                || self.stream_abort.read().is_none()
+                            {
+                                self.start_stream(run_id);
+                            }
+                        }
+                    }
+                    Err(error) if error.status == 401 => {
+                        self.clear_auth(Some(error.message)).await;
+                        return;
+                    }
+                    Err(error)
+                        if error.status == 404
+                            && self
+                                .state
+                                .read()
+                                .selected_session()
+                                .is_some_and(|session| session.run_ids.is_empty()) =>
+                    {
+                        errors = 0;
+                    }
+                    Err(error) => {
+                        errors = errors.saturating_add(1);
+                        let mut state = self.state.write();
+                        state.connection.stream = "reconnecting".to_owned();
+                        state.connection.attempt = errors;
+                        state.connection.error = Some(error.message);
+                    }
+                }
+            }
+        });
     }
 
     fn start_selected_agent_observer(self, initial_errors: u32) {
@@ -3369,6 +3487,36 @@ mod tests {
 
         state.sessions.selected_id = None;
         assert!(!agent_observation_is_current(&state, &target));
+    }
+
+    #[test]
+    fn builtin_observer_survives_completion_and_discovers_later_terminal_turns() {
+        let mut state = AppState::new(true);
+        state.sessions.items.push(native_session("terminal", 1));
+        state.sessions.selected_id = Some("terminal".to_owned());
+        let plan = live_transport_plan(&state);
+        assert_eq!(plan.builtin_session.as_deref(), Some("terminal"));
+        assert!(plan.agent_session.is_none());
+        assert!(plan.run_id.is_none());
+        let mut refreshed = native_session("terminal", 2);
+        refreshed.run_ids = vec!["terminal-turn".to_owned()];
+        merge_session_page(&mut state.sessions.items, vec![refreshed]);
+        state
+            .ensure_run("terminal-turn", Some("terminal".to_owned()))
+            .status = "running".to_owned();
+        assert_eq!(
+            live_transport_plan(&state).run_id.as_deref(),
+            Some("terminal-turn")
+        );
+        state.runs.get_mut("terminal-turn").unwrap().status = "delivered".to_owned();
+        let plan = live_transport_plan(&state);
+        assert!(plan.run_id.is_none());
+        assert_eq!(plan.builtin_session.as_deref(), Some("terminal"));
+        state.connection.online = false;
+        assert!(live_transport_plan(&state).builtin_session.is_none());
+        state.connection.online = true;
+        state.sessions.selected_id = None;
+        assert!(live_transport_plan(&state).builtin_session.is_none());
     }
 
     #[test]

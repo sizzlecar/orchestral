@@ -1,6 +1,7 @@
 mod api;
 mod assets;
 mod auth;
+pub(crate) mod local_hosts;
 mod server;
 mod session_coordinator;
 mod state;

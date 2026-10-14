@@ -48,6 +48,7 @@ Run from the repository root:
 
 ```sh
 node scripts/pwa_browser_smoke.cjs
+node scripts/pwa_local_host_smoke.cjs
 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_image_message_smoke.cjs

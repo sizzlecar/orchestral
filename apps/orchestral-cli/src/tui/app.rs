@@ -119,6 +119,7 @@ pub(crate) async fn run_tui(
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut process_events = process_supervisor.subscribe();
     let mut process_events_open = true;
+    let mut local_host = start_local_host(host, client.session_id()).await;
     let mut cache = RenderCache::default();
     let mut needs_redraw = true;
     let mut quit = false;
@@ -199,6 +200,7 @@ pub(crate) async fn run_tui(
                 file_index.refresh();
             }
             Some((generation, result)) = service_rx.recv() => {
+                let replace_local_host = matches!(&result, Ok(super::services::Response::Model { .. } | super::services::Response::Session { .. }));
                 if !service_tasks.accept(generation) { continue; }
                 state.host_busy = false;
                 state.ui_notice = None;
@@ -260,6 +262,45 @@ pub(crate) async fn run_tui(
                         }
                     }
                 }
+                if replace_local_host {
+                    drop(local_host.take());
+                    local_host = start_local_host(host, client.session_id()).await;
+                }
+                needs_redraw = true;
+            }
+            Some(request) = async {
+                match local_host.as_mut() {
+                    Some(server) => server.requests.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                use crate::remote::local_hosts::LocalRunStartError;
+                if state.host_busy {
+                    let _ = request.reply.send(Err(LocalRunStartError::Busy));
+                    continue;
+                }
+                let run_id = RunId::new(&request.run_id);
+                let existing = host.api.has_run(&run_id).await?;
+                if !existing && active.is_some() {
+                    if reconcile_active(&mut active, &mut state, &approval_broker).await? {
+                        stop_active(&mut active);
+                    } else {
+                        let _ = request.reply.send(Err(LocalRunStartError::Busy));
+                        continue;
+                    }
+                }
+                let result = host.api.start_text(client.session_id(), Some(run_id), request.input).await;
+                let handle = match result {
+                    Ok(handle) => handle,
+                    Err(error) => { let _ = request.reply.send(Err(LocalRunStartError::Agent(error))); continue; }
+                };
+                let _ = request.reply.send(Ok(handle.clone()));
+                if existing { continue; }
+                let observer = observe_run(&handle, agent_tx.clone()).await?;
+                let input = display_contents(&host.api.initial_input(handle.run_id()).await?);
+                update(&mut state, UiMsg::RemoteRunStarted { run_id: handle.run_id().as_str().to_owned(), input });
+                active = Some(ActiveRun { handle, observer, last_run_seq: 0, delta_order: 0, auto_resolved_approvals: BTreeSet::new() });
+                if reconcile_active(&mut active, &mut state, &approval_broker).await? { stop_active(&mut active); }
                 needs_redraw = true;
             }
             forwarded = agent_rx.recv() => {
@@ -331,10 +372,24 @@ pub(crate) async fn run_tui(
         quit |= state.exit_requested && active.is_none() && !state.host_busy;
     }
 
+    drop(local_host);
     stop_active(&mut active);
     terminal.restore().context("restore terminal after TUI")?;
     service_tasks.finish().await;
     Ok(())
+}
+
+async fn start_local_host(
+    host: &crate::agent::AgentHost,
+    session_id: &orchestral_core::agent_protocol::wire::AgentSessionId,
+) -> Option<crate::remote::local_hosts::LocalHostServer> {
+    match crate::remote::local_hosts::LocalHostServer::start(host, session_id).await {
+        Ok(server) => Some(server),
+        Err(error) => {
+            tracing::warn!(%error, "Could not publish local session to PWA");
+            None
+        }
+    }
 }
 
 fn project_process_event(state: &mut UiState, event: ExecSessionEvent) {

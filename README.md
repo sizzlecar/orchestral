@@ -185,8 +185,15 @@ orchestral resume --last
 ```
 
 Use `orchestral serve --pair` for browser access.
-The PWA discovers local Codex and Claude Code sessions. Host-owned Claude sessions
-support user input, streaming turns, approvals and cancellation. Existing Claude
+The PWA discovers running Orchestral TUIs under the same user, plus local Codex and Claude Code sessions.
+Orchestral terminals and the PWA share one session, approval broker, and running task;
+both can send messages, resolve approvals, and cancel. Use the same user configuration
+directory for `serve` and the terminal (including `ORCHESTRAL_HOME`, if set).
+Terminals started before upgrading must be reopened with the new binary using
+`orchestral resume --last` to publish their local control endpoint. Closing the
+terminal does not cause the gateway to start a replacement process.
+
+Host-owned Claude sessions support user input, streaming turns, approvals and cancellation. Existing Claude
 terminals can receive PWA messages and expose history and, with
 `orchestral serve --claude-approvals`, tool approvals. Messages sent to an existing
 terminal retain native peer origin; Claude adds its cross-session explanation.
