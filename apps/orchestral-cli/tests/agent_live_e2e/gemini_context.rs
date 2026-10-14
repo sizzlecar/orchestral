@@ -331,3 +331,72 @@ fn gemini_tui_shows_the_summary_while_waiting_for_the_next_model_response() {
     output.assert_terminal_restored();
     assert_eq!(server.join().unwrap().len(), 2);
 }
+
+#[test]
+fn gemini_recovers_from_stalled_headers_within_the_configured_header_budget() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("gemini-header-timeout");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let accept = || loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .unwrap();
+                    break stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(15),
+                        "expected a bounded header retry"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        };
+        let mut stalled = accept();
+        let first = read_http_fixture_request(&mut stalled);
+        // Keep the TCP connection open but send no headers. Only the Host's
+        // response-header deadline can release the first model attempt.
+        let mut recovered = accept();
+        let second = read_http_fixture_request(&mut recovered);
+        assert_eq!(
+            first.body, second.body,
+            "retry retains the same logical request"
+        );
+        write_http_fixture_response(
+            &mut recovered,
+            gemini_response(json!({"text":"Recovered after the stalled response."})),
+        );
+    });
+    configure_gemini_fixture(&workspace, &endpoint);
+    workspace.rewrite_config(|config| {
+        let google = config["providers"]["backends"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|backend| backend["name"].as_str() == Some("google"))
+            .unwrap();
+        google["config"]["response_header_timeout_secs"] = serde_yaml::to_value(1).unwrap();
+        google["config"]["stream_idle_timeout_secs"] = serde_yaml::to_value(300).unwrap();
+    });
+    let mut command = gemini_fixture_command(&workspace, "header-timeout");
+    command.arg("Say hello.");
+    let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert!(output
+        .stdout_text()
+        .contains("Recovered after the stalled response."));
+    server.join().unwrap();
+    assert_eq!(
+        checkpoint_event_count(&workspace, "model_retry_scheduled"),
+        1
+    );
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+    assert_eq!(run_payload_count(&workspace, "run_failed"), 0);
+}

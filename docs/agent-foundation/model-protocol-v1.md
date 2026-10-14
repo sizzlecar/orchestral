@@ -89,6 +89,12 @@ Google 凭证。`discover_model_capabilities: false` 或显式 backend `max_cont
 可避免自动发现。诊断上下文显示容量来源。SDK 默认仍提供显式等待发现的模式；通过
 `with_background_metadata_refresh()` 和持久缓存启用与 CLI 相同的非阻塞策略。
 
+Gemini CLI 默认只等待 HTTP 响应头 30 秒，可通过 Google backend 的
+`response_header_timeout_secs` 调整。收到响应头后，`stream_idle_timeout_secs`（默认
+300 秒）独立约束流中两次读取之间的等待，不限制生成总时长。首响应超时作为
+`Unavailable` 进入现有有界重试策略，不重放已经执行的工具；它只能缩短挂起请求的
+恢复等待，不能保证上游推理延迟。SDK 可显式调用 `with_response_header_timeout`。
+
 模型请求或首个内容事件等待超过 10 秒时，运行时以 ProgressReported 报告等待状态，
 不重发请求，不改变重试及取消语义。Gemini 错误详情记录 authentication、response_headers、
 error_body 或 response_body 阶段及耗时；正文耗时从收到响应头起算。调试日志仅记录请求 ID、
