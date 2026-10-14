@@ -788,6 +788,14 @@ fn tui_pty_keeps_reading_anchor_when_later_output_commits() {
         |s| s.contains("history row 079") && s.contains("replied"),
         LOCAL_PROCESS_TIMEOUT,
     );
+    tui.screen.screen_mut().set_scrollback(usize::MAX);
+    assert!(tui.screen.screen().scrollback() > 0);
+    let native_scrollback = physical_screen_contents(tui.screen.screen());
+    assert!(
+        native_scrollback.contains("history row 000"),
+        "{native_scrollback}"
+    );
+    tui.screen.screen_mut().set_scrollback(0);
     tui.send_paste("second request");
     let mut before = tui.wait_for_screen(|s| s.contains("running"), LOCAL_PROCESS_TIMEOUT);
     for _ in 0..2 {

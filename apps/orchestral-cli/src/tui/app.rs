@@ -22,9 +22,7 @@ use tokio::time::MissedTickBehavior;
 
 use super::services::Tasks as ServiceTasks;
 use super::terminal::TerminalSession;
-use super::{
-    render_cached, update, ApprovalChoice, RenderCache, UiEffect, UiMsg, UiPhase, UiState,
-};
+use super::{update, ApprovalChoice, RenderCache, UiEffect, UiMsg, UiPhase, UiState};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
@@ -128,13 +126,8 @@ pub(crate) async fn run_tui(
     while !quit {
         let had_active_run = active.is_some();
         if needs_redraw {
-            let mut anchor = state.viewport.anchor.clone();
-            let mut size = state.terminal_size;
-            terminal
-                .draw(|frame| {
-                    size = (frame.area().width, frame.area().height);
-                    anchor = render_cached(frame, &state, &mut cache);
-                })
+            let (size, anchor) = terminal
+                .draw_cached(&state, &mut cache)
                 .context("render TUI")?;
             state.terminal_size = size;
             state.viewport.anchor = anchor;

@@ -3071,6 +3071,23 @@ impl PtyOutput {
                 self.text()
             );
         }
+        // Main-screen rendering preserves the terminal's native scrollback and
+        // mouse selection; neither alternate screen nor mouse capture may be enabled.
+        for forbidden in [
+            b"\x1b[?1049h".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+            b"\x1b[?1000h".as_slice(),
+        ] {
+            assert!(
+                !self
+                    .bytes
+                    .windows(forbidden.len())
+                    .any(|part| part == forbidden),
+                "forbidden terminal sequence {:?} was emitted in PTY output:\n{}",
+                String::from_utf8_lossy(forbidden),
+                self.text()
+            );
+        }
         let assert_restored = |enabled: &[u8], disabled: &[u8]| {
             let enter = self
                 .bytes
@@ -3086,11 +3103,6 @@ impl PtyOutput {
         };
         assert_restored(b"\x1b[?2004h", b"\x1b[?2004l");
         assert_restored(b"\x1b[?25l", b"\x1b[?25h");
-        // Windows Server's ConPTY consumes 1049 rather than forwarding it.
-        // The terminal module's native-console test checks the real raw mode
-        // and original buffer restoration for explicit, Drop and unwind paths.
-        #[cfg(unix)]
-        assert_restored(b"\x1b[?1049h", b"\x1b[?1049l");
     }
 }
 
@@ -3160,7 +3172,7 @@ impl PtyHarness {
             started: Instant::now(),
             recording: std::env::var_os("ORCHESTRAL_TUI_ARTIFACT_DIR").map(|_| Vec::new()),
             max_size: (cols, rows),
-            screen: vt100::Parser::new(rows, cols, 0),
+            screen: vt100::Parser::new(rows, cols, 1_000),
             screen_frames: Vec::new(),
             master: pair.master,
             child,

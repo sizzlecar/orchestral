@@ -79,7 +79,7 @@ fn native_console_restores_modes_and_original_buffer_for_each_exit_path() {
             "{observation}"
         );
         assert_eq!(
-            observation["cursor_after"], observation["cursor_before"],
+            observation["cursor_after"], observation["cursor_during"],
             "{observation}"
         );
     }
@@ -104,7 +104,7 @@ fn native_restore_child() {
             session
                 .draw(|frame| {
                     frame.render_widget(
-                        ratatui::widgets::Paragraph::new("alternate buffer probe"),
+                        ratatui::widgets::Paragraph::new("main screen buffer probe"),
                         frame.area(),
                     );
                     frame.set_cursor_position((17, 11));
@@ -125,8 +125,9 @@ fn native_restore_child() {
         let raw_after = is_raw_mode_enabled().unwrap();
         assert!(!raw_after, "raw input mode survived {mode}");
         assert_eq!(
-            after, before,
-            "original screen buffer was not restored by {mode}"
+            after,
+            during.unwrap(),
+            "main screen cursor was not preserved by {mode}"
         );
         observations.insert(
             mode.into(),
