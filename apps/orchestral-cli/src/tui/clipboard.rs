@@ -305,26 +305,24 @@ fn normalize_path_string(input: &str) -> String {
 }
 
 fn unescape_shell_backslashes(input: &str) -> String {
-    #[cfg(windows)]
-    {
-        input.to_owned()
-    }
-    #[cfg(not(windows))]
-    {
-        let mut out = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\\' {
-                if let Some(&next) = chars.peek() {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if !cfg!(windows)
+                    || next.is_whitespace()
+                    || matches!(next, '\'' | '"' | '(' | ')' | '[' | ']' | '&' | ';')
+                {
                     out.push(next);
                     chars.next();
                     continue;
                 }
             }
-            out.push(ch);
         }
-        out
+        out.push(ch);
     }
+    out
 }
 
 fn split_shell_tokens(input: &str) -> Vec<String> {
@@ -350,10 +348,18 @@ fn split_shell_tokens(input: &str) -> Vec<String> {
             Some(_) => current.push(ch),
             None => match ch {
                 '\'' | '"' => quote = Some(ch),
-                '\\' if !cfg!(windows) => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
+                '\\' => {
+                    if let Some(&next) = chars.peek() {
+                        if !cfg!(windows)
+                            || next.is_whitespace()
+                            || matches!(next, '\'' | '"' | '(' | ')' | '[' | ']' | '&' | ';')
+                        {
+                            current.push(next);
+                            chars.next();
+                            continue;
+                        }
                     }
+                    current.push(ch);
                 }
                 c if c.is_whitespace() => {
                     if !current.is_empty() {

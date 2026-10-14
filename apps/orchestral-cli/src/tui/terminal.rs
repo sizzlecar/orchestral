@@ -101,7 +101,7 @@ impl Write for FrameWriter {
 pub(crate) struct TerminalSession {
     terminal: CrosstermTerminal,
     defer_flush: Rc<Cell<bool>>,
-    exit_cursor_row: u16,
+    exit_cursor_row: Option<u16>,
     active: bool,
 }
 
@@ -136,7 +136,7 @@ impl TerminalSession {
         Ok(Self {
             terminal,
             defer_flush,
-            exit_cursor_row: 0,
+            exit_cursor_row: None,
             active: true,
         })
     }
@@ -153,7 +153,7 @@ impl TerminalSession {
     ) -> io::Result<DrawOutcome> {
         self.defer_flush.set(true);
         let result = draw_with_scrollback(&mut self.terminal, state, cache);
-        self.exit_cursor_row = cache.exit_cursor_row();
+        self.exit_cursor_row = Some(cache.exit_cursor_row());
         self.defer_flush.set(false);
         let flush_result = self.terminal.backend_mut().flush();
         let outcome = result?;
@@ -178,48 +178,48 @@ impl TerminalSession {
             .or_else(|_| crossterm::terminal::size())
             .unwrap_or((80, 24));
         let height = rows.max(1);
-        let clean_from = self.exit_cursor_row.min(height);
         let mut first_error = None;
-        for y in clean_from..height {
-            if let Err(error) = execute!(
-                self.terminal.backend_mut(),
-                MoveTo(0, y),
-                Clear(ClearType::CurrentLine)
-            ) {
+        if let Some(exit_cursor_row) = self.exit_cursor_row {
+            let clean_from = exit_cursor_row.min(height);
+            for y in clean_from..height {
+                if let Err(error) = execute!(
+                    self.terminal.backend_mut(),
+                    MoveTo(0, y),
+                    Clear(ClearType::CurrentLine)
+                ) {
+                    first_error.get_or_insert(error);
+                }
+            }
+            let target_row = if clean_from >= height {
+                if let Err(error) = execute!(self.terminal.backend_mut(), MoveTo(0, height - 1)) {
+                    first_error.get_or_insert(error);
+                }
+                if let Err(error) = self.terminal.backend_mut().write_all(b"\r\n") {
+                    first_error.get_or_insert(error);
+                }
+                if let Err(error) = execute!(
+                    self.terminal.backend_mut(),
+                    Clear(ClearType::CurrentLine),
+                    Clear(ClearType::FromCursorDown)
+                ) {
+                    first_error.get_or_insert(error);
+                }
+                height - 1
+            } else {
+                if let Err(error) = execute!(
+                    self.terminal.backend_mut(),
+                    MoveTo(0, clean_from),
+                    Clear(ClearType::FromCursorDown)
+                ) {
+                    first_error.get_or_insert(error);
+                }
+                clean_from
+            };
+            if let Err(error) = execute!(self.terminal.backend_mut(), MoveTo(0, target_row)) {
                 first_error.get_or_insert(error);
             }
         }
-        let target_row = if clean_from >= height {
-            if let Err(error) = execute!(self.terminal.backend_mut(), MoveTo(0, height - 1)) {
-                first_error.get_or_insert(error);
-            }
-            if let Err(error) = self.terminal.backend_mut().write_all(b"\r\n") {
-                first_error.get_or_insert(error);
-            }
-            if let Err(error) = execute!(
-                self.terminal.backend_mut(),
-                Clear(ClearType::CurrentLine),
-                Clear(ClearType::FromCursorDown)
-            ) {
-                first_error.get_or_insert(error);
-            }
-            height - 1
-        } else {
-            if let Err(error) = execute!(
-                self.terminal.backend_mut(),
-                MoveTo(0, clean_from),
-                Clear(ClearType::FromCursorDown)
-            ) {
-                first_error.get_or_insert(error);
-            }
-            clean_from
-        };
-        if let Err(error) = execute!(
-            self.terminal.backend_mut(),
-            MoveTo(0, target_row),
-            DisableBracketedPaste,
-            Show
-        ) {
+        if let Err(error) = execute!(self.terminal.backend_mut(), DisableBracketedPaste, Show) {
             first_error.get_or_insert(error);
         }
         if let Err(error) = self.terminal.show_cursor() {
