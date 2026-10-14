@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -217,6 +217,7 @@ pub struct GeminiModelBackend {
     metadata: tokio::sync::OnceCell<Option<metadata::ResolvedMetadata>>,
     metadata_cache: Option<std::path::PathBuf>,
     metadata_discovery: bool,
+    background_metadata_refresh: bool,
     catalog_url: Option<String>,
 }
 
@@ -238,6 +239,7 @@ impl GeminiModelBackend {
             metadata: tokio::sync::OnceCell::new(),
             metadata_cache: None,
             metadata_discovery: true,
+            background_metadata_refresh: false,
             catalog_url,
         })
     }
@@ -252,6 +254,14 @@ impl GeminiModelBackend {
     /// Disable optional model metadata requests, retaining explicit capacity.
     pub fn with_metadata_discovery(mut self, enabled: bool) -> Self {
         self.metadata_discovery = enabled;
+        self
+    }
+
+    /// Resolve from a local snapshot immediately and refresh the persistent
+    /// cache in the background. Updated capacities apply to future backend
+    /// instances; an active backend's recovery identity remains unchanged.
+    pub fn with_background_metadata_refresh(mut self) -> Self {
+        self.background_metadata_refresh = true;
         self
     }
 
@@ -416,7 +426,15 @@ impl ModelBackend for GeminiModelBackend {
 
     async fn resolve_descriptor(&self) -> Result<ModelDescriptor, ModelError> {
         if self.metadata_discovery && self.config.max_context_tokens.is_none() {
-            self.metadata.get_or_init(|| metadata::discover(self)).await;
+            self.metadata
+                .get_or_init(|| async {
+                    if self.background_metadata_refresh {
+                        metadata::local_snapshot_and_refresh(self).await
+                    } else {
+                        metadata::discover(self).await
+                    }
+                })
+                .await;
         }
         let descriptor = self.descriptor();
         descriptor.validate()?;
@@ -431,27 +449,35 @@ impl ModelBackend for GeminiModelBackend {
         request.validate()?;
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
+        let started = Instant::now();
         let http_request = self
             .config
             .authentication
             .apply(self.client.post(self.config.stream_url()), &cancellation)
-            .await?
+            .await
+            .map_err(|error| request_timing(error, "authentication", started))?
             .json(&body);
+        tracing::debug!(request_id = %request.request_id, elapsed_ms = started.elapsed().as_millis(), "Gemini authentication complete");
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_error()),
             response = http_request.send() => response,
         }
-        .map_err(map_transport_error)?;
+        .map_err(|error| request_timing(map_transport_error(error), "response_headers", started))?;
         let status = response.status();
+        tracing::debug!(request_id = %request.request_id, elapsed_ms = started.elapsed().as_millis(), %status, "Gemini response headers received");
         if !status.is_success() {
             let bytes = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(cancelled_error()),
                 bytes = response.bytes() => bytes,
             }
-            .map_err(map_transport_error)?;
-            return Err(map_http_error(status, &bytes));
+            .map_err(|error| request_timing(map_transport_error(error), "error_body", started))?;
+            return Err(request_timing(
+                map_http_error(status, &bytes),
+                "response_headers",
+                started,
+            ));
         }
         Ok(gemini_event_stream(
             request,
@@ -460,6 +486,21 @@ impl ModelBackend for GeminiModelBackend {
             self.config.max_buffered_events,
         ))
     }
+}
+
+fn request_timing(mut error: ModelError, phase: &str, started: Instant) -> ModelError {
+    let mut details = match error.details {
+        Value::Object(details) => details,
+        Value::Null => Map::new(),
+        original => Map::from_iter([("cause".to_owned(), original)]),
+    };
+    details.insert("phase".to_owned(), json!(phase));
+    details.insert(
+        "elapsed_ms".to_owned(),
+        json!(started.elapsed().as_millis() as u64),
+    );
+    error.details = Value::Object(details);
+    error
 }
 
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
@@ -558,6 +599,8 @@ struct GeminiStreamState {
     emitted_content: bool,
     terminated: bool,
     max_buffered_events: usize,
+    started: Instant,
+    received_bytes: bool,
 }
 
 impl GeminiStreamState {
@@ -583,7 +626,8 @@ impl GeminiStreamState {
 
     fn fail(&mut self, error: ModelError) {
         self.terminated = true;
-        self.pending.push_back(Err(error));
+        self.pending
+            .push_back(Err(request_timing(error, "response_body", self.started)));
     }
 
     fn handle_frame(&mut self, frame: String) -> Result<(), ModelError> {
@@ -751,6 +795,8 @@ fn gemini_event_stream(
         emitted_content: false,
         terminated: false,
         max_buffered_events,
+        started: Instant::now(),
+        received_bytes: false,
     };
     stream::unfold(state, |mut state| async move {
         loop {
@@ -776,6 +822,10 @@ fn gemini_event_stream(
             };
             match next {
                 Some(Ok(chunk)) => {
+                    if !state.received_bytes && !chunk.is_empty() {
+                        tracing::debug!(request_id = %state.request_id, elapsed_ms = state.started.elapsed().as_millis(), "Gemini first response bytes received after headers");
+                        state.received_bytes = true;
+                    }
                     if let Err(error) = state.decoder.push(&chunk) {
                         state.fail(error);
                     }
@@ -1424,6 +1474,56 @@ mod tests {
             .run(&GeminiConformanceFixture)
             .await;
         assert!(report.is_conformant(), "{:#?}", report.results());
+    }
+
+    #[tokio::test]
+    async fn stalled_responses_report_the_failed_phase_and_elapsed_time() {
+        use axum::{body::Body, response::Response, routing::post, Router};
+
+        for phase in ["response_headers", "response_body"] {
+            let app = Router::new().route(
+                "/{*path}",
+                post(move || async move {
+                    if phase == "response_headers" {
+                        std::future::pending::<()>().await;
+                    }
+                    Response::new(Body::from_stream(
+                        stream::once(std::future::ready(Ok::<_, std::io::Error>(
+                            Bytes::from_static(b": connected\n\n"),
+                        )))
+                        .chain(stream::pending()),
+                    ))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let backend = GeminiModelBackend::new(GeminiModelConfig {
+                backend_id: "gemini-timeout".to_owned(),
+                endpoint,
+                authentication: GeminiAuthentication::ApiKey("fixture-key".to_owned()),
+                model: "fixture-model".to_owned(),
+                temperature: 0.0,
+                thinking_level: None,
+                default_max_output_tokens: 64,
+                max_context_tokens: Some(8_192),
+                timeout: Duration::from_millis(100),
+                max_buffered_events: 8,
+            })
+            .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                match backend.start(request(), CancellationToken::new()).await {
+                    Err(error) => error,
+                    Ok(mut events) => events.next().await.unwrap().unwrap_err(),
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(error.details["phase"], phase);
+            assert_eq!(error.details["timeout"], true);
+            assert!(error.details["elapsed_ms"].as_u64().unwrap() >= 100);
+            server.abort();
+        }
     }
 
     #[tokio::test]

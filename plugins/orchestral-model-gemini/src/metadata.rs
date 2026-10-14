@@ -5,7 +5,10 @@ use super::*;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_TIMEOUT: Duration = Duration::from_secs(5);
+// Catalogs are larger than a single model record. This work runs in the
+// background for the CLI and must tolerate ordinary download latency.
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_TTL_SECONDS: u64 = 300;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -182,7 +185,7 @@ pub(super) async fn discover(backend: &GeminiModelBackend) -> Option<ResolvedMet
     if let Some((metadata, true)) = &cached {
         return Some(metadata.clone());
     }
-    let native = tokio::time::timeout(TIMEOUT, async {
+    let native = tokio::time::timeout(NATIVE_TIMEOUT, async {
         let url = native_url(backend)?;
         let request = backend
             .config
@@ -200,7 +203,7 @@ pub(super) async fn discover(backend: &GeminiModelBackend) -> Option<ResolvedMet
     .flatten();
     let resolved = match native {
         Some(value) => Some(value),
-        None => tokio::time::timeout(TIMEOUT, async {
+        None => tokio::time::timeout(CATALOG_TIMEOUT, async {
             let url = backend.catalog_url.as_ref()?;
             // This request deliberately has no inference-service credentials.
             let catalog = response_json(
@@ -232,6 +235,63 @@ pub(super) async fn discover(backend: &GeminiModelBackend) -> Option<ResolvedMet
         }
     }
     resolved.or_else(|| cached.map(|(metadata, _)| metadata))
+}
+
+fn bundled(backend: &GeminiModelBackend) -> Option<ResolvedMetadata> {
+    if !public_google_endpoint(&backend.config.endpoint)
+        || backend.catalog_url.as_deref() != Some("https://models.dev/api.json")
+    {
+        return None;
+    }
+    static CATALOG: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let catalog = CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("metadata/catalog.json"))
+            .expect("bundled model catalog must be valid JSON")
+    });
+    let provider = if backend.config.endpoint.contains("/publishers/google") {
+        "google-vertex"
+    } else {
+        "google"
+    };
+    let model = backend
+        .config
+        .model
+        .strip_prefix("models/")
+        .unwrap_or(&backend.config.model);
+    let source = format!(
+        "bundled models.dev snapshot {}",
+        catalog.pointer("/_meta/fetched_at")?.as_str()?
+    );
+    catalog_metadata(catalog, provider, model, &source)
+}
+
+pub(super) async fn local_snapshot_and_refresh(
+    backend: &GeminiModelBackend,
+) -> Option<ResolvedMetadata> {
+    let existing = match cache_path(backend) {
+        Some(path) => cached(&path).await,
+        None => None,
+    };
+    let snapshot = existing
+        .as_ref()
+        .map(|(value, _)| value.clone())
+        .or_else(|| bundled(backend));
+    // Without a persistent cache there is no future consumer of a refresh.
+    if backend.metadata_cache.is_some() && !matches!(existing, Some((_, true))) {
+        let worker = GeminiModelBackend {
+            client: backend.client.clone(),
+            config: backend.config.clone(),
+            metadata: tokio::sync::OnceCell::new(),
+            metadata_cache: backend.metadata_cache.clone(),
+            metadata_discovery: true,
+            background_metadata_refresh: false,
+            catalog_url: backend.catalog_url.clone(),
+        };
+        tokio::spawn(async move {
+            discover(&worker).await;
+        });
+    }
+    snapshot
 }
 
 #[cfg(test)]

@@ -43,5 +43,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 orchestral-agent-protocol-testkit = { path = "../../testing/orchestral-agent-protocol-testkit" }
 orchestral-mcp-streamable-http = { path = "../../plugins/orchestral-mcp-streamable-http" }

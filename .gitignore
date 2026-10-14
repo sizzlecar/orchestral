@@ -42,6 +42,7 @@ logs/
 .claude/
 __pycache__/
 *.py
+!/scripts/update_gemini_catalog.py
 .orchestral
 configs/*.runtime.override.yaml
 configs/*.agent.override.yaml

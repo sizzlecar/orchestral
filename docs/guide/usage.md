@@ -104,6 +104,11 @@ usage event replaces the estimate when available. This is neither accumulated
 session usage nor live KV-cache occupancy. `limit` is the declared context capacity
 intersected with the Host budget; absent metadata remains `unknown`.
 
+Google model metadata refreshes in the background. Startup uses cached or bundled
+limits without waiting for a download; updates apply when the backend is next
+constructed. Requests waiting more than ten seconds show whether the runtime is
+waiting for a model response or output. Ctrl+C still interrupts the request.
+
 An empty TUI session opens with the Orchestral logo, the running build's version,
 selected model and workspace. Sending the first task opens the conversation view.
 Restoring a conversation shows its history instead of the welcome screen.

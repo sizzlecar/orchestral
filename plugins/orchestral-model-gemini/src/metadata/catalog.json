@@ -1,0 +1,622 @@
+{
+  "_meta": {
+    "fetched_at": "2026-10-14T03:54:50+00:00",
+    "source": "https://models.dev/api.json"
+  },
+  "google": {
+    "models": {
+      "deep-research-max-preview-04-2026": {
+        "limit": {
+          "context": 131072,
+          "output": 65536
+        }
+      },
+      "deep-research-preview-04-2026": {
+        "limit": {
+          "context": 131072,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-computer-use-preview-10-2025": {
+        "limit": {
+          "context": 128000,
+          "output": 64000
+        }
+      },
+      "gemini-2.5-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-flash-image": {
+        "limit": {
+          "context": 32768,
+          "output": 32768
+        }
+      },
+      "gemini-2.5-flash-lite": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-flash-preview-tts": {
+        "limit": {
+          "context": 8192,
+          "output": 16384
+        }
+      },
+      "gemini-2.5-pro": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-pro-preview-tts": {
+        "limit": {
+          "context": 8192,
+          "output": 16384
+        }
+      },
+      "gemini-3-flash-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3-pro-image": {
+        "limit": {
+          "context": 65536,
+          "output": 32768
+        }
+      },
+      "gemini-3-pro-image-preview": {
+        "limit": {
+          "context": 131072,
+          "output": 32768
+        }
+      },
+      "gemini-3.1-flash-image": {
+        "limit": {
+          "context": 131072,
+          "output": 32768
+        }
+      },
+      "gemini-3.1-flash-image-preview": {
+        "limit": {
+          "context": 65536,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-flash-lite": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-flash-lite-image": {
+        "limit": {
+          "context": 65536,
+          "output": 4096
+        }
+      },
+      "gemini-3.1-flash-lite-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-flash-live-preview": {
+        "limit": {
+          "context": 131072,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-flash-tts-preview": {
+        "limit": {
+          "context": 8192,
+          "output": 16384
+        }
+      },
+      "gemini-3.1-pro-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-pro-preview-customtools": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.5-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.5-flash-lite": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.5-live-translate-preview": {
+        "limit": {
+          "context": 16384,
+          "output": 32768
+        }
+      },
+      "gemini-3.6-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.7-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.8-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-4-argon": {
+        "limit": {
+          "context": 1048576,
+          "output": 32768
+        }
+      },
+      "gemini-embedding-001": {
+        "limit": {
+          "context": 2048,
+          "output": 1
+        }
+      },
+      "gemini-embedding-2": {
+        "limit": {
+          "context": 8192,
+          "output": 1
+        }
+      },
+      "gemini-flash-latest": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-flash-lite-latest": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-omni-flash-preview": {
+        "limit": {
+          "context": 131072,
+          "output": 65536
+        }
+      },
+      "gemma-4-26b-a4b-it": {
+        "limit": {
+          "context": 262144,
+          "output": 32768
+        }
+      },
+      "gemma-4-31b-it": {
+        "limit": {
+          "context": 262144,
+          "output": 32768
+        }
+      },
+      "lyria-3-clip-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "lyria-3-pro-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "veo-3.1-fast-generate-preview": {
+        "limit": {
+          "context": 480,
+          "output": 8192
+        }
+      },
+      "veo-3.1-generate-preview": {
+        "limit": {
+          "context": 480,
+          "output": 8192
+        }
+      },
+      "veo-3.1-lite-generate-preview": {
+        "limit": {
+          "context": 480,
+          "output": 8192
+        }
+      }
+    }
+  },
+  "google-vertex": {
+    "models": {
+      "claude-fable-5-1@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-fable-5@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-haiku-4-5@20251001": {
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-haiku-5-5@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-opus-4-1@20250805": {
+        "limit": {
+          "context": 200000,
+          "output": 32000
+        }
+      },
+      "claude-opus-4-5@20251101": {
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-opus-4-6@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-opus-4-7@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-opus-4-8@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-opus-4@20250514": {
+        "limit": {
+          "context": 200000,
+          "output": 32000
+        }
+      },
+      "claude-opus-5-5@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-opus-5@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-sonnet-4-5@20250929": {
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-sonnet-4-6@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-sonnet-4@20250514": {
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-sonnet-5-5@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-sonnet-5@default": {
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "codestral-2": {
+        "limit": {
+          "context": 128000,
+          "output": 8192
+        }
+      },
+      "deepseek-ai/deepseek-v3.1-maas": {
+        "limit": {
+          "context": 163840,
+          "output": 32768
+        }
+      },
+      "deepseek-ai/deepseek-v3.2-maas": {
+        "limit": {
+          "context": 163840,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-flash-image": {
+        "limit": {
+          "context": 32768,
+          "output": 32768
+        }
+      },
+      "gemini-2.5-flash-lite": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-flash-tts": {
+        "limit": {
+          "context": 32768,
+          "input": 8192,
+          "output": 16384
+        }
+      },
+      "gemini-2.5-pro": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-2.5-pro-tts": {
+        "limit": {
+          "context": 32768,
+          "input": 8192,
+          "output": 16384
+        }
+      },
+      "gemini-3-flash-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3-pro-image": {
+        "limit": {
+          "context": 65536,
+          "output": 32768
+        }
+      },
+      "gemini-3.1-flash-image": {
+        "limit": {
+          "context": 131072,
+          "output": 32768
+        }
+      },
+      "gemini-3.1-flash-lite": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-flash-lite-image": {
+        "limit": {
+          "context": 65536,
+          "output": 4096
+        }
+      },
+      "gemini-3.1-pro-preview": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.1-pro-preview-customtools": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.5-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.5-flash-lite": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.6-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.7-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-3.8-flash": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-4-argon": {
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        }
+      },
+      "gemini-embedding-001": {
+        "limit": {
+          "context": 2048,
+          "output": 1
+        }
+      },
+      "gemini-nano-banana-2.1": {
+        "limit": {
+          "context": 131072,
+          "output": 32768
+        }
+      },
+      "google/gemma-4-26b-a4b-it-maas": {
+        "limit": {
+          "context": 262144,
+          "output": 128000
+        }
+      },
+      "meta/llama-3.3-70b-instruct-maas": {
+        "limit": {
+          "context": 128000,
+          "output": 8192
+        }
+      },
+      "meta/llama-4-maverick-17b-128e-instruct-maas": {
+        "limit": {
+          "context": 524288,
+          "output": 8192
+        }
+      },
+      "meta/llama-4-scout-17b-16e-instruct-maas": {
+        "limit": {
+          "context": 1310720,
+          "output": 8192
+        }
+      },
+      "mistral-medium-3": {
+        "limit": {
+          "context": 131072,
+          "output": 131072
+        }
+      },
+      "mistral-small-2503": {
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "moonshotai/kimi-k2-thinking-maas": {
+        "limit": {
+          "context": 262144,
+          "output": 262144
+        }
+      },
+      "openai/gpt-oss-120b-maas": {
+        "limit": {
+          "context": 131072,
+          "output": 131072
+        }
+      },
+      "openai/gpt-oss-20b-maas": {
+        "limit": {
+          "context": 131072,
+          "output": 32768
+        }
+      },
+      "qwen/qwen3-235b-a22b-instruct-2507-maas": {
+        "limit": {
+          "context": 262144,
+          "output": 16384
+        }
+      },
+      "xai/grok-4.1-fast-non-reasoning": {
+        "limit": {
+          "context": 128000,
+          "output": 30000
+        }
+      },
+      "xai/grok-4.1-fast-reasoning": {
+        "limit": {
+          "context": 128000,
+          "output": 30000
+        }
+      },
+      "xai/grok-4.20-non-reasoning": {
+        "limit": {
+          "context": 2000000,
+          "output": 30000
+        }
+      },
+      "xai/grok-4.20-reasoning": {
+        "limit": {
+          "context": 2000000,
+          "output": 30000
+        }
+      },
+      "xai/grok-4.3": {
+        "limit": {
+          "context": 200000,
+          "output": 30000
+        }
+      },
+      "xai/grok-4.6": {
+        "limit": {
+          "context": 524288,
+          "output": 500000
+        }
+      },
+      "xai/grok-4.7": {
+        "limit": {
+          "context": 524288,
+          "output": 500000
+        }
+      },
+      "zai-org/glm-4.7-maas": {
+        "limit": {
+          "context": 200000,
+          "output": 128000
+        }
+      },
+      "zai-org/glm-5-maas": {
+        "limit": {
+          "context": 200000,
+          "output": 128000
+        }
+      },
+      "zai-org/glm-5.2-maas": {
+        "limit": {
+          "context": 1000000,
+          "output": 64000
+        }
+      }
+    }
+  }
+}
