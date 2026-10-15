@@ -12,7 +12,7 @@ pub use reasoning::ReasoningPreference;
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One configuration surface for the Generic Agent composition root.
 #[derive(Debug, Clone, Deserialize)]
@@ -164,12 +164,26 @@ impl Default for AgentConfig {
     }
 }
 
+/// Host-owned Session compaction strategy kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSummarizerStrategy {
+    /// Model-assisted structured working-memory handoff with deterministic
+    /// extractive fallback.
+    #[default]
+    ModelAssisted,
+    /// Deterministic extractive transcript compaction without model calls.
+    DeterministicExtractive,
+}
+
 /// Host-owned Session compaction policy for the Generic Agent composition.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCompactionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub strategy: SessionSummarizerStrategy,
     #[serde(default = "default_compaction_minimum_source_records")]
     pub minimum_source_records: usize,
     #[serde(default = "default_compaction_keep_recent_records")]
@@ -182,6 +196,7 @@ impl Default for AgentCompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            strategy: SessionSummarizerStrategy::default(),
             minimum_source_records: default_compaction_minimum_source_records(),
             keep_recent_records: default_compaction_keep_recent_records(),
             summary_max_chars: default_compaction_summary_chars(),

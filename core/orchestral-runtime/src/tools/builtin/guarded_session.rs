@@ -100,11 +100,14 @@ impl GuardedSessionReadExecutor {
             let content =
                 String::from_utf8(serde_jcs::to_vec(selected).map_err(|error| error.to_string())?)
                     .map_err(|error| error.to_string())?;
-            let start = usize::try_from(args.offset).map_err(|_| "offset is too large")?;
-            if start > content.len() || !content.is_char_boundary(start) {
+            let mut start = usize::try_from(args.offset).map_err(|_| "offset is too large")?;
+            if start > content.len() {
                 return Err(
                     "offset must be a UTF-8 boundary inside the selected JSON value".to_owned(),
                 );
+            }
+            while !content.is_char_boundary(start) {
+                start -= 1;
             }
             let requested = args.max_bytes.unwrap_or(4096).clamp(4, chunk_limit as u64) as usize;
             let mut end = start.saturating_add(requested).min(content.len());

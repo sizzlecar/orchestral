@@ -70,7 +70,25 @@ pub(super) async fn project_model_context(
     // Replaying it must never append a new compaction fact to the Session.
     if through_session_seq.is_none() {
         if let Some(compactor) = &inner.session_compactor {
-            for _ in 0..8 {
+            for step in 0..8 {
+                if step == 0 {
+                    publish_telemetry(
+                        inner,
+                        &request.run.spec.run_id,
+                        AgentTelemetryEnvelope {
+                            telemetry_id: TelemetryId::new(format!(
+                                "generic-{}-session-compaction-check",
+                                request.run.spec.run_id.as_str()
+                            )),
+                            run_id: request.run.spec.run_id.clone(),
+                            provider_seq: None,
+                            payload: AgentTelemetry::ProgressReported {
+                                message: "Compacting conversation history…".to_owned(),
+                                fraction: None,
+                            },
+                        },
+                    );
+                }
                 if compactor
                     .compact_if_needed(&request.run.spec.session_id, &request.run.spec.run_id)
                     .await?
