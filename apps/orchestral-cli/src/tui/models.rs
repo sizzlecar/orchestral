@@ -5,7 +5,7 @@ use crate::agent::HostMetadata;
 use crate::model_controls::DiscoveredModel;
 use crate::runtime::ModelOverrides;
 use anyhow::{bail, Context, Result};
-use orchestral_core::config::ReasoningPreference;
+use orchestral_core::config::{PermissionPreset, ReasoningPreference};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +23,9 @@ pub(super) enum Selection {
         backend: String,
         model: String,
         value: ReasoningPreference,
+    },
+    Permissions {
+        value: PermissionPreset,
     },
 }
 
@@ -142,6 +145,44 @@ pub(super) fn reasoning_argument(command: &str) -> Option<&str> {
     rest.starts_with(char::is_whitespace).then(|| rest.trim())
 }
 
+pub(super) fn permissions_argument(command: &str) -> Option<&str> {
+    let rest = command.strip_prefix("/permissions")?;
+    rest.starts_with(char::is_whitespace).then(|| rest.trim())
+}
+
+pub(super) fn explicit_permissions(value: &str) -> Result<Selection> {
+    let value = value
+        .parse::<PermissionPreset>()
+        .map_err(anyhow::Error::msg)?;
+    Ok(Selection::Permissions { value })
+}
+
+pub(super) fn permissions(metadata: &HostMetadata) -> Menu {
+    Menu::new(
+        MenuKind::Models,
+        format!(
+            "Permissions · current: {} ({})",
+            metadata.permissions.label(),
+            metadata.permissions
+        ),
+        PermissionPreset::ALL
+            .into_iter()
+            .map(|value| {
+                let description = if value == metadata.permissions {
+                    format!("Current · {}", value.description())
+                } else {
+                    value.description().to_owned()
+                };
+                choice(
+                    &format!("{} ({})", value.label(), value.as_str()),
+                    Selection::Permissions { value },
+                    description,
+                )
+            })
+            .collect(),
+    )
+}
+
 pub(super) fn explicit_reasoning(
     metadata: &HostMetadata,
     current: &str,
@@ -245,6 +286,10 @@ pub(super) fn apply_selection(
             }
             overrides.reasoning = Some(value);
             // Reconfiguration must not rediscover a different ID or revert to the profile's ID.
+            overrides.model = Some(current.to_owned());
+        }
+        Selection::Permissions { value } => {
+            overrides.permissions = Some(value);
             overrides.model = Some(current.to_owned());
         }
         Selection::Profiles => bail!("Profile navigation is not a model selection"),

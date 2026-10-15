@@ -75,6 +75,7 @@ pub struct GuardedExecCommandExecutor {
     runtime_readable_files: Vec<PathBuf>,
     environment: CommandEnvironmentSnapshot,
     sandboxed_execution_enabled: bool,
+    full_access: bool,
 }
 
 #[derive(Clone)]
@@ -116,6 +117,7 @@ impl GuardedExecCommandExecutor {
             runtime_readable_files: files.into_iter().collect(),
             environment,
             sandboxed_execution_enabled: true,
+            full_access: false,
         })
     }
 
@@ -123,6 +125,14 @@ impl GuardedExecCommandExecutor {
     /// No request silently escalates because the workspace sandbox is disabled.
     pub fn with_sandboxed_execution_enabled(mut self, enabled: bool) -> Self {
         self.sandboxed_execution_enabled = enabled;
+        self
+    }
+
+    /// Authorize default commands to execute directly on the Host without
+    /// sandbox wrapping or interactive escalation prompts when the Host
+    /// permission preset is Full Access.
+    pub fn with_full_access(mut self, enabled: bool) -> Self {
+        self.full_access = enabled;
         self
     }
 
@@ -196,7 +206,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
     }
 
     fn planning_contract(&self) -> Value {
-        json!({
+        let mut contract = json!({
             "contract": "orchestral.exec-command-operation-planner/v7",
             "sandboxed_execution_enabled": self.sandboxed_execution_enabled,
             "shell": self.shell,
@@ -206,7 +216,11 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             "runtime_readable_files": self.runtime_readable_files,
             "environment_names": self.environment.names(),
             "runtime_temp_root": self.manager.runtime_temp_root(),
-        })
+        });
+        if self.full_access {
+            contract["full_access"] = json!(true);
+        }
+        contract
     }
 
     fn activity_evidence(
@@ -244,8 +258,10 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         };
         let explicitly_requested_host_execution =
             self.requested_host_execution(&invocation.arguments)?;
-        let justification =
-            escalation_justification(&invocation.arguments, explicitly_requested_host_execution)?;
+        let justification = escalation_justification(
+            &invocation.arguments,
+            explicitly_requested_host_execution && !self.full_access,
+        )?;
         let readable_roots = self
             .workspace_roots(&effective_policy.bounds().filesystem.readable_roots)
             .map_err(|message| rejected("exec_read_root_invalid", message))?;
@@ -259,7 +275,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             ));
         }
         let (host_execution, sandboxed_cwd, implicit_escalation_reason) =
-            if explicitly_requested_host_execution {
+            if self.full_access || explicitly_requested_host_execution {
                 validate_host_workdir_argument(invocation.arguments.get("workdir"))?;
                 (true, None, None)
             } else {
@@ -466,7 +482,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             };
         if let Err(outcome) = escalation_justification(
             &execution.invocation.arguments,
-            explicitly_requested_host_execution,
+            explicitly_requested_host_execution && !self.full_access,
         ) {
             return outcome;
         }
@@ -474,7 +490,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
             .operation
             .required_capabilities
             .requires(EffectScope::HostExecution);
-        if explicitly_requested_host_execution && !host_execution {
+        if (self.full_access || explicitly_requested_host_execution) && !host_execution {
             return rejected(
                 "exec_operation_mismatch",
                 "planned execution no longer matches the invocation's Host execution request",
@@ -482,7 +498,7 @@ impl GuardedToolExecutor for GuardedExecCommandExecutor {
         }
         if host_execution
             && (!host_execution_capabilities_are_complete(execution.lease.granted())
-                || !execution.lease.was_approved())
+                || (!execution.lease.was_approved() && !self.full_access))
         {
             return rejected(
                 "exec_escalation_not_approved",
@@ -776,7 +792,7 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
         // supervised process. A pure poll, including observation after an exit
         // race, cannot trigger new process behavior.
         let input_will_be_delivered = has_input && session_is_running;
-        let mut required_capabilities = if input_will_be_delivered {
+        let required_capabilities = if input_will_be_delivered {
             origin.required_capabilities
         } else {
             CapabilityRequest::from_effects(BTreeSet::from([EffectScope::Process]))
@@ -786,19 +802,9 @@ impl GuardedToolExecutor for GuardedWriteStdinExecutor {
             .get("chars")
             .and_then(Value::as_str)
             .map(display_payload);
-        if input_will_be_delivered {
-            required_capabilities.insert_resource(
-                EffectScope::ExternalSideEffect,
-                CapabilitySelector::Exact(format!("exec-session:{}", session_id.get())),
-            );
-        }
         let operation = ToolOperationPlan {
             required_capabilities,
-            risk: if input_will_be_delivered {
-                ToolOperationRisk::Elevated
-            } else {
-                ToolOperationRisk::Routine
-            },
+            risk: ToolOperationRisk::Routine,
             session_approval_scope: None,
             summary: if has_input && session_has_exited {
                 format!(
@@ -1201,40 +1207,15 @@ fn classify_command(command: &str) -> CommandClassification {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     });
+    let segments = command_segments(&tokens);
+    let destructive = segments
+        .iter()
+        .any(|segment| segment_is_destructive(segment));
+    let network = segments.iter().any(|segment| segment_uses_network(segment));
     let normalized = tokens
         .iter()
-        .map(|token| {
-            Path::new(token)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(token)
-                .to_ascii_lowercase()
-        })
+        .map(|token| normalize_command_token(token))
         .collect::<Vec<_>>();
-    let destructive = normalized.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "rm" | "rmdir"
-                | "unlink"
-                | "shred"
-                | "truncate"
-                | "dd"
-                | "mkfs"
-                | "kill"
-                | "killall"
-                | "pkill"
-                | "shutdown"
-                | "reboot"
-                | "sudo"
-        )
-    }) || git_is_destructive(&normalized)
-        || normalized.iter().any(|token| token == "-delete");
-    let network = normalized.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "curl" | "wget" | "ssh" | "scp" | "sftp" | "nc" | "ncat" | "telnet" | "ftp" | "rsync"
-        )
-    }) || git_uses_network(&normalized);
     let read_only = !destructive
         && !network
         && command_is_simple(command)
@@ -1244,6 +1225,124 @@ fn classify_command(command: &str) -> CommandClassification {
         destructive,
         network,
     }
+}
+
+fn normalize_command_token(token: &str) -> String {
+    Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(token)
+        .to_ascii_lowercase()
+}
+
+fn command_segments(tokens: &[String]) -> Vec<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for token in tokens {
+        if matches!(token.as_str(), ";" | "&&" | "||" | "|" | "&" | "\n") {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(token.clone());
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn strip_command_wrappers(segment: &[String]) -> &[String] {
+    let mut index = 0;
+    while let Some(token) = segment.get(index) {
+        if token.contains('=') && !token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        let verb = normalize_command_token(token);
+        if matches!(verb.as_str(), "env" | "command" | "nohup" | "time" | "nice") {
+            index += 1;
+            while let Some(arg) = segment.get(index) {
+                if arg.starts_with('-') || (verb == "env" && arg.contains('=')) {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    &segment[index..]
+}
+
+fn inner_shell_script(segment: &[String]) -> Option<&str> {
+    let verb = normalize_command_token(segment.first()?);
+    if !matches!(verb.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+        return None;
+    }
+    let mut iter = segment.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "-c"
+            || arg == "-lc"
+            || (arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c'))
+        {
+            return iter.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+fn segment_is_destructive(segment: &[String]) -> bool {
+    let segment = strip_command_wrappers(segment);
+    let Some(first) = segment.first() else {
+        return false;
+    };
+    let verb = normalize_command_token(first);
+    if verb == "sudo" {
+        return true;
+    }
+    if let Some(script) = inner_shell_script(segment) {
+        return classify_command(script).destructive;
+    }
+    let normalized = segment
+        .iter()
+        .map(|token| normalize_command_token(token))
+        .collect::<Vec<_>>();
+    matches!(
+        verb.as_str(),
+        "rm" | "rmdir"
+            | "unlink"
+            | "shred"
+            | "truncate"
+            | "dd"
+            | "mkfs"
+            | "killall"
+            | "pkill"
+            | "shutdown"
+            | "reboot"
+    ) || (verb == "git" && git_is_destructive(&normalized))
+        || (verb == "find" && normalized.iter().any(|token| token == "-delete"))
+}
+
+fn segment_uses_network(segment: &[String]) -> bool {
+    let segment = strip_command_wrappers(segment);
+    let Some(first) = segment.first() else {
+        return false;
+    };
+    if let Some(script) = inner_shell_script(segment) {
+        return classify_command(script).network;
+    }
+    let verb = normalize_command_token(first);
+    let normalized = segment
+        .iter()
+        .map(|token| normalize_command_token(token))
+        .collect::<Vec<_>>();
+    matches!(
+        verb.as_str(),
+        "curl" | "wget" | "ssh" | "scp" | "sftp" | "nc" | "ncat" | "telnet" | "ftp" | "rsync"
+    ) || (verb == "git" && git_uses_network(&normalized))
 }
 
 fn command_is_simple(command: &str) -> bool {
@@ -1329,10 +1428,6 @@ fn git_is_destructive(tokens: &[String]) -> bool {
     match git_subcommand(tokens) {
         Some("clean") => true,
         Some("reset") => tokens.iter().any(|token| token == "--hard"),
-        Some("checkout" | "restore") => tokens.iter().any(|token| token == "--"),
-        Some("branch") => tokens
-            .iter()
-            .any(|token| matches!(token.as_str(), "-d" | "-D")),
         _ => false,
     }
 }
@@ -2245,6 +2340,19 @@ mod tests {
 
         let network = classify_command("curl https://example.com/status");
         assert!(network.network);
+
+        for non_destructive in [
+            "rg kill src/",
+            "cargo test truncate",
+            "git commit -m 'kill dead code'",
+            "git branch -d old-branch",
+            "git checkout -- src/lib.rs",
+        ] {
+            let classified = classify_command(non_destructive);
+            assert!(!classified.destructive, "{non_destructive}: {classified:?}");
+            assert!(!classified.network, "{non_destructive}: {classified:?}");
+        }
+        assert!(classify_command("rg ssh src/").read_only);
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! Strict configuration for the Agent Foundation runtime.
 
 mod loader;
+mod permissions;
 mod providers;
 mod reasoning;
 
 pub use loader::{load_config, load_providers_config, ConfigError};
+pub use permissions::PermissionPreset;
 pub use providers::{ApiKeyError, BackendSpec, ModelPolicy, ModelProfile, ProvidersConfig};
 pub use reasoning::ReasoningPreference;
 
@@ -211,6 +213,8 @@ fn default_history_limit() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
     #[serde(default)]
+    pub permissions: PermissionPreset,
+    #[serde(default)]
     pub exec: ExecToolConfig,
     #[serde(default = "default_tool_timeout_ms")]
     pub max_timeout_ms: u64,
@@ -225,6 +229,7 @@ pub struct ToolsConfig {
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
+            permissions: PermissionPreset::default(),
             exec: ExecToolConfig::default(),
             max_timeout_ms: default_tool_timeout_ms(),
             max_output_bytes: default_tool_output_bytes(),

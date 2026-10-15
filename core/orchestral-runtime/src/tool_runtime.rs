@@ -292,6 +292,12 @@ pub enum ToolPermissionDecision {
 pub trait ToolPermissionPolicy: Send + Sync {
     fn contract_digest(&self) -> Digest;
 
+    /// Whether this Host policy explicitly authorizes leaving the default OS
+    /// sandbox without an interactive user prompt (for example Full Access).
+    fn allows_unapproved_host_execution(&self) -> bool {
+        false
+    }
+
     fn decide(
         &self,
         descriptor: &ToolDescriptor,
@@ -339,6 +345,111 @@ impl ToolPermissionPolicy for DescriptorPermissionPolicy {
 /// and any Tool that statically requires approval still route to the reviewer.
 #[derive(Debug, Default)]
 pub struct WorkspacePermissionPolicy;
+
+impl WorkspacePermissionPolicy {
+    pub fn for_preset(
+        preset: orchestral_core::config::PermissionPreset,
+    ) -> Arc<dyn ToolPermissionPolicy> {
+        match preset {
+            orchestral_core::config::PermissionPreset::Auto => Arc::new(Self),
+            orchestral_core::config::PermissionPreset::ReadOnly => {
+                Arc::new(ReadOnlyPermissionPolicy)
+            }
+            orchestral_core::config::PermissionPreset::FullAccess => {
+                Arc::new(FullAccessPermissionPolicy)
+            }
+        }
+    }
+}
+
+/// Interactive read-only policy: inspections and strictly read-only sandboxed
+/// commands run automatically; workspace file mutations, non-read-only commands,
+/// network access, and Host escalation require explicit user approval.
+#[derive(Debug, Default)]
+pub struct ReadOnlyPermissionPolicy;
+
+impl ToolPermissionPolicy for ReadOnlyPermissionPolicy {
+    fn contract_digest(&self) -> Digest {
+        Digest::sha256("orchestral.permission-policy/read-only/v1")
+    }
+
+    fn decide(
+        &self,
+        _descriptor: &ToolDescriptor,
+        operation: &ToolOperationPlan,
+        effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision {
+        let bounds = effective_policy.bounds();
+        if bounds.approval == ApprovalPolicy::Deny {
+            return ToolPermissionDecision::Deny {
+                code: "approval_policy_denied".to_owned(),
+                message: "effective Host policy denies this Tool operation".to_owned(),
+            };
+        }
+        let mutates_workspace_files = operation
+            .required_capabilities
+            .requires(EffectScope::FilesystemWrite)
+            && !operation
+                .required_capabilities
+                .requires(EffectScope::Process);
+        if bounds.approval == ApprovalPolicy::Required
+            || operation.risk != ToolOperationRisk::Routine
+            || mutates_workspace_files
+            || operation.required_capabilities.effects.iter().any(|scope| {
+                matches!(
+                    scope,
+                    EffectScope::SecretRead
+                        | EffectScope::HostExecution
+                        | EffectScope::Network
+                        | EffectScope::ExternalSideEffect
+                )
+            })
+            || (!bounds.sandbox.required
+                && operation.required_capabilities.effects.iter().any(|scope| {
+                    matches!(scope, EffectScope::Process | EffectScope::FilesystemWrite)
+                }))
+        {
+            ToolPermissionDecision::RequireApproval
+        } else {
+            ToolPermissionDecision::Allow
+        }
+    }
+}
+
+/// Full-access policy: operations within the Host ceiling run without
+/// interactive approval prompts.
+#[derive(Debug, Default)]
+pub struct FullAccessPermissionPolicy;
+
+impl ToolPermissionPolicy for FullAccessPermissionPolicy {
+    fn contract_digest(&self) -> Digest {
+        Digest::sha256("orchestral.permission-policy/full-access/v1")
+    }
+
+    fn allows_unapproved_host_execution(&self) -> bool {
+        true
+    }
+
+    fn decide(
+        &self,
+        _descriptor: &ToolDescriptor,
+        _operation: &ToolOperationPlan,
+        effective_policy: &EffectiveToolPolicy,
+    ) -> ToolPermissionDecision {
+        match effective_policy.bounds().approval {
+            ApprovalPolicy::NotRequired => ToolPermissionDecision::Allow,
+            ApprovalPolicy::Required => ToolPermissionDecision::RequireApproval,
+            ApprovalPolicy::Deny => ToolPermissionDecision::Deny {
+                code: "approval_policy_denied".to_owned(),
+                message: "effective Host policy denies this Tool operation".to_owned(),
+            },
+            _ => ToolPermissionDecision::Deny {
+                code: "approval_policy_unknown".to_owned(),
+                message: "effective Host policy contains an unsupported approval mode".to_owned(),
+            },
+        }
+    }
+}
 
 impl ToolPermissionPolicy for WorkspacePermissionPolicy {
     fn contract_digest(&self) -> Digest {
@@ -391,16 +502,17 @@ impl ToolPermissionPolicy for WorkspacePermissionPolicy {
 /// `Required` and `Deny` are ceilings, never suggestions that an application
 /// policy can relax.
 fn constrain_permission_decision(
+    permission_policy: &dyn ToolPermissionPolicy,
     effective_policy: &EffectiveToolPolicy,
     operation: &ToolOperationPlan,
     proposed: ToolPermissionDecision,
 ) -> ToolPermissionDecision {
-    // Leaving the configured OS sandbox is never an automatic policy path.
-    // Even a pluggable policy that would otherwise allow the operation must
-    // produce an exact, verified Host approval capability for this effect.
+    // Leaving the configured OS sandbox is never an automatic policy path
+    // unless the Host explicitly selected the full-access permission policy.
     let proposed = if operation
         .required_capabilities
         .requires(EffectScope::HostExecution)
+        && !permission_policy.allows_unapproved_host_execution()
     {
         match proposed {
             ToolPermissionDecision::Deny { code, message } => {
@@ -1288,6 +1400,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             ));
         }
         let permission = constrain_permission_decision(
+            self.permission_policy.as_ref(),
             &effective_policy,
             &operation,
             self.permission_policy
@@ -1506,6 +1619,7 @@ impl<S: ApprovalCapabilityStore> GuardedToolRuntime<S> {
             );
         }
         let permission = constrain_permission_decision(
+            self.permission_policy.as_ref(),
             &effective_policy,
             &operation,
             self.permission_policy

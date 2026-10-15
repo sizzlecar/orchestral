@@ -145,6 +145,11 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
         "Inspect declared controls, or /reasoning <value>; effort:<name> sends a literal effort",
     ),
     (
+        "/permissions",
+        "Change permissions",
+        "Select Read Only, Default (auto), or Full Access; or /permissions <preset>",
+    ),
+    (
         "/copy",
         "Copy last answer",
         "Copy the complete last answer without terminal formatting",
@@ -176,10 +181,12 @@ pub(crate) fn commands(state: &super::state::UiState) -> Vec<Choice> {
         .iter()
         .map(|(name, label, description)| {
             let unavailable = match *name {
-                "/model" | "/reasoning" | "/new" | "/resume" if state.host_busy => {
+                "/model" | "/reasoning" | "/permissions" | "/new" | "/resume"
+                    if state.host_busy =>
+                {
                     Some("session operation running")
                 }
-                "/model" | "/reasoning" | "/new"
+                "/model" | "/reasoning" | "/permissions" | "/new"
                     if matches!(
                         state.phase,
                         super::state::UiPhase::Running

@@ -366,6 +366,11 @@ fn build_macos_profile(
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
     profile.push_str("(allow process-fork)\n");
+    profile.push_str("(allow signal (target same-sandbox))\n");
+    profile.push_str("(allow process-info* (target same-sandbox))\n");
+    profile.push_str("(allow ipc-posix-sem)\n");
+    profile.push_str("(allow ipc-posix-shm-read* (ipc-posix-name-prefix \"apple.cfprefs.\"))\n");
+    profile.push_str("(allow user-preference-read)\n");
     if policy.allow_child_processes {
         profile.push_str("(allow process-exec)\n");
     } else {
@@ -376,11 +381,22 @@ fn build_macos_profile(
             ));
         }
     }
-    // Darwin user-directory lookup needs local account and directory services,
-    // including for offline toolchains. Filesystem access remains separately
+    // Darwin user-directory and account lookup services required by standard
+    // runtimes and offline toolchains. Filesystem access remains separately
     // constrained by the declared paths and roots.
     profile.push_str(
-        "(allow mach-lookup\n  (global-name \"com.apple.bsd.dirhelper\")\n  (global-name \"com.apple.system.opendirectoryd.membership\"))\n",
+        r#"(allow mach-lookup
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.DirectoryService.libinfo_v1")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.cfprefsd.agent")
+  (global-name "com.apple.cfprefsd.daemon")
+  (local-name "com.apple.cfprefsd.agent")
+  (global-name "com.apple.PowerManagement.control"))
+"#,
     );
     match &policy.network {
         SandboxNetworkAccess::Disabled => {}
@@ -456,6 +472,27 @@ fn build_macos_profile(
         );
     }
     profile.push_str("(allow sysctl-read)\n");
+    profile.push_str("(allow sysctl-write (sysctl-name \"kern.grade_cputype\"))\n");
+    profile.push_str(
+        r#"(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write* (literal "/dev/zero") (literal "/dev/tty"))
+(allow file-read* (literal "/dev/random") (literal "/dev/urandom") (literal "/dev/autofs_nowait"))
+(allow file-read-data file-write-data (subpath "/dev/fd"))
+(allow file-read* file-write* file-ioctl (literal "/dev/dtracehelper"))
+(allow file-read* file-write* (regex #"^/dev/ttys[0-9]+$"))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))
+(allow file-read-metadata (literal "/dev") (regex #"^/dev/.*$"))
+(allow file-read-metadata
+  (literal "/etc")
+  (literal "/tmp")
+  (literal "/var")
+  (literal "/private")
+  (literal "/private/etc")
+  (literal "/private/tmp")
+  (literal "/private/var"))
+"#,
+    );
 
     let mut literal_reads = BTreeSet::new();
     let mut subtree_reads = BTreeSet::new();
@@ -470,7 +507,11 @@ fn build_macos_profile(
         // from these system locations even when the selected SDK lives under
         // `/Applications/Xcode.app`.
         Path::new("/Library/Developer"),
+        Path::new("/Library/Apple"),
         Path::new("/Library/Apple/System/Library"),
+        Path::new("/Library/Preferences"),
+        Path::new("/private/var/db/timezone"),
+        Path::new("/var/db/timezone"),
         Path::new("/etc"),
         Path::new("/private/etc"),
     ] {
