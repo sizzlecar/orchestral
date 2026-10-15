@@ -1200,6 +1200,9 @@ fn render_working_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     ];
     let process_count = state.active_process_count();
     if process_count > 0 {
+        if let Some(detail) = state.working_detail.as_deref() {
+            spans.push(Span::styled(format!(" · {detail}"), MUTED));
+        }
         spans.push(Span::styled(
             format!(
                 " · {process_count} background terminal{} running",

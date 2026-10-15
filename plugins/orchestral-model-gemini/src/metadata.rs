@@ -187,10 +187,11 @@ pub(super) async fn discover(backend: &GeminiModelBackend) -> Option<ResolvedMet
     }
     let native = tokio::time::timeout(NATIVE_TIMEOUT, async {
         let url = native_url(backend)?;
+        let client = backend.http_client();
         let request = backend
             .config
             .authentication
-            .apply(backend.client.get(&url), &CancellationToken::new())
+            .apply(client.get(&url), &CancellationToken::new())
             .await
             .ok()?;
         native_metadata(
@@ -208,7 +209,7 @@ pub(super) async fn discover(backend: &GeminiModelBackend) -> Option<ResolvedMet
             // This request deliberately has no inference-service credentials.
             let catalog = response_json(
                 backend
-                    .client
+                    .http_client()
                     .get(url)
                     .header("User-Agent", "orchestral-model-metadata/1"),
             )

@@ -193,6 +193,18 @@ impl AgentSessionContextEngine {
             });
         }
 
+        // Bound historical context (summaries and older exchanges outside the
+        // current Run) so barriers such as retained artifacts cannot cause
+        // historical summaries to accumulate linearly across a long Session.
+        // Older historical groups beyond this cap become deferred_ranges and
+        // remain accessible on demand through session_read.
+        let historical_token_allowance = input_budget
+            .saturating_sub(pinned_tokens)
+            .min((input_budget / 4).clamp(4_096, 24_576));
+        let historical_budget = pinned_tokens
+            .saturating_add(historical_token_allowance)
+            .min(input_budget);
+
         // On a follow-up turn, prefer the latest original user request over
         // incidental older Tool output, even if a historical summary shadows
         // it. Never promote historical text to system authority or exceed the
@@ -229,7 +241,7 @@ impl AgentSessionContextEngine {
                     &assemble_messages(&request.system_message, &candidate_groups, &candidate),
                     &request.tools,
                     policy,
-                )? <= input_budget
+                )? <= historical_budget
                 {
                     groups = candidate_groups;
                     selected = candidate;
@@ -251,7 +263,16 @@ impl AgentSessionContextEngine {
             let mut candidate = selected.clone();
             candidate.insert(group.key);
             let messages = assemble_messages(&request.system_message, &groups, &candidate);
-            if self.context_input_tokens(&messages, &request.tools, policy)? <= input_budget {
+            let ceiling = if group
+                .messages
+                .first()
+                .is_some_and(placement::is_summary_context)
+            {
+                historical_budget
+            } else {
+                input_budget
+            };
+            if self.context_input_tokens(&messages, &request.tools, policy)? <= ceiling {
                 selected = candidate;
             }
         }
@@ -1666,7 +1687,9 @@ fn render_compaction_message(message: &ModelMessage) -> Result<String, SessionCo
             rendered.push_str(" | ");
         }
         match content {
-            ModelContent::Text { text } => rendered.push_str(text),
+            ModelContent::Text { text } => {
+                rendered.push_str(&sanitize_inline_data_payloads(text));
+            }
             ModelContent::Json { value } => {
                 rendered.push_str("json=");
                 rendered.push_str(&canonical_summary_json(value)?);
@@ -1815,6 +1838,36 @@ fn excerpt_summary_chars(value: &str, limit: usize) -> String {
         .chain(OMITTED.chars())
         .chain(value.chars().skip(count - tail))
         .collect()
+}
+
+fn sanitize_inline_data_payloads(text: &str) -> String {
+    const MARKER: &str = "data[";
+    if !text.contains(MARKER) && !text.contains("data:image/") {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len().min(4096));
+    let mut rest = text;
+    while let Some(pos) = rest.find(MARKER) {
+        out.push_str(&rest[..pos]);
+        let after_marker = &rest[pos..];
+        if let Some(eq_offset) = after_marker.find("]=") {
+            let header = &after_marker[..eq_offset + 2];
+            let payload_start = &after_marker[eq_offset + 2..];
+            let payload_len = payload_start
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '|' | '"' | '\'' | ')' | ']'))
+                .unwrap_or(payload_start.len());
+            if payload_len > 128 {
+                out.push_str(header);
+                out.push_str(&format!("<inline data omitted, {payload_len} bytes>"));
+                rest = &payload_start[payload_len..];
+                continue;
+            }
+        }
+        out.push_str(MARKER);
+        rest = &after_marker[MARKER.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[async_trait]

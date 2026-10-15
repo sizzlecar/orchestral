@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -213,7 +213,7 @@ impl GeminiModelConfig {
 }
 
 pub struct GeminiModelBackend {
-    client: Client,
+    client: Arc<RwLock<Client>>,
     config: GeminiModelConfig,
     metadata: tokio::sync::OnceCell<Option<metadata::ResolvedMetadata>>,
     metadata_cache: Option<std::path::PathBuf>,
@@ -224,20 +224,29 @@ pub struct GeminiModelBackend {
     catalog_url: Option<String>,
 }
 
+fn build_http_client(config: &GeminiModelConfig) -> Result<Client, ModelError> {
+    Client::builder()
+        .connect_timeout(config.timeout.min(Duration::from_secs(30)))
+        .read_timeout(config.timeout)
+        .tcp_keepalive(Duration::from_secs(15))
+        .tcp_keepalive_interval(Duration::from_secs(10))
+        .tcp_keepalive_retries(3)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(1)
+        .build()
+        .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))
+}
+
 impl GeminiModelBackend {
     pub fn new(config: GeminiModelConfig) -> Result<Self, ModelError> {
         config.validate()?;
-        let client = Client::builder()
-            .connect_timeout(config.timeout.min(Duration::from_secs(30)))
-            .read_timeout(config.timeout)
-            .build()
-            .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
+        let client = build_http_client(&config)?;
         // Custom gateways own their model identities. Do not infer their
         // capacities from a public provider's catalog.
         let catalog_url = metadata::public_google_endpoint(&config.endpoint)
             .then(|| "https://models.dev/api.json".to_owned());
         Ok(Self {
-            client,
+            client: Arc::new(RwLock::new(client)),
             response_header_timeout: config.timeout,
             config,
             metadata: tokio::sync::OnceCell::new(),
@@ -247,6 +256,22 @@ impl GeminiModelBackend {
             include_thoughts: false,
             catalog_url,
         })
+    }
+
+    pub(crate) fn http_client(&self) -> Client {
+        self.client
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn reset_http_client(&self) {
+        if let Ok(fresh) = build_http_client(&self.config) {
+            *self
+                .client
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+        }
     }
 
     /// Persist public capacity metadata between processes. No credentials or
@@ -485,10 +510,11 @@ impl ModelBackend for GeminiModelBackend {
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
         let started = Instant::now();
+        let client = self.http_client();
         let http_request = self
             .config
             .authentication
-            .apply(self.client.post(self.config.stream_url()), &cancellation)
+            .apply(client.post(self.config.stream_url()), &cancellation)
             .await
             .map_err(|error| request_timing(error, "authentication", started))?
             .json(&body);
@@ -499,6 +525,7 @@ impl ModelBackend for GeminiModelBackend {
             response = tokio::time::timeout(self.response_header_timeout, http_request.send()) => response,
         }
         .map_err(|_| {
+            self.reset_http_client();
             request_timing(
                 ModelError::new(ModelErrorCode::Unavailable, format!(
                     "Gemini response headers were not received within {:?}", self.response_header_timeout
@@ -509,7 +536,10 @@ impl ModelBackend for GeminiModelBackend {
                 "response_headers", started,
             )
         })?
-        .map_err(|error| request_timing(map_transport_error(error), "response_headers", started))?;
+        .map_err(|error| {
+            self.reset_http_client();
+            request_timing(map_transport_error(error), "response_headers", started)
+        })?;
         let status = response.status();
         tracing::debug!(request_id = %request.request_id, elapsed_ms = started.elapsed().as_millis(), %status, "Gemini response headers received");
         if !status.is_success() {
@@ -1624,6 +1654,62 @@ mod tests {
         assert!(backend
             .with_response_header_timeout(Duration::ZERO)
             .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_rotates_the_pooled_http_client_for_retries() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_handler = attempts.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            post(move || {
+                let attempts = attempts_handler.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::future::pending::<String>().await
+                    } else {
+                        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1}}\n\n".to_owned()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = GeminiModelBackend::new(GeminiModelConfig {
+            backend_id: "retry-rotation-fixture".into(),
+            endpoint,
+            authentication: GeminiAuthentication::ApiKey("fixture".into()),
+            model: "fixture".into(),
+            temperature: 0.0,
+            thinking_level: None,
+            default_max_output_tokens: 256,
+            max_context_tokens: None,
+            timeout: Duration::from_secs(5),
+            max_buffered_events: 16,
+        })
+        .unwrap()
+        .with_response_header_timeout(Duration::from_millis(80))
+        .unwrap();
+
+        let first = backend
+            .start(request(), CancellationToken::new())
+            .await
+            .err()
+            .expect("first attempt must time out");
+        assert_eq!(first.details["phase"], "response_headers");
+        let mut second = backend
+            .start(request(), CancellationToken::new())
+            .await
+            .expect("second attempt after client rotation must succeed");
+        assert!(matches!(
+            second.next().await.unwrap().unwrap().payload,
+            ModelEvent::TextDelta { ref delta } if delta == "recovered"
+        ));
         server.abort();
     }
 

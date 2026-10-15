@@ -41,16 +41,22 @@ pub(super) async fn start_model_with_retry(
         }
         let attempt_cancellation = cancellation.child_token();
         let guard = attempt_cancellation.clone().drop_guard();
+        let max_retries = inner.config.model_retry.max_retries;
+        let retry_prefix = if retry_number > 0 {
+            format!("Retry {retry_number}/{max_retries} · ")
+        } else {
+            String::new()
+        };
         let result = with_wait_notice(
             inner.backend.start(request.clone(), attempt_cancellation),
-            |elapsed| report_model_wait(inner, run, "response", elapsed),
+            |elapsed| report_model_wait(inner, run, &retry_prefix, "response", elapsed),
         )
         .await;
         let mut usage = None;
         let mut expected_sequence = 1;
         let error = match result {
             Ok(mut stream) => loop {
-                match next_model_event(inner, run, &mut stream).await {
+                match next_model_event_with_prefix(inner, run, &retry_prefix, &mut stream).await {
                     Some(Ok(first)) => {
                         first
                             .validate_for(&request.request_id, expected_sequence)
@@ -166,8 +172,17 @@ pub(super) async fn next_model_event(
     run: &AgentStartRequest,
     stream: &mut ModelStream,
 ) -> Option<Result<ModelStreamEvent, ModelError>> {
+    next_model_event_with_prefix(inner, run, "", stream).await
+}
+
+async fn next_model_event_with_prefix(
+    inner: &GenericInner,
+    run: &AgentStartRequest,
+    prefix: &str,
+    stream: &mut ModelStream,
+) -> Option<Result<ModelStreamEvent, ModelError>> {
     with_wait_notice(stream.next(), |elapsed| {
-        report_model_wait(inner, run, "output", elapsed)
+        report_model_wait(inner, run, prefix, "output", elapsed)
     })
     .await
 }
@@ -195,6 +210,7 @@ async fn with_wait_notice<T>(
 fn report_model_wait(
     inner: &GenericInner,
     run: &AgentStartRequest,
+    prefix: &str,
     phase: &str,
     elapsed: Duration,
 ) {
@@ -207,7 +223,7 @@ fn report_model_wait(
             run_id: run_id.clone(),
             provider_seq: None,
             payload: AgentTelemetry::ProgressReported {
-                message: format!("Waiting for model {phase} ({}s)", elapsed.as_secs()),
+                message: format!("{prefix}Waiting for model {phase} ({}s)", elapsed.as_secs()),
                 fraction: None,
             },
         },

@@ -1906,7 +1906,7 @@ pub(crate) fn build_model_backend(
             .with_response_header_timeout(Duration::from_secs(
                 backend
                     .get_config("response_header_timeout_secs")
-                    .unwrap_or(120),
+                    .unwrap_or(60),
             ))
             .context("configure Gemini response header timeout")?
             .with_thought_summaries(backend.get_config("include_thoughts").unwrap_or(true))
