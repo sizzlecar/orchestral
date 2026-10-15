@@ -15,12 +15,15 @@ pub(super) struct RuntimeTempRoot {
 impl RuntimeTempRoot {
     pub(super) fn temporary() -> Result<Self, ExecProcessError> {
         #[cfg(unix)]
-        let parent = PathBuf::from("/tmp");
-        #[cfg(not(unix))]
-        let parent = std::env::temp_dir();
         let owner = tempfile::Builder::new()
             .prefix("orch-")
-            .tempdir_in(parent)
+            .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("orch-").tempdir())
+            .map_err(io_error)?;
+        #[cfg(not(unix))]
+        let owner = tempfile::Builder::new()
+            .prefix("orch-")
+            .tempdir()
             .map_err(io_error)?;
         let path = std::fs::canonicalize(owner.path()).map_err(io_error)?;
         Ok(Self {

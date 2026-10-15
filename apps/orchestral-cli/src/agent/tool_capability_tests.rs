@@ -238,3 +238,153 @@ async fn cli_file_schema_projection_preserves_primary_and_additional_root_operat
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn permission_presets_control_read_only_auto_and_full_access_execution() {
+    use orchestral_core::config::PermissionPreset;
+
+    let root = std::env::temp_dir().join(unique_id("permission-presets", 0));
+    let primary = root.join("primary");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let workspaces = CliWorkspaceSet::resolve(Some(&primary), &[]).unwrap();
+    let outside = std::fs::canonicalize(&outside).unwrap();
+    std::fs::write(primary.join("note.txt"), "initial\n").unwrap();
+    std::fs::write(outside.join("external.txt"), "external-ok\n").unwrap();
+
+    let compose = |preset: PermissionPreset| {
+        let mut config = OrchestralConfig::default();
+        config.tools.permissions = preset;
+        config.tools.exec.enabled = true;
+        config.tools.exec.allow_host_execution = true;
+        config.tools.exec.shell = Some("/bin/sh".to_owned());
+        let effects = Arc::new(InMemoryToolEffectJournalStore::default());
+        let artifacts =
+            ToolArtifactStore::new(Arc::new(InMemoryBlobStore::default()), 8192, 128).unwrap();
+        let reader = GuardedArtifactReadExecutor::new_session_scoped(
+            artifacts.clone(),
+            Arc::new(InMemoryAgentJournalStore::default()),
+            Arc::new(InMemoryAgentSessionJournalStore::default()),
+            effects.clone(),
+        );
+        build_cli_tool_runtime(&config, &[], effects, artifacts, &workspaces, reader).unwrap()
+    };
+
+    // 1. ReadOnly: file_read auto-runs, but file_write and mutating exec_command require approval.
+    let read_only = compose(PermissionPreset::ReadOnly);
+    let read_result = read_only
+        .runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("preset-ro"),
+                call_id: ToolCallId::new("ro-read"),
+                tool_id: read_only
+                    .runtime
+                    .resolve_tool_id("file_read")
+                    .unwrap()
+                    .unwrap(),
+                arguments: json!({"path": "note.txt"}),
+            },
+            read_only.run_grant.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        read_result,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            ..
+        }
+    ));
+    let write_result = read_only
+        .runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("preset-ro"),
+                call_id: ToolCallId::new("ro-write"),
+                tool_id: read_only
+                    .runtime
+                    .resolve_tool_id("file_write")
+                    .unwrap()
+                    .unwrap(),
+                arguments: json!({"path": "blocked.txt", "content": "no\n", "mode": "create"}),
+            },
+            read_only.run_grant.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        write_result,
+        GuardedToolResult::ApprovalRequired { .. }
+    ));
+
+    // 2. FullAccess: external workdir, destructive commands, and patch deletions run without approval.
+    let full = compose(PermissionPreset::FullAccess);
+    let exec_outside = full
+        .runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("preset-full"),
+                call_id: ToolCallId::new("full-exec"),
+                tool_id: full
+                    .runtime
+                    .resolve_tool_id("exec_command")
+                    .unwrap()
+                    .unwrap(),
+                arguments: json!({
+                    "cmd": "cat external.txt && rm -f external.txt",
+                    "workdir": outside,
+                }),
+            },
+            full.run_grant.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let GuardedToolResult::Outcome {
+        outcome: ToolOutcome::Completed {
+            output: ToolOutput::Inline(output),
+        },
+        ..
+    } = exec_outside
+    else {
+        panic!("FullAccess exec must complete without approval: {exec_outside:?}");
+    };
+    assert_eq!(output["stdout"], "external-ok\n");
+    assert!(!outside.join("external.txt").exists());
+
+    let patch_delete = full
+        .runtime
+        .invoke(
+            ToolInvocation {
+                run_id: RunId::new("preset-full"),
+                call_id: ToolCallId::new("full-patch-delete"),
+                tool_id: full
+                    .runtime
+                    .resolve_tool_id("apply_patch")
+                    .unwrap()
+                    .unwrap(),
+                arguments: json!({
+                    "patch": "*** Begin Patch\n*** Delete File: note.txt\n*** End Patch"
+                }),
+            },
+            full.run_grant.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        patch_delete,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Completed { .. },
+            ..
+        }
+    ));
+    assert!(!primary.join("note.txt").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}

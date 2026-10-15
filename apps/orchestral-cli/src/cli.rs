@@ -50,6 +50,12 @@ pub struct Cli {
     /// Generic Agent reasoning: default omits controls; on/off toggle thinking; other names request provider effort. Use effort:<name> for literal reserved names.
     #[arg(long, value_name = "default|on|off|EFFORT|effort:NAME", global = true)]
     reasoning: Option<orchestral_core::config::ReasoningPreference>,
+    /// Session permission preset: read-only, auto (default workspace write), or full-access (no sandbox/approvals).
+    #[arg(long, value_name = "read-only|auto|full-access", global = true)]
+    permissions: Option<orchestral_core::config::PermissionPreset>,
+    /// Shorthand for --permissions full-access (unrestricted filesystem/network without approval prompts).
+    #[arg(long, global = true, conflicts_with = "permissions")]
+    full_access: bool,
     /// Continue the conversation with this session ID
     #[arg(long, global = true)]
     session_id: Option<String>,
@@ -127,6 +133,10 @@ impl Cli {
             model,
             temperature: self.temperature,
             reasoning: self.reasoning.clone(),
+            permissions: self.permissions.or_else(|| {
+                self.full_access
+                    .then_some(orchestral_core::config::PermissionPreset::FullAccess)
+            }),
             base_url,
             api_key_env: self.api_key_env.clone(),
             no_auth: self.no_auth,
@@ -181,6 +191,14 @@ impl Cli {
             )
         {
             anyhow::bail!("--reasoning configures the Generic Agent (run, resume, or serve); native Agent sessions use their declared session controls");
+        }
+        if (self.permissions.is_some() || self.full_access)
+            && matches!(
+                self.command,
+                Some(CliCommand::Sessions(_) | CliCommand::Mcp(_) | CliCommand::Skills(_))
+            )
+        {
+            anyhow::bail!("--permissions/--full-access configures the Generic Agent (run, resume, or serve); native Agent sessions use their declared session controls");
         }
         Ok(())
     }
@@ -245,6 +263,43 @@ mod tests {
             Cli::try_parse_from(["orchestral", "--reasoning", "off", "resume", "conversation"])
                 .unwrap();
         assert!(resume.validate_reasoning_command().is_ok());
+    }
+
+    #[test]
+    fn permissions_and_full_access_flags_are_typed_and_validated() {
+        use orchestral_core::config::PermissionPreset;
+        for (args, expected) in [
+            (
+                &["orchestral", "--permissions", "read-only", "inspect"][..],
+                Some(PermissionPreset::ReadOnly),
+            ),
+            (
+                &["orchestral", "--permissions", "auto", "inspect"][..],
+                Some(PermissionPreset::Auto),
+            ),
+            (
+                &["orchestral", "--permissions", "full-access", "inspect"][..],
+                Some(PermissionPreset::FullAccess),
+            ),
+            (
+                &["orchestral", "--full-access", "inspect"][..],
+                Some(PermissionPreset::FullAccess),
+            ),
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap();
+            assert_eq!(parsed.model_overrides().permissions, expected);
+        }
+        assert!(Cli::try_parse_from([
+            "orchestral",
+            "--permissions",
+            "auto",
+            "--full-access",
+            "inspect",
+        ])
+        .is_err());
+        let native =
+            Cli::try_parse_from(["orchestral", "--full-access", "sessions", "agents"]).unwrap();
+        assert!(native.validate_reasoning_command().is_err());
     }
 
     #[test]

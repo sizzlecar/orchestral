@@ -120,6 +120,7 @@ fn merge_model_overrides(requested: &ModelOverrides, automatic: &ModelOverrides)
             .reasoning
             .clone()
             .or_else(|| automatic.reasoning.clone()),
+        permissions: requested.permissions.or(automatic.permissions),
         base_url: requested.base_url.clone(),
         api_key_env: requested.api_key_env.clone(),
         no_auth: requested.no_auth,
@@ -216,6 +217,10 @@ fn apply_model_overrides_to_yaml(
     }
     if let Some(reasoning) = &overrides.reasoning {
         set_yaml_key(agent, "reasoning", serde_yaml::to_value(reasoning)?);
+    }
+    if let Some(permissions) = overrides.permissions {
+        let tools = ensure_mapping_entry(root, "tools");
+        set_yaml_key(tools, "permissions", serde_yaml::to_value(permissions)?);
     }
     if overrides.base_url.is_some() || overrides.api_key_env.is_some() || overrides.no_auth {
         apply_connection_overrides(root, config, overrides)?;

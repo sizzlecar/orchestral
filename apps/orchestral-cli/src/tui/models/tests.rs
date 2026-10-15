@@ -8,6 +8,7 @@ fn metadata(endpoint: &str) -> HostMetadata {
         models: vec![serde_json::from_value(json!({"name":"same-name", "backend":"configured", "model":"profile-id"})).unwrap()],
         model_backend: serde_json::from_value(json!({"name":"cli-openai", "kind":"openai", "endpoint":endpoint,"config":{"auth":"none"}})).unwrap(),
         reasoning: ReasoningPreference::Default,
+        permissions: PermissionPreset::Auto,
     }
 }
 
@@ -256,4 +257,28 @@ fn explicit_reasoning_command_needs_no_discovery_and_preserves_custom_effort() {
     assert!(reasoning_argument("/reasoning").is_none());
     assert!(reasoning_argument("/reasoningful high").is_none());
     assert!(explicit_reasoning(&metadata, "model", "effort:").is_err());
+}
+
+#[test]
+fn permissions_menu_and_explicit_command_select_all_presets() {
+    let mut meta = metadata("http://127.0.0.1:1/v1");
+    meta.permissions = PermissionPreset::Auto;
+    let menu = permissions(&meta);
+    assert_eq!(menu.choices.len(), 3);
+    assert!(menu.choices[1].description.starts_with("Current · "));
+    for (command, expected) in [
+        ("/permissions read-only", PermissionPreset::ReadOnly),
+        ("/permissions auto", PermissionPreset::Auto),
+        ("/permissions default", PermissionPreset::Auto),
+        ("/permissions full-access", PermissionPreset::FullAccess),
+    ] {
+        let argument = permissions_argument(command).unwrap();
+        let selection = explicit_permissions(argument).unwrap();
+        let mut overrides = ModelOverrides::default();
+        apply_selection(&meta, "model", &mut overrides, selection).unwrap();
+        assert_eq!(overrides.permissions, Some(expected));
+        assert_eq!(overrides.model.as_deref(), Some("model"));
+    }
+    assert!(permissions_argument("/permissions").is_none());
+    assert!(explicit_permissions("unknown").is_err());
 }

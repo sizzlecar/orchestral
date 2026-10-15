@@ -91,8 +91,9 @@ impl Tasks {
         );
         if (matches!(
             name.as_str(),
-            "/model" | "/model profiles" | "/reasoning" | "/new"
+            "/model" | "/model profiles" | "/reasoning" | "/permissions" | "/new"
         ) || super::models::reasoning_argument(&name).is_some()
+            || super::models::permissions_argument(&name).is_some()
             || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _))))
             && active
         {
@@ -158,6 +159,7 @@ impl Tasks {
         let generation = self.generation;
         let changes_host_state = name == "/new"
             || super::models::reasoning_argument(&name).is_some()
+            || super::models::permissions_argument(&name).is_some()
             || matches!(selection, Some((MenuKind::Models | MenuKind::Sessions, _)))
             || matches!(action, Some(LocalAction::SetSkillEnabled { .. }))
             || (name.starts_with("/skills ") && name.trim() != "/skills list");
@@ -287,11 +289,13 @@ async fn local_action(host: &AgentHost, session: &str, action: LocalAction) -> R
             Ok(detail(
                 "Session details · ↑↓ read · Esc back",
                 format!(
-                    "Session: {session}\nStorage: {}\nWorkspace: {}\nModel: {} / {}\n\n{}",
+                    "Session: {session}\nStorage: {}\nWorkspace: {}\nModel: {} / {}\nPermissions: {} ({})\n\n{}",
                     host.metadata.journal_location,
                     host.workspace_root.display(),
                     host.backend_name,
                     host.model,
+                    host.metadata.permissions.label(),
+                    host.metadata.permissions,
                     super::insights::usage(history.as_ref())
                 ),
             ))
@@ -319,6 +323,18 @@ pub(crate) async fn command(
         "/reasoning" => Ok(Response::Menu(
             super::models::reasoning(&host.metadata, &host.model).await?,
         )),
+        "/permissions" => Ok(Response::Menu(super::models::permissions(&host.metadata))),
+        command if super::models::permissions_argument(command).is_some() => {
+            let value = super::models::permissions_argument(command).unwrap();
+            let selection = super::models::explicit_permissions(value)?;
+            choose(
+                host,
+                options,
+                MenuKind::Models,
+                serde_json::to_string(&selection)?,
+            )
+            .await
+        }
         command if super::models::reasoning_argument(command).is_some() => {
             let value = super::models::reasoning_argument(command).unwrap();
             let selection = super::models::explicit_reasoning(&host.metadata, &host.model, value)?;
@@ -426,6 +442,7 @@ pub(crate) async fn choose(
                 )));
             }
             let reasoning = matches!(selection, super::models::Selection::Reasoning { .. });
+            let permissions = matches!(selection, super::models::Selection::Permissions { .. });
             super::models::apply_selection(
                 &host.metadata,
                 &host.model,
@@ -437,6 +454,12 @@ pub(crate) async fn choose(
                 format!(
                     "Reasoning {} selected for the next request",
                     next.metadata.reasoning
+                )
+            } else if permissions {
+                format!(
+                    "Permissions set to {} ({})",
+                    next.metadata.permissions.label(),
+                    next.metadata.permissions
                 )
             } else {
                 "Model selected for the next request".to_owned()

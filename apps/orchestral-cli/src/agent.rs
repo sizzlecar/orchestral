@@ -226,6 +226,7 @@ pub(crate) struct HostMetadata {
     pub models: Vec<ModelProfile>,
     pub model_backend: BackendSpec,
     pub reasoning: orchestral_core::config::ReasoningPreference,
+    pub permissions: orchestral_core::config::PermissionPreset,
 }
 
 pub struct AgentHost {
@@ -432,6 +433,7 @@ async fn build_agent_host_with_journals(
         models: config.providers.models.clone(),
         model_backend: backend.clone(),
         reasoning: reasoning.clone(),
+        permissions: config.tools.permissions,
     };
     let session_history = if matches!(config.journal.backend.as_str(), "fs" | "filesystem") {
         crate::local_sessions::LocalSessionHistory::Directory(base_journal_root)
@@ -601,7 +603,10 @@ async fn build_agent_host_with_journals(
         execution_profile: AgentSessionExecutionProfile {
             model: Some(model),
             reasoning_effort: Some(reasoning.to_string()),
-            permissions: Default::default(),
+            permissions: config
+                .tools
+                .permissions
+                .to_session_permissions(!config.tools.exec.network_targets.is_empty()),
         },
         skill_manager,
         session_history,
@@ -1048,7 +1053,9 @@ fn build_cli_tool_runtime(
             artifact_store.clone(),
         )
         .context("create guarded Tool Runtime")?
-        .with_permission_policy(Arc::new(WorkspacePermissionPolicy)),
+        .with_permission_policy(WorkspacePermissionPolicy::for_preset(
+            config.tools.permissions,
+        )),
     );
     runtime
         .register(
@@ -1151,6 +1158,8 @@ fn build_cli_tool_runtime(
         } else {
             approved_host_exec_command_descriptor(restriction)
         };
+        let full_access =
+            config.tools.permissions == orchestral_core::config::PermissionPreset::FullAccess;
         let executor = GuardedExecCommandExecutor::new(
             process_supervisor.clone(),
             exec_host.shell,
@@ -1163,7 +1172,8 @@ fn build_cli_tool_runtime(
         })
         .map_err(anyhow::Error::msg)
         .context("configure guarded exec_command Tool")?
-        .with_sandboxed_execution_enabled(config.tools.exec.sandboxed_execution_enabled);
+        .with_sandboxed_execution_enabled(config.tools.exec.sandboxed_execution_enabled)
+        .with_full_access(full_access);
         descriptor.model_schema.description.push_str(if executor.enables_pipefail() {
             " Pipefail is enabled: a pipeline returns its rightmost nonzero status, including SIGPIPE from an early-exiting consumer."
         } else {
@@ -1228,7 +1238,9 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     if !config.tools.exec.enabled {
         return Ok(None);
     }
-    if !config.tools.exec.sandboxed_execution_enabled && !config.tools.exec.allow_host_execution {
+    let allow_host_execution = config.tools.exec.allow_host_execution
+        || config.tools.permissions == orchestral_core::config::PermissionPreset::FullAccess;
+    if !config.tools.exec.sandboxed_execution_enabled && !allow_host_execution {
         bail!("tools.exec.sandboxed_execution_enabled=false requires tools.exec.allow_host_execution=true; command approval is still required");
     }
     let configured = config
@@ -1300,7 +1312,7 @@ fn configured_exec_host(config: &OrchestralConfig) -> anyhow::Result<Option<CliE
     .map(str::to_owned)
     .collect::<BTreeSet<_>>();
     Ok(Some(CliExecHost {
-        allow_host_execution: config.tools.exec.allow_host_execution,
+        allow_host_execution,
         runtime_readable_roots: exec_runtime_readable_roots(&shell),
         runtime_readable_files: exec_runtime_readable_files(),
         shell,
@@ -1316,17 +1328,39 @@ fn exec_runtime_readable_files() -> Vec<PathBuf> {
         .collect::<BTreeSet<_>>();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(home) = &home {
-        candidates.insert(home.join(".gitconfig"));
+        for relative in [
+            ".gitconfig",
+            ".gitignore",
+            ".gitignore_global",
+            ".gitattributes",
+            ".cargo/config.toml",
+            ".cargo/config",
+        ] {
+            candidates.insert(home.join(relative));
+        }
         let xdg_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| home.join(".config"));
-        candidates.insert(xdg_home.join("git/config"));
+        for relative in ["git/config", "git/ignore", "git/attributes"] {
+            candidates.insert(xdg_home.join(relative));
+        }
     }
     for name in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
         if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
             if path.is_absolute() {
                 candidates.insert(path);
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+            if let Ok(entries) = std::fs::read_dir(&directory) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                        candidates.insert(entry.path());
+                    }
+                }
             }
         }
     }
@@ -1349,13 +1383,51 @@ fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {
             // Version-managed runtimes may load adjacent libraries, but never
             // widen a PATH entry to the manager's entire user directory (for
             // example ~/.cargo, which can contain credentials).
-            if ["/.nvm/versions/", "/.pyenv/versions/"]
-                .iter()
-                .any(|marker| text.contains(marker))
+            if [
+                "/.nvm/versions/",
+                "/.pyenv/versions/",
+                "/.asdf/installs/",
+                "/.mise/installs/",
+                "/.local/share/",
+                "/.codex/packages/",
+            ]
+            .iter()
+            .any(|marker| text.contains(marker))
                 && directory.file_name().is_some_and(|name| name == "bin")
             {
                 if let Some(installation) = directory.parent() {
                     candidates.insert(installation.to_path_buf());
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(&directory) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                        continue;
+                    }
+                    let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
+                        continue;
+                    };
+                    let resolved_text = resolved.to_string_lossy();
+                    if [
+                        "/.local/share/",
+                        "/.codex/packages/",
+                        "/.nvm/versions/",
+                        "/.pyenv/versions/",
+                        "/.asdf/installs/",
+                        "/.mise/installs/",
+                    ]
+                    .iter()
+                    .any(|marker| resolved_text.contains(marker))
+                    {
+                        if let Some(parent) = resolved.parent() {
+                            candidates.insert(parent.to_path_buf());
+                            if parent.file_name().is_some_and(|name| name == "bin") {
+                                if let Some(installation) = parent.parent() {
+                                    candidates.insert(installation.to_path_buf());
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if text.starts_with("/opt/homebrew/") {
@@ -1368,12 +1440,14 @@ fn exec_runtime_readable_roots(shell: &Path) -> Vec<PathBuf> {
     }
     for candidate in [
         "/bin",
+        "/sbin",
         "/usr/bin",
         "/usr/sbin",
         "/usr/local",
         "/opt/homebrew",
         "/nix/store",
         "/etc",
+        "/Library/Apple",
         "/Library/Frameworks",
         "/Library/Developer/CommandLineTools",
         "/Applications/Xcode.app",
