@@ -1,10 +1,13 @@
 //! Replay-derived model context for the Generic Agent.
 
 mod live_source;
+mod model_assisted;
 pub mod observed_prefix;
 mod placement;
 mod pressure;
 mod summary_continuation;
+
+pub use self::model_assisted::ModelAssistedSessionSummarizer;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -985,18 +988,11 @@ pub fn select_compaction_source(
     close_segment(&mut segments, &mut current, false);
 
     let total_non_summary_records: usize = segments.iter().map(|s| s.non_summary_records).sum();
-    let has_later_compaction = |end: u64| {
-        records
-            .iter()
-            .any(|record| record.session_seq > end && is_compaction_summary_record(record))
-    };
-
     segments.into_iter().find_map(|segment| {
         let count_ready = segment.non_summary_records >= policy.minimum_source_records;
         let volume_ready = segment.byte_volume >= COMPACTION_SOURCE_VOLUME_BYTES;
         let sealed_island_ready = segment.sealed_by_historical_barrier
-            && (total_non_summary_records >= policy.minimum_source_records
-                || has_later_compaction(segment.range.last_session_seq));
+            && total_non_summary_records >= policy.minimum_source_records;
         (count_ready || volume_ready || sealed_island_ready).then_some(segment.range)
     })
 }
@@ -1053,18 +1049,52 @@ pub fn select_active_run_compaction_source(
         {
             last_index += 1;
         }
-        // Keep the newest post-summary exchange verbatim when possible. The
-        // rest of the live segment, including the old summary producer, is
-        // collapsed into one new summary so summaries cannot accumulate.
-        let source_last_index = if last_index > summary_index
-            && matches!(
-                records[last_index].payload,
-                AgentSessionEvent::ToolExchangeCommitted { .. }
-            ) {
-            last_index - 1
+        // Retain up to `policy.keep_recent_records` trailing Tool exchanges in
+        // this segment when there are still post-summary exchanges to fold into
+        // the existing summary, so repeated pressure compaction does not wipe
+        // out the entire recent working window.
+        let post_summary_exchanges = records[(summary_index + 1)..=last_index]
+            .iter()
+            .filter(|record| {
+                live.contains(&record.session_seq)
+                    && matches!(
+                        record.payload,
+                        AgentSessionEvent::ToolExchangeCommitted { .. }
+                    )
+            })
+            .count();
+        let retain_trailing = if post_summary_exchanges > policy.keep_recent_records {
+            policy.keep_recent_records
+        } else if post_summary_exchanges > 1
+            || (last_index > summary_index
+                && matches!(
+                    records[last_index].payload,
+                    AgentSessionEvent::ToolExchangeCommitted { .. }
+                )
+                && first_index < summary_index)
+        {
+            1
         } else {
-            last_index
+            0
         };
+        let mut source_last_index = last_index;
+        let mut retained = 0usize;
+        while retained < retain_trailing && source_last_index > first_index {
+            if live.contains(&records[source_last_index].session_seq)
+                && matches!(
+                    records[source_last_index].payload,
+                    AgentSessionEvent::ToolExchangeCommitted { .. }
+                )
+            {
+                retained += 1;
+            }
+            source_last_index -= 1;
+        }
+        while source_last_index > first_index
+            && !live.contains(&records[source_last_index].session_seq)
+        {
+            source_last_index -= 1;
+        }
         if source_last_index >= first_index
             && records[first_index..=source_last_index]
                 .iter()

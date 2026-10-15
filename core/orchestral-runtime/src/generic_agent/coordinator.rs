@@ -126,38 +126,39 @@ impl InternalGenericAgentProvider {
         };
 
         let model_definitions = model_definitions_for_run(&self.inner, run_skills.is_some());
-        let context_result = project_model_messages(
-            &self.inner,
-            &request,
-            &model_definitions,
-            run_skills.as_deref(),
-            Some(user_message.clone()),
-            None,
-            None,
-        )
-        .await;
-
-        let model_messages = match context_result {
-            Ok(messages) => messages,
-            Err(error) => {
-                let inner = self.inner.clone();
-                let failed_request = request.clone();
-                let failed_user_message = user_message.clone();
-                tokio::spawn(async move {
-                    fail_before_model(
-                        inner,
-                        &failed_request,
-                        &failed_user_message,
-                        session_failure(error),
-                    );
-                });
-                return Ok(AgentStart {
-                    execution,
-                    admission,
-                    stream,
-                });
-            }
-        };
+        if let Err(error) = self
+            .inner
+            .session_journal
+            .append(AgentSessionEventDraft {
+                event_id: AgentSessionEventId::new(format!(
+                    "generic-{}-input",
+                    request.run.spec.run_id.as_str()
+                )),
+                session_id: request.run.spec.session_id.clone(),
+                run_id: request.run.spec.run_id.clone(),
+                payload: AgentSessionEvent::RunInputCommitted {
+                    message: user_message.clone(),
+                },
+            })
+            .await
+        {
+            let inner = self.inner.clone();
+            let failed_request = request.clone();
+            let failed_user_message = user_message.clone();
+            tokio::spawn(async move {
+                fail_before_model(
+                    inner,
+                    &failed_request,
+                    &failed_user_message,
+                    session_failure(SessionContextError::from(error)),
+                );
+            });
+            return Ok(AgentStart {
+                execution,
+                admission,
+                stream,
+            });
+        }
 
         if let Err(failure) = commit_loop_boundary(
             &self.inner,
@@ -187,7 +188,7 @@ impl InternalGenericAgentProvider {
                 inner,
                 request,
                 user_message,
-                model_messages,
+                model_messages: Vec::new(),
                 model_tools: model_definitions,
                 run_skills,
                 seed: GenericExecutionSeed::fresh(),

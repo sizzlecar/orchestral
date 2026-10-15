@@ -141,7 +141,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
             .as_ref()
             .and_then(|recovery| recovery.output_budget_tokens)
             .map_or(output_reserve, |cap| output_reserve.min(cap));
-        let model_context = match project_model_context(
+        let project_fut = project_model_context(
             &inner,
             &request,
             &model_tools,
@@ -169,9 +169,14 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                 ),
                 observed_prefix: observed_prefix.as_ref(),
             },
-        )
-        .await
-        {
+        );
+        let model_context = match tokio::select! {
+            _ = cancellation.cancelled() => {
+                emit_cancel(&inner, &request, &user_message);
+                return;
+            }
+            result = project_fut => result,
+        } {
             Ok(context) => context,
             Err(SessionContextError::ContextOverflow { budget, .. })
                 if remaining_input == Some(budget) =>

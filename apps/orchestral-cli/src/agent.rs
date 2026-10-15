@@ -24,6 +24,7 @@ use orchestral_core::agent_protocol::{
 use orchestral_core::agent_session::{AgentSessionJournalStore, InMemoryAgentSessionJournalStore};
 use orchestral_core::config::{
     load_config, BackendSpec, McpTransportSpec, ModelProfile, OrchestralConfig,
+    SessionSummarizerStrategy,
 };
 use orchestral_core::io::BlobStore;
 use orchestral_core::mcp_protocol::{McpServerId, McpTransportFactory};
@@ -64,12 +65,13 @@ use orchestral_runtime::tools::{
     SessionScheduleRegistry,
 };
 use orchestral_runtime::{
-    AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
+    AgentClient, AgentControlEvent, AgentController, AgentSessionSummarizer, ContinuationPolicy,
     DeterministicExtractiveSessionSummarizer, GenericAgentCheckpointStore, GenericAgentConfig,
     GuardedMcpServerConfig, GuardedToolRuntime, InMemoryBlobStore,
     InMemoryGenericAgentCheckpointStore, InMemoryHostApprovalBroker, InternalGenericAgentProvider,
-    McpToolsAdapterRegistry, ModelTokenMeter, ProcessSupervisor, SessionCompactionPolicy,
-    StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore, WorkspacePermissionPolicy,
+    McpToolsAdapterRegistry, ModelAssistedSessionSummarizer, ModelTokenMeter, ProcessSupervisor,
+    SessionCompactionPolicy, StdioMcpSandboxPolicy, StdioMcpTransportFactory, ToolArtifactStore,
+    WorkspacePermissionPolicy,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -565,6 +567,7 @@ async fn build_agent_host_with_journals(
     }
     let (skills, skill_manager) =
         build_skill_setup(&config, &workspaces.primary, options.no_skills)?;
+    let summarizer_backend = model_backend.clone();
     let provider = match skills.clone() {
         Some(skills) => {
             InternalGenericAgentProvider::new_with_tools_approval_skills_and_session_journal(
@@ -590,14 +593,25 @@ async fn build_agent_host_with_journals(
     }
     .context("create Generic Agent provider")?;
     let provider = if config.agent.compaction.enabled {
+        let summarizer: Arc<dyn AgentSessionSummarizer> = match config.agent.compaction.strategy {
+            SessionSummarizerStrategy::ModelAssisted => Arc::new(
+                ModelAssistedSessionSummarizer::new(
+                    summarizer_backend,
+                    Some(model.clone()),
+                    config.agent.compaction.summary_max_chars,
+                )
+                .context("configure model-assisted Session summarizer")?,
+            ),
+            SessionSummarizerStrategy::DeterministicExtractive => Arc::new(
+                DeterministicExtractiveSessionSummarizer::new(
+                    config.agent.compaction.summary_max_chars,
+                )
+                .context("configure deterministic Session summarizer")?,
+            ),
+        };
         provider
             .with_session_compaction(
-                Arc::new(
-                    DeterministicExtractiveSessionSummarizer::new(
-                        config.agent.compaction.summary_max_chars,
-                    )
-                    .context("configure deterministic Session summarizer")?,
-                ),
+                summarizer,
                 SessionCompactionPolicy {
                     minimum_source_records: config.agent.compaction.minimum_source_records,
                     keep_recent_records: config.agent.compaction.keep_recent_records,

@@ -243,6 +243,25 @@ async fn recall_pages_an_immutable_prefix_and_reassembles_exact_unicode_fields()
         serde_json::from_str::<String>(&content).unwrap(),
         "Keep names unchanged. 中文🙂".repeat(60)
     );
+    // Mid-character UTF-8 byte offsets are aligned down to the start of the
+    // multi-byte codepoint so estimated offsets on CJK/emoji text do not fail.
+    let aligned: SessionReadChunk = serde_json::from_value(output(
+        f.call(
+            "chunk-mid-char",
+            json!({
+                "session_seq": 1,
+                "json_pointer": "/payload/message/content/0/text",
+                "offset": 24,
+                "max_bytes": 16,
+                "through_seq": first.through_seq
+            }),
+            true,
+        )
+        .await,
+    ))
+    .unwrap();
+    assert_eq!(aligned.offset, 23);
+    assert!(aligned.content.starts_with("中"));
     let invalid = f
         .call(
             "bad-path",
