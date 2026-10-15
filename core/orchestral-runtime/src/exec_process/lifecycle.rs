@@ -31,6 +31,7 @@ pub struct ExecSessionSnapshot {
     pub status: ExecSessionStatus,
     pub operation: ToolOperationPlan,
     pub wall_time_seconds: f64,
+    pub recent_output: Vec<String>,
 }
 
 /// Lossy process activity notification. `snapshot` remains authoritative when

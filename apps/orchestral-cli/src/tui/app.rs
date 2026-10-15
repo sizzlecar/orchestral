@@ -387,9 +387,14 @@ pub(crate) async fn run_tui(
                                     &mut state,
                                     UiMsg::ProcessInventory {
                                         run_id: run_id.as_str().to_owned(),
-                                        session_ids: sessions.into_iter().map(|id| id.get()).collect(),
+                                        session_ids: sessions.iter().map(|id| id.get()).collect(),
                                     },
                                 );
+                                for session_id in sessions {
+                                    if let Ok(snapshot) = process_supervisor.snapshot(&run_id, session_id) {
+                                        project_process_event(&mut state, ExecSessionEvent { snapshot });
+                                    }
+                                }
                                 needs_redraw = true;
                             }
                         }
@@ -448,6 +453,7 @@ fn project_process_event(state: &mut UiState, event: ExecSessionEvent) {
             run_id: event.snapshot.run_id.as_str().to_owned(),
             session_id: event.snapshot.session_id.get(),
             running: matches!(event.snapshot.status, ExecSessionStatus::Running),
+            recent_output: event.snapshot.recent_output,
         },
     );
 }

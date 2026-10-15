@@ -267,6 +267,7 @@ pub(crate) enum UiMsg {
         run_id: String,
         session_id: u64,
         running: bool,
+        recent_output: Vec<String>,
     },
     ProcessInventory {
         run_id: String,
@@ -365,6 +366,7 @@ pub(crate) struct UiState {
     seen_summary_delta_ids: BTreeSet<String>,
     activity_reducer: ActivityReducer,
     active_processes: BTreeSet<u64>,
+    process_outputs: BTreeMap<u64, Vec<String>>,
     last_tick: Option<Instant>,
 }
 
@@ -422,6 +424,7 @@ impl UiState {
             seen_summary_delta_ids: BTreeSet::new(),
             activity_reducer: ActivityReducer::default(),
             active_processes: BTreeSet::new(),
+            process_outputs: BTreeMap::new(),
             last_tick: None,
         }
     }
@@ -683,6 +686,21 @@ impl UiState {
             tool_status: Some(projection.status),
             tool_details: projection.details,
         });
+    }
+
+    fn sync_live_command_output(&mut self) {
+        let output = self
+            .active_processes
+            .iter()
+            .next_back()
+            .and_then(|id| self.process_outputs.get(id))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(projection) = self.activity_reducer.set_live_command_output(output) {
+            self.upsert_tool(projection);
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.viewport.changed();
+        }
     }
 
     fn settle_tools(&mut self, state: ToolActivityState) {
@@ -971,6 +989,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                 state.working_elapsed = Duration::ZERO;
                 state.animation_frame = 0;
                 state.active_processes.clear();
+                state.process_outputs.clear();
                 state.last_tick = None;
             }
             state.run_id = Some(run_id);
@@ -1041,13 +1060,21 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             run_id,
             session_id,
             running,
+            recent_output,
         } => {
             if state.run_id.as_deref() == Some(run_id.as_str()) {
                 if running {
                     state.active_processes.insert(session_id);
+                    if recent_output.is_empty() {
+                        state.process_outputs.remove(&session_id);
+                    } else {
+                        state.process_outputs.insert(session_id, recent_output);
+                    }
                 } else {
                     state.active_processes.remove(&session_id);
+                    state.process_outputs.remove(&session_id);
                 }
+                state.sync_live_command_output();
             }
         }
         UiMsg::ProcessInventory {
@@ -1056,6 +1083,10 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         } => {
             if state.run_id.as_deref() == Some(run_id.as_str()) {
                 state.active_processes = session_ids.into_iter().collect();
+                state
+                    .process_outputs
+                    .retain(|id, _| state.active_processes.contains(id));
+                state.sync_live_command_output();
             }
         }
         UiMsg::WaitingInput {
@@ -1182,6 +1213,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.pending = None;
             state.working_detail = None;
             state.active_processes.clear();
+            state.process_outputs.clear();
             state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Completed;
@@ -1197,6 +1229,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.pending = None;
             state.working_detail = None;
             state.active_processes.clear();
+            state.process_outputs.clear();
             state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Incomplete;
@@ -1213,6 +1246,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.pending = None;
             state.working_detail = None;
             state.active_processes.clear();
+            state.process_outputs.clear();
             state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Failed;
@@ -1228,6 +1262,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.pending = None;
             state.working_detail = None;
             state.active_processes.clear();
+            state.process_outputs.clear();
             state.last_tick = None;
             state.run_id = None;
             state.phase = UiPhase::Cancelled;
@@ -1256,6 +1291,7 @@ fn begin_run(state: &mut UiState, input: String) {
     state.working_elapsed = Duration::ZERO;
     state.animation_frame = 0;
     state.active_processes.clear();
+    state.process_outputs.clear();
     state.last_tick = None;
     state.run_id = None;
     state.phase = UiPhase::Running;
@@ -1837,6 +1873,7 @@ mod tests {
                 run_id: "stale-run".to_owned(),
                 session_id: 1,
                 running: true,
+                recent_output: Vec::new(),
             },
         );
         assert_eq!(state.active_process_count(), 0);
@@ -1846,6 +1883,7 @@ mod tests {
                 run_id: "run-a".to_owned(),
                 session_id: 7,
                 running: true,
+                recent_output: vec!["Compiling orchestral-runtime v0.1.0".to_owned()],
             },
         );
         assert_eq!(state.active_process_count(), 1);
@@ -1892,5 +1930,70 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].text, "Read 16 files");
         assert_eq!(tools[0].tool_status, Some(ActivityStatus::Succeeded));
+    }
+
+    #[test]
+    fn process_activity_surfaces_live_command_output_until_process_exits() {
+        let mut state = UiState::new("session", "model");
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run-live".to_owned(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ToolActivity {
+                activity_id: "exec-live".to_owned(),
+                tool_name: "exec_command".to_owned(),
+                state: ToolActivityState::Running,
+                evidence: vec![ToolActivityEvidence::Command {
+                    command: "cargo build".to_owned(),
+                }],
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ProcessActivity {
+                run_id: "run-live".to_owned(),
+                session_id: 1,
+                running: true,
+                recent_output: vec![
+                    "Compiling orchestral-core v0.4.1".to_owned(),
+                    "Compiling orchestral-runtime v0.4.1".to_owned(),
+                ],
+            },
+        );
+        let entry = state
+            .transcript
+            .iter()
+            .find(|entry| entry.role == TranscriptRole::Tool)
+            .expect("tool entry");
+        assert_eq!(entry.tool_details.len(), 3);
+        assert_eq!(
+            entry.tool_details[1].text,
+            "Compiling orchestral-core v0.4.1"
+        );
+        assert_eq!(
+            entry.tool_details[2].text,
+            "Compiling orchestral-runtime v0.4.1"
+        );
+
+        update(
+            &mut state,
+            UiMsg::ProcessActivity {
+                run_id: "run-live".to_owned(),
+                session_id: 1,
+                running: false,
+                recent_output: vec!["Finished dev profile".to_owned()],
+            },
+        );
+        let entry = state
+            .transcript
+            .iter()
+            .find(|entry| entry.role == TranscriptRole::Tool)
+            .expect("tool entry");
+        assert_eq!(entry.tool_details.len(), 1);
+        assert_eq!(entry.tool_details[0].text, "cargo build");
     }
 }

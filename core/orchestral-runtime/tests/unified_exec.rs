@@ -276,6 +276,10 @@ async fn process_supervisor_observes_and_reaps_pipe_exit_without_model_polling()
         exited.snapshot.status,
         ExecSessionStatus::Exited { exit_code: 0 }
     );
+    assert_eq!(
+        exited.snapshot.recent_output,
+        vec!["supervised-output".to_owned()]
+    );
     assert!(manager.list(&run_id).unwrap().is_empty());
     assert_eq!(
         manager.snapshot(&run_id, session_id).unwrap().status,
