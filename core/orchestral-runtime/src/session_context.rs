@@ -782,6 +782,39 @@ impl SessionCompactionPolicy {
     }
 }
 
+const COMPACTION_SOURCE_VOLUME_BYTES: usize = 64 * 1024;
+const KEEP_RECENT_MAX_VOLUME_BYTES: usize = 64 * 1024;
+
+fn record_payload_bytes(record: &AgentSessionRecord) -> usize {
+    match &record.payload {
+        AgentSessionEvent::RunInputCommitted { message }
+        | AgentSessionEvent::RunOutputCommitted { message, .. }
+        | AgentSessionEvent::CompactionCommitted {
+            summary: message, ..
+        }
+        | AgentSessionEvent::ActiveRunCompactionCommitted {
+            summary: message, ..
+        } => serde_json::to_vec(message).map_or(0, |bytes| bytes.len()),
+        AgentSessionEvent::ToolExchangeCommitted {
+            assistant, tool, ..
+        } => {
+            serde_json::to_vec(assistant).map_or(0, |bytes| bytes.len())
+                + serde_json::to_vec(tool).map_or(0, |bytes| bytes.len())
+        }
+        AgentSessionEvent::EffectUncertaintyCommitted { message, .. } => message.len(),
+        AgentSessionEvent::SkillLoaded { load } => load.package.instructions.len(),
+        _ => 0,
+    }
+}
+
+fn is_compaction_summary_record(record: &AgentSessionRecord) -> bool {
+    matches!(
+        record.payload,
+        AgentSessionEvent::CompactionCommitted { .. }
+            | AgentSessionEvent::ActiveRunCompactionCommitted { .. }
+    )
+}
+
 pub fn select_compaction_source(
     records: &[AgentSessionRecord],
     current_run_id: &RunId,
@@ -791,24 +824,6 @@ pub fn select_compaction_source(
     let minimum_records = policy
         .minimum_source_records
         .checked_add(policy.keep_recent_records)?;
-    if records.len() < minimum_records {
-        return None;
-    }
-    if let Some(previous_compaction) = records.iter().rev().find(|record| {
-        matches!(
-            record.payload,
-            AgentSessionEvent::CompactionCommitted { .. }
-                | AgentSessionEvent::ActiveRunCompactionCommitted { .. }
-        )
-    }) {
-        let records_since_compaction = records
-            .len()
-            .saturating_sub(previous_compaction.session_seq as usize);
-        if records_since_compaction < minimum_records {
-            return None;
-        }
-    }
-    let source_len = records.len().saturating_sub(policy.keep_recent_records);
     let shadowed = records
         .iter()
         .filter_map(|record| match &record.payload {
@@ -817,12 +832,96 @@ pub fn select_compaction_source(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let mut segment_start = None;
-    let mut segment_end = 0;
+    let is_shadowed = |seq: u64| shadowed.iter().any(|source| source.contains(seq));
+    let historical_unshadowed_bytes: usize = records
+        .iter()
+        .filter(|record| {
+            record.run_id != *current_run_id
+                && !is_shadowed(record.session_seq)
+                && !is_compaction_summary_record(record)
+        })
+        .map(record_payload_bytes)
+        .sum();
+    if records.len() < minimum_records
+        && historical_unshadowed_bytes < COMPACTION_SOURCE_VOLUME_BYTES
+    {
+        return None;
+    }
+
+    let trailing_current_run_compactions = records
+        .iter()
+        .rev()
+        .take_while(|record| {
+            record.run_id == *current_run_id && is_compaction_summary_record(record)
+        })
+        .count();
+    let effective_len = records
+        .len()
+        .saturating_sub(trailing_current_run_compactions);
+    let mut source_len = effective_len.saturating_sub(policy.keep_recent_records);
+    let mut retained_recent_bytes = 0usize;
+    for index in (source_len..effective_len).rev() {
+        let record = &records[index];
+        if record.run_id == *current_run_id
+            || is_shadowed(record.session_seq)
+            || is_compaction_summary_record(record)
+        {
+            continue;
+        }
+        retained_recent_bytes = retained_recent_bytes.saturating_add(record_payload_bytes(record));
+        if retained_recent_bytes > KEEP_RECENT_MAX_VOLUME_BYTES {
+            source_len = index + 1;
+            break;
+        }
+    }
+
+    let groups = if shadowed.is_empty() {
+        None
+    } else {
+        Some(replay_groups(records, current_run_id, &BTreeMap::new()).ok()?)
+    };
+    let can_replace = |first_session_seq: u64, last_session_seq: u64| {
+        groups.as_ref().is_none_or(|groups| {
+            placement::can_replace_source(
+                groups,
+                records,
+                &SessionSourceRange {
+                    first_session_seq,
+                    last_session_seq,
+                },
+            )
+        })
+    };
+
+    struct CandidateSegment {
+        range: SessionSourceRange,
+        non_summary_records: usize,
+        byte_volume: usize,
+        sealed_by_historical_barrier: bool,
+    }
+
+    let mut segments = Vec::<CandidateSegment>::new();
+    let mut current: Option<(u64, u64, usize, usize)> = None;
+    let close_segment = |segments: &mut Vec<CandidateSegment>,
+                         current: &mut Option<(u64, u64, usize, usize)>,
+                         sealed_by_historical_barrier: bool| {
+        if let Some((start, end, non_summary_records, byte_volume)) = current.take() {
+            if non_summary_records > 0 {
+                segments.push(CandidateSegment {
+                    range: SessionSourceRange {
+                        first_session_seq: start,
+                        last_session_seq: end,
+                    },
+                    non_summary_records,
+                    byte_volume,
+                    sealed_by_historical_barrier,
+                });
+            }
+        }
+    };
+
     for record in &records[..source_len] {
-        let is_shadowed = shadowed
-            .iter()
-            .any(|source| source.contains(record.session_seq));
+        let shadowed_record = is_shadowed(record.session_seq);
         let is_barrier = record.run_id == *current_run_id
             || match &record.payload {
                 AgentSessionEvent::SkillLoaded { .. }
@@ -832,29 +931,52 @@ pub fn select_compaction_source(
                 } => !retained_artifacts.is_empty(),
                 _ => false,
             };
-        if is_shadowed || is_barrier {
-            if let Some(start) = segment_start {
-                if segment_end - start + 1 >= policy.minimum_source_records as u64 {
-                    return Some(SessionSourceRange {
-                        first_session_seq: start,
-                        last_session_seq: segment_end,
-                    });
-                }
-            }
-            segment_start = None;
+        if shadowed_record || is_barrier {
+            let historical_seal = !shadowed_record && record.run_id != *current_run_id;
+            close_segment(&mut segments, &mut current, historical_seal);
             continue;
         }
-        segment_start.get_or_insert(record.session_seq);
-        segment_end = record.session_seq;
-    }
-    segment_start.and_then(|start| {
-        if segment_end - start + 1 >= policy.minimum_source_records as u64 {
-            return Some(SessionSourceRange {
-                first_session_seq: start,
-                last_session_seq: segment_end,
-            });
+        if let Some((start, _, _, _)) = current {
+            if !can_replace(start, record.session_seq) {
+                close_segment(&mut segments, &mut current, true);
+            }
         }
-        None
+        if current.is_none() && !can_replace(record.session_seq, record.session_seq) {
+            continue;
+        }
+        let non_summary = usize::from(!is_compaction_summary_record(record));
+        let bytes = if non_summary > 0 {
+            record_payload_bytes(record)
+        } else {
+            0
+        };
+        match &mut current {
+            Some((_, end, count, volume)) => {
+                *end = record.session_seq;
+                *count += non_summary;
+                *volume = volume.saturating_add(bytes);
+            }
+            None => {
+                current = Some((record.session_seq, record.session_seq, non_summary, bytes));
+            }
+        }
+    }
+    close_segment(&mut segments, &mut current, false);
+
+    let total_non_summary_records: usize = segments.iter().map(|s| s.non_summary_records).sum();
+    let has_later_compaction = |end: u64| {
+        records
+            .iter()
+            .any(|record| record.session_seq > end && is_compaction_summary_record(record))
+    };
+
+    segments.into_iter().find_map(|segment| {
+        let count_ready = segment.non_summary_records >= policy.minimum_source_records;
+        let volume_ready = segment.byte_volume >= COMPACTION_SOURCE_VOLUME_BYTES;
+        let sealed_island_ready = segment.sealed_by_historical_barrier
+            && (total_non_summary_records >= policy.minimum_source_records
+                || has_later_compaction(segment.range.last_session_seq));
+        (count_ready || volume_ready || sealed_island_ready).then_some(segment.range)
     })
 }
 

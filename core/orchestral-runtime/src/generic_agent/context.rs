@@ -40,6 +40,9 @@ pub(super) fn context_output_cap(
     preferred.min(backend_context_limit(inner).saturating_sub(planned_input))
 }
 
+const WORKING_SET_HIGH_WATERMARK_TOKENS: u64 = 128 * 1024;
+const WORKING_SET_LOW_WATERMARK_TOKENS: u64 = 80 * 1024;
+
 pub(super) async fn project_model_context(
     inner: &GenericInner,
     request: &AgentStartRequest,
@@ -67,9 +70,15 @@ pub(super) async fn project_model_context(
     // Replaying it must never append a new compaction fact to the Session.
     if through_session_seq.is_none() {
         if let Some(compactor) = &inner.session_compactor {
-            compactor
-                .compact_if_needed(&request.run.spec.session_id, &request.run.spec.run_id)
-                .await?;
+            for _ in 0..8 {
+                if compactor
+                    .compact_if_needed(&request.run.spec.session_id, &request.run.spec.run_id)
+                    .await?
+                    .is_none()
+                {
+                    break;
+                }
+            }
         }
     }
     let backend_context_limit = backend_context_limit(inner);
@@ -125,6 +134,7 @@ pub(super) async fn project_model_context(
     );
 
     let mut previous_overflow = None;
+    let mut previous_watermark = None;
     let mut tried_smaller_reserve = false;
     loop {
         let policy = if request.run.spec.limits.max_input_tokens.is_some()
@@ -142,6 +152,80 @@ pub(super) async fn project_model_context(
             .await
         {
             Ok(mut projection) => {
+                let planned_tokens = projection
+                    .context_estimate
+                    .as_ref()
+                    .map_or(projection.used_input_tokens, |estimate| estimate.tokens);
+                if through_session_seq.is_none()
+                    && projection.input_budget_tokens > WORKING_SET_HIGH_WATERMARK_TOKENS
+                    && planned_tokens > WORKING_SET_HIGH_WATERMARK_TOKENS
+                    && previous_watermark.is_none_or(|previous| planned_tokens < previous)
+                {
+                    if let Some(compactor) = &inner.session_compactor {
+                        previous_watermark = Some(planned_tokens);
+                        let mut compacted = compactor
+                            .compact_active_run_for_context(
+                                &context_engine,
+                                make_request(
+                                    reserved_output_tokens,
+                                    Some(WORKING_SET_LOW_WATERMARK_TOKENS),
+                                ),
+                                policy,
+                            )
+                            .await?;
+                        if compacted.is_none()
+                            && policy == crate::session_context::ContextTokenPolicy::UpperBound
+                        {
+                            compacted = compactor
+                                .compact_active_run_for_context(
+                                    &context_engine,
+                                    make_request(
+                                        reserved_output_tokens,
+                                        Some(WORKING_SET_HIGH_WATERMARK_TOKENS),
+                                    ),
+                                    policy,
+                                )
+                                .await?;
+                        }
+                        if compacted.is_some() {
+                            publish_telemetry(
+                                inner,
+                                &request.run.spec.run_id,
+                                AgentTelemetryEnvelope {
+                                    telemetry_id: TelemetryId::new(format!(
+                                        "generic-{}-context-watermark-{planned_tokens}-{WORKING_SET_HIGH_WATERMARK_TOKENS}",
+                                        request.run.spec.run_id.as_str()
+                                    )),
+                                    run_id: request.run.spec.run_id.clone(),
+                                    provider_seq: None,
+                                    payload: AgentTelemetry::ProgressReported {
+                                        message: format!(
+                                            "Compacting context ({planned_tokens} tokens exceed the {WORKING_SET_HIGH_WATERMARK_TOKENS}-token working-set watermark)"
+                                        ),
+                                        fraction: None,
+                                    },
+                                },
+                            );
+                            publish_telemetry(
+                                inner,
+                                &request.run.spec.run_id,
+                                AgentTelemetryEnvelope {
+                                    telemetry_id: TelemetryId::new(format!(
+                                        "generic-{}-context-watermark-compacted-{planned_tokens}",
+                                        request.run.spec.run_id.as_str()
+                                    )),
+                                    run_id: request.run.spec.run_id.clone(),
+                                    provider_seq: None,
+                                    payload: AgentTelemetry::ProgressReported {
+                                        message: "Context compacted; continuing".to_owned(),
+                                        fraction: None,
+                                    },
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                }
                 if policy == crate::session_context::ContextTokenPolicy::Planning {
                     projection.planning = inner.context_engine.planning_trace(
                         &projection.messages,

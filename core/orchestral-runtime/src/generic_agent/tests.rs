@@ -681,6 +681,103 @@ mod context_planning_tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn large_window_active_run_compacts_at_working_set_watermark_before_hard_limit() {
+        let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+        let backend = Arc::new(PlanningModel {
+            starts: AtomicU64::new(0),
+            requests: Mutex::new(Vec::new()),
+            max_context_tokens: 1_048_576,
+        });
+        let mut config = GenericAgentConfig::new("test/provider", "test/agent");
+        config.system_prompt = "Inspect workspace files and complete the task.".to_owned();
+        config.max_context_tokens = 1_048_576;
+        config.reserved_output_tokens = 65_536;
+        let provider = InternalGenericAgentProvider::new_with_session_journal(
+            backend,
+            config,
+            journal.clone(),
+            Arc::new(JsonSizeTokenMeter::default()),
+        )
+        .unwrap()
+        .with_session_compaction(
+            Arc::new(crate::DeterministicExtractiveSessionSummarizer::new(4096).unwrap()),
+            SessionCompactionPolicy {
+                minimum_source_records: 32,
+                keep_recent_records: 16,
+            },
+        )
+        .unwrap();
+        let request = request(&provider, RunLimits::default());
+        initial_projection(&provider, &request).await.unwrap();
+
+        // Append 10 bulky tool exchanges (~20 KB each -> ~200k tokens on the
+        // 1-byte-per-token fixture meter), exceeding the 128k working-set high
+        // watermark while remaining far below the 983,040 hard input budget.
+        for index in 1..=10 {
+            let call_id = ModelToolCallId::new(format!("observation-call-{index}"));
+            journal
+                .append(AgentSessionEventDraft {
+                    event_id: AgentSessionEventId::new(format!("observation-{index}")),
+                    session_id: request.run.spec.session_id.clone(),
+                    run_id: request.run.spec.run_id.clone(),
+                    payload: AgentSessionEvent::ToolExchangeCommitted {
+                        request_id: ModelRequestId::new(format!("observation-request-{index}")),
+                        assistant: ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::ToolCall {
+                                call_id: call_id.clone(),
+                                name: "file_read".to_owned(),
+                                arguments: serde_json::json!({
+                                    "path": format!("src/module_{index}.rs")
+                                }),
+                                extensions: Default::default(),
+                            }],
+                        },
+                        tool: ModelMessage {
+                            role: ModelRole::Tool,
+                            content: vec![ModelContent::ToolResult {
+                                call_id,
+                                result: serde_json::json!({
+                                    "path": format!("src/module_{index}.rs"),
+                                    "content": "pub fn item() -> usize { 1 }\n".repeat(700),
+                                    "truncated": false,
+                                }),
+                                is_error: false,
+                            }],
+                        },
+                        retained_artifacts: Vec::new(),
+                        usage: None,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let projection = project_model_context(
+            &provider.inner,
+            &request,
+            &[],
+            None,
+            None,
+            None,
+            ModelContextBudget::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(projection.input_budget_tokens, 1_048_576 - 65_536);
+        assert!(projection.used_input_tokens <= 80 * 1024);
+        let after = journal
+            .load_session(&request.run.spec.session_id)
+            .await
+            .unwrap();
+        assert!(after.iter().any(|record| matches!(
+            record.payload,
+            AgentSessionEvent::ActiveRunCompactionCommitted { .. }
+        )));
+        let rendered = serde_json::to_string(&projection.messages).unwrap();
+        assert!(rendered.contains("src/module_10.rs"));
+    }
 }
 
 mod run_limit_tests {

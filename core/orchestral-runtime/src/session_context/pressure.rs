@@ -56,10 +56,23 @@ impl AgentSessionCompactor {
         // establish progress under Planning; the subset is not a lower bound.
 
         let mut sources = Vec::new();
-        if let Some(preferred) =
-            select_active_run_compaction_source(&records, &request.current_run_id, &self.policy)
-        {
-            sources.push(preferred);
+        let mut retain = self.policy.keep_recent_records;
+        loop {
+            let step_policy = SessionCompactionPolicy {
+                minimum_source_records: self.policy.minimum_source_records,
+                keep_recent_records: retain.max(1),
+            };
+            if let Some(candidate) =
+                select_active_run_compaction_source(&records, &request.current_run_id, &step_policy)
+            {
+                if !sources.contains(&candidate) {
+                    sources.push(candidate);
+                }
+            }
+            if retain <= 1 {
+                break;
+            }
+            retain /= 2;
         }
         // Keeping recent exchanges is a quality preference. If the preferred
         // source cannot fit, consider each entire live segment, including its
