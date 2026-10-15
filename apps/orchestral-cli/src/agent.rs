@@ -829,6 +829,8 @@ fn model_output_budget(
     (output, source)
 }
 
+const DEFAULT_MAX_INLINE_TOOL_OUTPUT_BYTES: u64 = 32 * 1024;
+
 fn model_inline_output_limit(
     config: &OrchestralConfig,
     backend_context_tokens: Option<u64>,
@@ -839,11 +841,13 @@ fn model_inline_output_limit(
     }
     let context = model_context_budget(config, backend_context_tokens);
     // A per-result allowance, not a tokenizer estimate or a guarantee for an
-    // entire conversation. Leave room for the request, history and other tools.
+    // entire conversation. Leave room for the request, history and other tools,
+    // and cap default inline payloads so large-window models store bulky
+    // outputs as recallable artifacts instead of bloating every subsequent turn.
     let bytes = context
         .saturating_sub(reserved_output_tokens)
         .div_ceil(4)
-        .max(1);
+        .clamp(1, DEFAULT_MAX_INLINE_TOOL_OUTPUT_BYTES);
     std::num::NonZeroU64::new(bytes).expect("inline output allowance is positive")
 }
 

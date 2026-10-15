@@ -26,6 +26,11 @@ fn inline_budget_uses_the_declared_model_window_and_output_reserve() {
         model_inline_output_limit(&config, Some(32_768), 4096).get(),
         2_048
     );
+    config.agent.max_context_tokens = None;
+    assert_eq!(
+        model_inline_output_limit(&config, Some(1_048_576), 65_536).get(),
+        DEFAULT_MAX_INLINE_TOOL_OUTPUT_BYTES
+    );
     assert_eq!(config.tools.max_output_bytes, 1024 * 1024);
     config.tools.max_inline_output_bytes = std::num::NonZeroU64::new(768);
     assert_eq!(

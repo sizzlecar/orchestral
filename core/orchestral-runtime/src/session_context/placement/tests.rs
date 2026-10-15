@@ -534,3 +534,131 @@ async fn historical_summary_keeps_cross_run_user_anchor_and_disjoint_provenance(
     assert_eq!(replay.included_ranges, projection.included_ranges);
     assert_eq!(replay.deferred_ranges, projection.deferred_ranges);
 }
+
+#[tokio::test]
+async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_barrier() {
+    let fixture = Fixture::new();
+    let policy = SessionCompactionPolicy {
+        minimum_source_records: 32,
+        keep_recent_records: 16,
+    };
+    let compactor = AgentSessionCompactor::new(
+        fixture.store.clone(),
+        Arc::new(DeterministicExtractiveSessionSummarizer::new(2048).unwrap()),
+        policy.clone(),
+    )
+    .unwrap();
+
+    // 1..=10: an earlier segment that is shorter than minimum_source_records (32)
+    // and contains a large inline payload before an artifact barrier at seq 11.
+    for index in 1..=9 {
+        append_input(
+            &fixture.store,
+            index,
+            "run-1",
+            format!("early-step-{index}"),
+        )
+        .await;
+    }
+    append_input(&fixture.store, 10, "run-1", "x".repeat(80 * 1024)).await;
+
+    let call = ModelToolCallId::new("barrier-artifact-call");
+    let artifact = ArtifactRefWithDigest {
+        artifact_ref: ArtifactRef::new("barrier-artifact-ref"),
+        digest: Digest::sha256("barrier-artifact-bytes"),
+    };
+    fixture
+        .store
+        .append(AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new("barrier-artifact-event"),
+            session_id: AgentSessionId::new("session-1"),
+            run_id: RunId::new("run-1"),
+            payload: AgentSessionEvent::ToolExchangeCommitted {
+                request_id: ModelRequestId::new("barrier-artifact-req"),
+                assistant: ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: vec![ModelContent::ToolCall {
+                        call_id: call.clone(),
+                        name: "exec_command".into(),
+                        arguments: json!({"cmd": "inspect"}),
+                        extensions: Default::default(),
+                    }],
+                },
+                tool: ModelMessage {
+                    role: ModelRole::Tool,
+                    content: vec![ModelContent::ToolResult {
+                        call_id: call,
+                        result: json!({"kind": "artifact", "artifact": artifact.clone()}),
+                        is_error: false,
+                    }],
+                },
+                retained_artifacts: vec![artifact],
+                usage: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    // 12..=16: fewer than keep_recent_records (16), but 12..=14 are bulky
+    // tool exchanges (> 64 KB total) that must not hide inside keep_recent.
+    for index in 12..=14 {
+        append_tool_exchange(&fixture.store, index, "run-2", 32 * 1024).await;
+    }
+    append_input(&fixture.store, 15, "run-2", "recent-small-followup".into()).await;
+    append_input(&fixture.store, 16, "current", "continue-work".into()).await;
+
+    let first = compactor
+        .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
+        .await
+        .unwrap()
+        .expect("sealed island before artifact barrier must compact");
+    let AgentSessionEvent::CompactionCommitted {
+        source: first_source,
+        ..
+    } = &first.payload
+    else {
+        panic!("expected historical compaction");
+    };
+    assert_eq!(
+        *first_source,
+        SessionSourceRange {
+            first_session_seq: 1,
+            last_session_seq: 10,
+        }
+    );
+
+    let second = compactor
+        .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
+        .await
+        .unwrap()
+        .expect("oversized post-barrier segment must compact without crossing displaced summary");
+    let AgentSessionEvent::CompactionCommitted {
+        source: second_source,
+        ..
+    } = &second.payload
+    else {
+        panic!("expected second historical compaction");
+    };
+    assert_eq!(second_source.first_session_seq, 12);
+    assert!(second_source.last_session_seq >= 13);
+
+    assert!(compactor
+        .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
+        .await
+        .unwrap()
+        .is_none());
+
+    let projected = fixture
+        .engine()
+        .project(fixture.request(500_000))
+        .await
+        .unwrap();
+    assert!(projected.used_input_tokens < 40_000);
+    let restarted = fixture.restart().await;
+    let replayed = restarted
+        .engine()
+        .project(restarted.request(500_000))
+        .await
+        .unwrap();
+    assert_eq!(replayed.messages, projected.messages);
+}
