@@ -115,6 +115,7 @@ pub(crate) struct ActivityReducer {
     generation: u64,
     next_order: u64,
     calls: BTreeMap<String, ActivityCall>,
+    live_command_output: Vec<String>,
 }
 
 impl ActivityReducer {
@@ -122,6 +123,32 @@ impl ActivityReducer {
         self.generation = self.generation.saturating_add(1);
         self.next_order = 0;
         self.calls.clear();
+        self.live_command_output.clear();
+    }
+
+    pub(crate) fn set_live_command_output(
+        &mut self,
+        output: Vec<String>,
+    ) -> Option<ActivityProjection> {
+        let mut bounded = output
+            .into_iter()
+            .filter_map(|line| {
+                let compact = compact_output_line(&line);
+                (!compact.is_empty()).then_some(compact)
+            })
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>();
+        bounded.reverse();
+        if self.live_command_output == bounded {
+            return None;
+        }
+        self.live_command_output = bounded;
+        let has_command = self
+            .calls
+            .values()
+            .any(|call| call.family == ActivityFamily::Command);
+        has_command.then(|| self.project(&ActivityFamily::Command))
     }
 
     pub(crate) fn observe(
@@ -160,6 +187,8 @@ impl ActivityReducer {
     }
 
     pub(crate) fn settle(&mut self, terminal: ToolActivityState) -> Vec<ActivityProjection> {
+        let had_live_output = !self.live_command_output.is_empty();
+        self.live_command_output.clear();
         let mut families = Vec::new();
         for call in self.calls.values_mut() {
             if call.state == ToolActivityState::Running {
@@ -168,6 +197,15 @@ impl ActivityReducer {
                     families.push(call.family.clone());
                 }
             }
+        }
+        if had_live_output
+            && !families.contains(&ActivityFamily::Command)
+            && self
+                .calls
+                .values()
+                .any(|call| call.family == ActivityFamily::Command)
+        {
+            families.push(ActivityFamily::Command);
         }
         families
             .into_iter()
@@ -201,11 +239,24 @@ impl ActivityReducer {
         if cancelled > 0 {
             summary.push_str(&format!(" · {cancelled} cancelled"));
         }
+        let mut details = projected_details(&calls);
+        if family == &ActivityFamily::Command && !self.live_command_output.is_empty() {
+            details.extend(
+                self.live_command_output
+                    .iter()
+                    .cloned()
+                    .map(|text| ActivityDetail {
+                        text,
+                        depth: 1,
+                        style: ActivityDetailStyle::Muted,
+                    }),
+            );
+        }
         ActivityProjection {
             id: format!("{}:{}", self.generation, family.id()),
             summary,
             status,
-            details: projected_details(&calls),
+            details,
         }
     }
 }
@@ -353,6 +404,17 @@ fn project_evidence(
 fn compact_error_message(message: &str) -> String {
     const MAX_CHARS: usize = 800;
     let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn compact_output_line(line: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let compact = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = compact.chars();
     let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
     if chars.next().is_some() {
@@ -600,5 +662,56 @@ mod tests {
         let bounded = compact_error_message(&"远程错误".repeat(500));
         assert!(bounded.chars().count() <= 801);
         assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn live_command_output_is_appended_and_cleared_on_settle() {
+        let mut reducer = ActivityReducer::default();
+        reducer.begin_run();
+        reducer.observe(
+            "exec-1".to_owned(),
+            "exec_command".to_owned(),
+            ToolActivityState::Running,
+            vec![ToolActivityEvidence::Command {
+                command: "cargo test --workspace".to_owned(),
+            }],
+        );
+        let projection = reducer
+            .set_live_command_output(vec![
+                "line 1".to_owned(),
+                "  Compiling orchestral-runtime v0.4.1  ".to_owned(),
+                "  Running unittests src/lib.rs  ".to_owned(),
+            ])
+            .expect("command projection updated");
+        assert_eq!(
+            projection.details,
+            vec![
+                ActivityDetail {
+                    text: "cargo test --workspace".to_owned(),
+                    depth: 0,
+                    style: ActivityDetailStyle::Primary,
+                },
+                ActivityDetail {
+                    text: "Compiling orchestral-runtime v0.4.1".to_owned(),
+                    depth: 1,
+                    style: ActivityDetailStyle::Muted,
+                },
+                ActivityDetail {
+                    text: "Running unittests src/lib.rs".to_owned(),
+                    depth: 1,
+                    style: ActivityDetailStyle::Muted,
+                },
+            ]
+        );
+        let settled = reducer.settle(ToolActivityState::Succeeded);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            settled[0].details,
+            vec![ActivityDetail {
+                text: "cargo test --workspace".to_owned(),
+                depth: 0,
+                style: ActivityDetailStyle::Primary,
+            }]
+        );
     }
 }

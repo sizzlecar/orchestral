@@ -890,7 +890,7 @@ pub fn guarded_schedule_create_descriptor(restriction: ToolRestriction) -> ToolD
         tool_id: ToolId::new("orchestral/schedule_create/v1"),
         model_schema: ModelToolSchema {
             name: "schedule_create".to_owned(),
-            description: "Schedule a recurring loop or one-shot delayed prompt in the current Session. When the timer expires and the Session is idle, the prompt is automatically submitted as a new turn. Use this when the user asks to poll, monitor, repeat on an interval (like /loop), or set a reminder/timer.".to_owned(),
+            description: "Schedule a recurring loop or one-shot delayed prompt in the current Session. When the timer expires and the Session is idle, the prompt is automatically submitted as a new turn. Use this when the user asks to poll, monitor, repeat on an interval (like /loop), or set a reminder/timer, or to check on a long-running background job across turns without blocking the current turn.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "required": ["prompt", "interval"],

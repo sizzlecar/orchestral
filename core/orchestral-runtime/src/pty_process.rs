@@ -88,15 +88,19 @@ pub struct PtyReadOptions {
 
 struct PtyOutputBuffer {
     bytes: VecDeque<u8>,
+    tail: VecDeque<u8>,
     dropped_bytes: u64,
     generation: u64,
     closed: bool,
 }
 
+const PTY_TAIL_PREVIEW_MAX_BYTES: usize = 2048;
+
 impl PtyOutputBuffer {
     fn new() -> Self {
         Self {
             bytes: VecDeque::new(),
+            tail: VecDeque::new(),
             dropped_bytes: 0,
             generation: 0,
             closed: false,
@@ -110,6 +114,10 @@ impl PtyOutputBuffer {
                 self.dropped_bytes = self.dropped_bytes.saturating_add(1);
             }
             self.bytes.push_back(*byte);
+            if self.tail.len() == PTY_TAIL_PREVIEW_MAX_BYTES {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(*byte);
         }
         self.generation = self.generation.saturating_add(1);
     }
@@ -118,6 +126,25 @@ impl PtyOutputBuffer {
         let bytes = self.bytes.drain(..).collect();
         let dropped = std::mem::take(&mut self.dropped_bytes);
         (bytes, dropped)
+    }
+
+    fn tail_preview(&self) -> (u64, Vec<String>) {
+        if self.tail.is_empty() {
+            return (self.generation, Vec::new());
+        }
+        let raw = self.tail.iter().copied().collect::<Vec<_>>();
+        let stripped = strip_ansi_escapes::strip(&raw);
+        let text = String::from_utf8_lossy(&stripped);
+        let mut lines = text
+            .split(['\n', '\r'])
+            .map(|line| line.trim_end())
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(2)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        lines.reverse();
+        (self.generation, lines)
     }
 }
 
@@ -377,6 +404,21 @@ impl PtyProcessManager {
             .map_err(|_| PtyProcessError::Unavailable)?
             .status();
         status
+    }
+
+    pub(crate) fn output_tail(
+        &self,
+        run_id: &RunId,
+        process_id: &PtyProcessId,
+    ) -> Result<(u64, Vec<String>), PtyProcessError> {
+        let process = self.process(run_id, process_id)?;
+        let output = process
+            .lock()
+            .map_err(|_| PtyProcessError::Unavailable)?
+            .output
+            .clone();
+        let buffer = output.0.lock().map_err(|_| PtyProcessError::Unavailable)?;
+        Ok(buffer.tail_preview())
     }
 
     pub fn read(

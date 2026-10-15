@@ -992,7 +992,9 @@ fn build_exec_command_descriptor(
                 "Running commands return session_id for write_stdin. Output shares a stdout/stderr ",
                 "budget and retains each stream's beginning/end where space permits. ",
                 "Preserve validation commands' own exit status; do not pipe through tail or filters ",
-                "just to shorten output."
+                "just to shorten output. ",
+                "For multi-minute background jobs, you may start the process with a background log/pidfile ",
+                "and use schedule_create to poll status in subsequent turns instead of tight write_stdin loops."
             )),
             input_schema,
         },
@@ -1029,8 +1031,9 @@ fn build_write_stdin_descriptor(mut restriction: ToolRestriction) -> ToolDescrip
                 "If the process exits before input can be delivered, the call returns its final ",
                 "output and exit status instead of failing. Wait defaults: empty non-TTY polls use ",
                 "completion (30s); TTY/input uses output. yield_time_ms changes the observation window, ",
-                "not process lifetime. Output shares a stdout/stderr budget and retains each stream's ",
-                "beginning/end where space permits."
+                "not process lifetime. When polling a long-running command, use a generous yield_time_ms ",
+                "(e.g. 30000-60000) rather than rapid short polls. Output shares a stdout/stderr budget ",
+                "and retains each stream's beginning/end where space permits."
             )
             .to_owned(),
             input_schema: json!({

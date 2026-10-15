@@ -2159,6 +2159,7 @@ mod tests {
                 run_id: "run-running".to_owned(),
                 session_id: 7,
                 running: true,
+                recent_output: Vec::new(),
             },
         );
 

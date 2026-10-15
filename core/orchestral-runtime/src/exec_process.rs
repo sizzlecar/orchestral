@@ -139,10 +139,13 @@ use lifecycle::SessionLifecycle;
 #[derive(Default)]
 struct OutputState {
     bytes: VecDeque<u8>,
+    tail: VecDeque<u8>,
     dropped_bytes: u64,
     generation: u64,
     closed: bool,
 }
+
+const TAIL_PREVIEW_MAX_BYTES: usize = 2048;
 
 struct SharedOutput {
     state: Mutex<OutputState>,
@@ -167,6 +170,10 @@ impl SharedOutput {
                     state.dropped_bytes = state.dropped_bytes.saturating_add(1);
                 }
                 state.bytes.push_back(*byte);
+                if state.tail.len() == TAIL_PREVIEW_MAX_BYTES {
+                    state.tail.pop_front();
+                }
+                state.tail.push_back(*byte);
             }
             state.generation = state.generation.saturating_add(1);
         }
@@ -187,6 +194,29 @@ impl SharedOutput {
             .lock()
             .map_err(|_| ExecProcessError::Unavailable)?;
         Ok((state.generation, state.closed, !state.bytes.is_empty()))
+    }
+
+    fn tail_lines(&self) -> Result<Vec<String>, ExecProcessError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ExecProcessError::Unavailable)?;
+        if state.tail.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raw = state.tail.iter().copied().collect::<Vec<_>>();
+        let stripped = strip_ansi_escapes::strip(&raw);
+        let text = String::from_utf8_lossy(&stripped);
+        let mut lines = text
+            .split(['\n', '\r'])
+            .map(|line| line.trim_end())
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(2)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        lines.reverse();
+        Ok(lines)
     }
 
     fn drain(&self) -> Result<(String, u64), ExecProcessError> {
@@ -578,7 +608,7 @@ impl ProcessSupervisor {
             .lock()
             .map_err(|_| ExecProcessError::Unavailable)?
             .insert(key.clone(), session.clone());
-        publish_session_event(&self.events, &key, &session);
+        publish_session_event(&self.events, &key, &session, &self.pty);
         spawn_exit_watcher(key, session, self.pty.clone(), self.events.clone());
         Ok(session_id)
     }
@@ -709,6 +739,7 @@ impl ProcessSupervisor {
                     &self.events,
                     &(run_id.clone(), session_id),
                     &session,
+                    &self.pty,
                     ExecSessionStatus::Exited { exit_code },
                 )?;
             }
@@ -732,6 +763,7 @@ impl ProcessSupervisor {
             &self.events,
             &(run_id.clone(), session_id),
             &session,
+            &self.pty,
             ExecSessionStatus::Terminated,
         )?;
         self.terminate_session(run_id, session).await;
@@ -755,7 +787,13 @@ impl ProcessSupervisor {
         };
         let count = owned.len();
         for (key, session) in owned {
-            transition_session(&self.events, &key, &session, ExecSessionStatus::Terminated)?;
+            transition_session(
+                &self.events,
+                &key,
+                &session,
+                &self.pty,
+                ExecSessionStatus::Terminated,
+            )?;
             self.terminate_session(run_id, session).await;
         }
         self.runtime_temps
@@ -785,7 +823,7 @@ impl ProcessSupervisor {
         session_id: ExecSessionId,
     ) -> Result<ExecSessionSnapshot, ExecProcessError> {
         let session = self.session(run_id, session_id)?;
-        session_snapshot(&(run_id.clone(), session_id), &session)
+        session_snapshot(&(run_id.clone(), session_id), &session, &self.pty)
     }
 
     pub fn operation_plan(
@@ -843,10 +881,34 @@ impl ProcessSupervisor {
     }
 }
 
+fn session_recent_output(
+    run_id: &RunId,
+    session: &ManagedSession,
+    pty: &PtyProcessManager,
+) -> (u64, Vec<String>) {
+    match &session.process {
+        ManagedProcess::Pipe(process) => {
+            let stdout_gen = process.stdout.snapshot().map_or(0, |s| s.0);
+            let stderr_gen = process.stderr.snapshot().map_or(0, |s| s.0);
+            let mut combined = process.stdout.tail_lines().unwrap_or_default();
+            combined.extend(process.stderr.tail_lines().unwrap_or_default());
+            if combined.len() > 2 {
+                combined.drain(..combined.len() - 2);
+            }
+            (stdout_gen.wrapping_add(stderr_gen), combined)
+        }
+        ManagedProcess::Pty { process_id } => {
+            pty.output_tail(run_id, process_id).unwrap_or_default()
+        }
+    }
+}
+
 fn session_snapshot(
     (run_id, session_id): &SessionKey,
     session: &ManagedSession,
+    pty: &PtyProcessManager,
 ) -> Result<ExecSessionSnapshot, ExecProcessError> {
+    let (_, recent_output) = session_recent_output(run_id, session, pty);
     Ok(ExecSessionSnapshot {
         run_id: run_id.clone(),
         session_id: *session_id,
@@ -854,6 +916,7 @@ fn session_snapshot(
         status: session.lifecycle.status()?,
         operation: session.operation.clone(),
         wall_time_seconds: session.started.elapsed().as_secs_f64(),
+        recent_output,
     })
 }
 
@@ -861,8 +924,9 @@ fn publish_session_event(
     events: &broadcast::Sender<ExecSessionEvent>,
     key: &SessionKey,
     session: &ManagedSession,
+    pty: &PtyProcessManager,
 ) {
-    if let Ok(snapshot) = session_snapshot(key, session) {
+    if let Ok(snapshot) = session_snapshot(key, session, pty) {
         let _ = events.send(ExecSessionEvent { snapshot });
     }
 }
@@ -871,11 +935,12 @@ fn transition_session(
     events: &broadcast::Sender<ExecSessionEvent>,
     key: &SessionKey,
     session: &ManagedSession,
+    pty: &PtyProcessManager,
     status: ExecSessionStatus,
 ) -> Result<bool, ExecProcessError> {
     let changed = session.lifecycle.transition(status)?;
     if changed {
-        publish_session_event(events, key, session);
+        publish_session_event(events, key, session, pty);
     }
     Ok(changed)
 }
@@ -887,6 +952,7 @@ fn spawn_exit_watcher(
     events: broadcast::Sender<ExecSessionEvent>,
 ) {
     tokio::spawn(async move {
+        let mut last_output_gen = 0_u64;
         loop {
             if session
                 .lifecycle
@@ -894,6 +960,11 @@ fn spawn_exit_watcher(
                 .is_ok_and(|status| status.is_terminal())
             {
                 return;
+            }
+            let (output_gen, _) = session_recent_output(&key.0, &session, &pty);
+            if output_gen != last_output_gen {
+                last_output_gen = output_gen;
+                publish_session_event(&events, &key, &session, &pty);
             }
             let observed = match &session.process {
                 ManagedProcess::Pipe(process) => process
@@ -921,6 +992,7 @@ fn spawn_exit_watcher(
                         &events,
                         &key,
                         &session,
+                        &pty,
                         ExecSessionStatus::Exited { exit_code },
                     );
                     if let ManagedProcess::Pipe(process) = &session.process {
@@ -934,6 +1006,7 @@ fn spawn_exit_watcher(
                         &events,
                         &key,
                         &session,
+                        &pty,
                         ExecSessionStatus::Failed { message },
                     );
                     match &session.process {
