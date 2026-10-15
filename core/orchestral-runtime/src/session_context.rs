@@ -1116,6 +1116,7 @@ struct ExtractiveCandidate {
     rendered: String,
     terms: BTreeSet<String>,
     score: u64,
+    dialogue: bool,
     failed: bool,
     latest_tool_exchange: bool,
     tool_observation: Option<(String, String)>,
@@ -1158,8 +1159,12 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
         let focus = input
             .focus_messages
             .iter()
-            .map(render_compaction_message)
-            .collect::<Result<Vec<_>, _>>()?
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                ModelContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
             .join("\n");
         let focus_terms = extract_summary_terms(&focus);
         let latest_tool_exchange = input.groups.iter().rposition(|group| {
@@ -1189,6 +1194,15 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
                     continuation_observation: summary_continuation::artifact_page_observation(
                         group,
                     ),
+                    dialogue: group.messages.iter().all(|message| {
+                        matches!(message.role, ModelRole::User | ModelRole::Assistant)
+                            && message.content.iter().all(|content| {
+                                !matches!(
+                                    content,
+                                    ModelContent::ToolCall { .. } | ModelContent::ToolResult { .. }
+                                )
+                            })
+                    }),
                     failed: group
                         .messages
                         .iter()
@@ -1275,12 +1289,22 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
             });
         }
         candidates.sort_by(|left, right| {
-            right
-                .latest_tool_exchange
-                .cmp(&left.latest_tool_exchange)
-                .then_with(|| right.failed.cmp(&left.failed))
-                .then_with(|| right.score.cmp(&left.score))
-                .then_with(|| right.index.cmp(&left.index))
+            if has_relevant {
+                right
+                    .latest_tool_exchange
+                    .cmp(&left.latest_tool_exchange)
+                    .then_with(|| right.failed.cmp(&left.failed))
+                    .then_with(|| right.score.cmp(&left.score))
+                    .then_with(|| right.dialogue.cmp(&left.dialogue))
+                    .then_with(|| right.index.cmp(&left.index))
+            } else {
+                right
+                    .dialogue
+                    .cmp(&left.dialogue)
+                    .then_with(|| right.latest_tool_exchange.cmp(&left.latest_tool_exchange))
+                    .then_with(|| right.failed.cmp(&left.failed))
+                    .then_with(|| right.index.cmp(&left.index))
+            }
         });
 
         let mut selected = Vec::<(usize, String)>::new();
@@ -3116,6 +3140,75 @@ mod tests {
         assert!(text.contains("VALIDATION COMPLETE"));
         assert!(text.contains("session_seq=30..30"));
         assert!(text.chars().count() <= 4096);
+    }
+
+    #[tokio::test]
+    async fn followup_without_shared_focus_words_retains_dialogue_ahead_of_incidental_reads() {
+        let summarizer = DeterministicExtractiveSessionSummarizer::new(2048).unwrap();
+        let mut groups = vec![
+            SessionCompactionGroup {
+                source: single_range(1),
+                messages: vec![ModelMessage::text(
+                    ModelRole::User,
+                    "Fix the payment retry idempotency bug without changing public types.",
+                )],
+            },
+            SessionCompactionGroup {
+                source: single_range(2),
+                messages: vec![ModelMessage::text(
+                    ModelRole::Assistant,
+                    "I located the duplicate charge path in checkout/retry.rs and will patch it next.",
+                )],
+            },
+        ];
+        for seq in 3..=25 {
+            let call_id = ModelToolCallId::new(format!("read-{seq}"));
+            groups.push(SessionCompactionGroup {
+                source: single_range(seq),
+                messages: vec![
+                    ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![ModelContent::ToolCall {
+                            call_id: call_id.clone(),
+                            name: "file_read".into(),
+                            arguments: json!({"path": format!("src/module_{seq}.rs")}),
+                            extensions: Default::default(),
+                        }],
+                    },
+                    ModelMessage {
+                        role: ModelRole::Tool,
+                        content: vec![ModelContent::ToolResult {
+                            call_id,
+                            result: json!({"content": "fn helper() {}\n".repeat(40)}),
+                            is_error: false,
+                        }],
+                    },
+                ],
+            });
+        }
+        let summary = summarizer
+            .summarize(SessionCompactionInput {
+                session_id: AgentSessionId::new("continue-followup"),
+                source: SessionSourceRange {
+                    first_session_seq: 1,
+                    last_session_seq: 25,
+                },
+                groups,
+                focus_messages: vec![ModelMessage::text(ModelRole::User, "继续")],
+            })
+            .await
+            .unwrap();
+        let ModelContent::Text { text } = &summary.content[0] else {
+            panic!("text summary");
+        };
+        assert!(
+            text.contains("Fix the payment retry idempotency bug"),
+            "{text}"
+        );
+        assert!(
+            text.contains("duplicate charge path in checkout/retry.rs"),
+            "{text}"
+        );
     }
 
     #[test]

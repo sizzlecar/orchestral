@@ -742,13 +742,19 @@ fn push_entry_lines(
             } else {
                 3
             };
-            let visible = entry.tool_details.len().min(limit);
-            push_activity_details(lines, &entry.tool_details[..visible]);
-            if visible < entry.tool_details.len() {
+            if entry.tool_details.len() <= limit {
+                push_activity_details(lines, &entry.tool_details);
+            } else {
+                let tail_visible = limit.saturating_sub(1);
+                push_activity_details(lines, &entry.tool_details[..1]);
+                push_activity_details(
+                    lines,
+                    &entry.tool_details[entry.tool_details.len() - tail_visible..],
+                );
                 lines.push(Line::styled(
                     format!(
                         "      … {} more detail lines · ctrl+o expand",
-                        entry.tool_details.len() - visible
+                        entry.tool_details.len() - limit
                     ),
                     MUTED,
                 ));
@@ -2417,6 +2423,43 @@ mod tests {
         assert!(screen.contains("1. Trigger mode:"), "{screen}");
         assert!(screen.contains("2. Lifecycle:"), "{screen}");
         assert!(screen.contains("B. Persistent"), "{screen}");
+    }
+
+    #[test]
+    fn collapsed_tool_activity_keeps_first_and_latest_details_visible() {
+        let mut state = UiState::new("session-tool-details", "fixture-model");
+        state.phase = UiPhase::Running;
+        state.run_id = Some("run-details".to_owned());
+        for index in 0..24 {
+            let id = format!("read-{index}");
+            update(
+                &mut state,
+                UiMsg::ToolActivity {
+                    activity_id: id.clone(),
+                    tool_name: "file_read".to_owned(),
+                    state: ToolActivityState::Running,
+                    evidence: file_evidence(&format!("src/file_{index:02}.rs")),
+                },
+            );
+            update(
+                &mut state,
+                UiMsg::ToolActivity {
+                    activity_id: id,
+                    tool_name: "file_read".to_owned(),
+                    state: ToolActivityState::Succeeded,
+                    evidence: Vec::new(),
+                },
+            );
+        }
+        let collapsed = render_to_string(&state, 80, 20);
+        assert!(collapsed.contains("Read 24 files"), "{collapsed}");
+        assert!(collapsed.contains("Read src/file_00.rs"), "{collapsed}");
+        assert!(collapsed.contains("Read src/file_22.rs"), "{collapsed}");
+        assert!(collapsed.contains("Read src/file_23.rs"), "{collapsed}");
+        assert!(
+            collapsed.contains("… 17 more detail lines · ctrl+o expand"),
+            "{collapsed}"
+        );
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
