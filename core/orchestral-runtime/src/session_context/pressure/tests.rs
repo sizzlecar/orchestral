@@ -666,3 +666,75 @@ async fn pressure_uses_selected_policy_with_full_system_and_tool_overhead() {
         request(budget).system_message.as_ref()
     );
 }
+
+#[tokio::test]
+async fn historical_context_budget_caps_accumulated_summaries_and_summarizer_elides_inline_data_uris(
+) {
+    let fixture = Fixture::new(&[], "initial").await;
+    let session_id = AgentSessionId::new("session-1");
+    let summarizer = DeterministicExtractiveSessionSummarizer::new(4096).unwrap();
+
+    // A user message containing a large inline data[image/png] payload must have
+    // the base64 blob stripped by the extractive summarizer.
+    let inline_image_msg = format!(
+        "[Image #1] 一直出现这个问题 | data[image/png]={}",
+        "A".repeat(32_000)
+    );
+    append_input(&fixture.store, 2, "run-img", inline_image_msg).await;
+    let records = fixture.records().await;
+    let source = single_range(records.last().unwrap().session_seq);
+    let summary_msg = summarizer
+        .summarize(SessionCompactionInput {
+            session_id: session_id.clone(),
+            groups: original_compaction_groups(&records, &source).unwrap(),
+            source,
+            focus_messages: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let ModelContent::Text { text } = &summary_msg.content[0] else {
+        panic!("expected text summary");
+    };
+    assert!(text.contains("<inline data omitted"));
+    assert!(!text.contains(&"A".repeat(64)));
+
+    // Multiple historical compaction summaries separated by barriers must be capped
+    // by the historical context budget (25% of input budget, max 24K tokens),
+    // deferring older summaries instead of accumulating without bound.
+    let fixture = Fixture::new(&[], "initial").await;
+    let compactor = fixture.compactor(default_summarizer());
+    for index in 0..6_u64 {
+        let run_name = format!("old-run-{index}");
+        append_tool_exchange(&fixture.store, index + 10, &run_name, 8_000).await;
+        let records = fixture.records().await;
+        let last_seq = records.last().unwrap().session_seq;
+        compactor
+            .commit_active_run_summary(
+                &records,
+                &RunId::new(run_name),
+                single_range(last_seq),
+                ModelMessage::text(
+                    ModelRole::Assistant,
+                    format!("summary-{index}: {}", "x".repeat(6_000)),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    append_input(
+        &fixture.store,
+        99,
+        "current",
+        "follow up question".to_owned(),
+    )
+    .await;
+    let mut request = fixture.request(96_000);
+    request.history_limit = 64;
+    let projected = fixture.engine.project(request).await.unwrap();
+    assert!(
+        !projected.deferred_ranges.is_empty(),
+        "older historical summaries exceeding the 24K historical budget cap must be deferred"
+    );
+    assert!(projected.used_input_tokens <= 28_000);
+}
