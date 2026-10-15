@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -219,11 +219,35 @@ fn install_tracing_subscriber() {
     // retaining their subscriber is safer than failing the command at startup.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(io::stderr)
+        .with_writer(StderrTracingWriter::new)
         .with_ansi(io::stderr().is_terminal())
         .with_target(true)
         .compact()
         .try_init();
+}
+
+struct StderrTracingWriter;
+
+impl StderrTracingWriter {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl Write for StderrTracingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if crate::tui::stderr_logging_suppressed() {
+            return Ok(buf.len());
+        }
+        io::stderr().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if crate::tui::stderr_logging_suppressed() {
+            return Ok(());
+        }
+        io::stderr().flush()
+    }
 }
 
 #[cfg(test)]
@@ -419,5 +443,21 @@ mod tests {
         assert_eq!(parsed.model.as_deref(), Some("gemini-3.1-pro-preview"));
         assert_eq!(parsed.cwd, Some(PathBuf::from("/work/primary")));
         assert!(matches!(parsed.command, Some(super::CliCommand::Serve(_))));
+    }
+
+    #[test]
+    fn stderr_tracing_writer_drops_bytes_while_tui_is_active() {
+        use std::io::Write;
+        crate::tui::TerminalSession::set_stderr_logging_suppressed_for_test(true);
+        let result = super::StderrTracingWriter::new()
+            .write(b"INFO orchestral_cli::agent: loaded project instructions\n");
+        let flush = super::StderrTracingWriter::new().flush();
+        crate::tui::TerminalSession::set_stderr_logging_suppressed_for_test(false);
+        assert_eq!(
+            result.unwrap(),
+            b"INFO orchestral_cli::agent: loaded project instructions\n".len()
+        );
+        assert!(flush.is_ok());
+        assert!(!crate::tui::stderr_logging_suppressed());
     }
 }

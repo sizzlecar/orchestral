@@ -22,7 +22,7 @@ pub(crate) enum UiPhase {
 }
 
 impl UiPhase {
-    fn accepts_new_run(self) -> bool {
+    pub(super) fn accepts_new_run(self) -> bool {
         matches!(
             self,
             Self::Idle | Self::Completed | Self::Incomplete | Self::Failed | Self::Cancelled
@@ -232,6 +232,10 @@ pub(crate) enum UiMsg {
         run_id: String,
     },
     RemoteRunStarted {
+        run_id: String,
+        input: String,
+    },
+    ScheduledRunStarted {
         run_id: String,
         input: String,
     },
@@ -746,6 +750,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         msg,
         UiMsg::RunStarted { .. }
             | UiMsg::RemoteRunStarted { .. }
+            | UiMsg::ScheduledRunStarted { .. }
             | UiMsg::StreamDelta { .. }
             | UiMsg::ReasoningSummaryDelta { .. }
             | UiMsg::ToolActivity { .. }
@@ -788,6 +793,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         msg,
         UiMsg::RunStarted { .. }
             | UiMsg::RemoteRunStarted { .. }
+            | UiMsg::ScheduledRunStarted { .. }
             | UiMsg::StreamDelta { .. }
             | UiMsg::ReasoningSummaryDelta { .. }
             | UiMsg::OutputCommitted { .. }
@@ -948,6 +954,10 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::RemoteRunStarted { run_id, input } => {
             state.input_history.push(&input);
+            begin_run(state, input);
+            state.run_id = Some(run_id);
+        }
+        UiMsg::ScheduledRunStarted { run_id, input } => {
             begin_run(state, input);
             state.run_id = Some(run_id);
         }

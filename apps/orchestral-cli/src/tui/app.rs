@@ -136,6 +136,16 @@ pub(crate) async fn run_tui(
             state.transcript_dirty_from = state.transcript.len();
             needs_redraw = false;
         }
+        let next_schedule_deadline = if !state.exit_requested
+            && !state.host_busy
+            && active.is_none()
+            && state.menu.is_none()
+            && state.phase.accepts_new_run()
+        {
+            host.schedules.next_deadline(client.session_id())
+        } else {
+            None
+        };
         tokio::select! {
             event = input.next() => {
                 let event = event.context("terminal event stream closed")?
@@ -174,6 +184,8 @@ pub(crate) async fn run_tui(
                     for effect in effects {
                         if let Some(queue_effects) = super::input_queue::route_effect(&effect, &mut state) {
                             execution.extend(queue_effects);
+                        } else if let Some(schedule_effects) = super::schedule::route_effect(&effect, &host.schedules, &mut state) {
+                            execution.extend(schedule_effects);
                         } else if matches!(&effect, UiEffect::MenuChoice { kind: super::menu::MenuKind::Commands, value } if value == "/quit") {
                             service_tasks.cancel_read(&mut state);
                             execution.extend(update(&mut state, UiMsg::Quit));
@@ -323,6 +335,43 @@ pub(crate) async fn run_tui(
             _ = animation_tick.tick(), if active.is_some() => {
                 update(&mut state, UiMsg::Tick { now: Instant::now() });
                 needs_redraw = true;
+            }
+            _ = host.schedules.notified() => {}
+            _ = async {
+                match next_schedule_deadline {
+                    Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(fired) = host.schedules.pop_due(client.session_id(), Instant::now()) {
+                    let input = fired.formatted_prompt();
+                    match client.start_text(input.clone()).await {
+                        Ok(handle) => {
+                            let run_id = handle.run_id().as_str().to_owned();
+                            let observer = observe_run(&handle, agent_tx.clone()).await?;
+                            update(&mut state, UiMsg::ScheduledRunStarted { run_id, input });
+                            active = Some(ActiveRun {
+                                handle,
+                                observer,
+                                last_run_seq: 0,
+                                delta_order: 0,
+                                auto_resolved_approvals: BTreeSet::new(),
+                            });
+                            if reconcile_active(&mut active, &mut state, &approval_broker).await? {
+                                stop_active(&mut active);
+                            }
+                        }
+                        Err(error) => {
+                            notice(
+                                &mut state,
+                                "scheduled-run-error",
+                                format!("Could not start scheduled task {}: {error}", fired.id),
+                                true,
+                            );
+                        }
+                    }
+                    needs_redraw = true;
+                }
             }
             process_event = process_events.recv(), if active.is_some() && process_events_open => {
                 match process_event {

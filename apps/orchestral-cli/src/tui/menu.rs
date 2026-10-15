@@ -17,6 +17,9 @@ pub(crate) enum MenuKind {
 pub(crate) enum LocalAction {
     EditQueuedInput(String),
     WithdrawQueuedInput(String),
+    TriggerScheduledTask(String),
+    CancelScheduledTask(String),
+    ClearScheduledTasks,
     Keyboard,
     Appearance,
     SessionDetails,
@@ -123,6 +126,11 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
         "/queue",
         "Pending messages",
         "Inspect, edit or withdraw messages awaiting the next model call",
+    ),
+    (
+        "/loop",
+        "Scheduled tasks",
+        "Schedule a recurring or one-shot task (/loop 5m <prompt>) or manage active timers",
     ),
     (
         "/new",

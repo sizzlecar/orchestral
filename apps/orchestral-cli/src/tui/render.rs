@@ -1685,7 +1685,7 @@ fn pending_height(state: &UiState, width: u16) -> u16 {
     let inner_width = width.saturating_sub(2 * CONTENT_PADDING).max(1) as usize;
     match state.pending.as_ref() {
         Some(PendingOverlay::Input { prompt, .. }) => 2_u16.saturating_add(
-            u16::try_from(wrapped_rows(prompt, inner_width).clamp(1, 3)).unwrap_or(3),
+            u16::try_from(wrapped_rows(prompt, inner_width).clamp(1, 12)).unwrap_or(12),
         ),
         Some(PendingOverlay::Approval {
             summary,
@@ -2394,6 +2394,29 @@ mod tests {
                 "missing {expected} after 80x24 -> 60x12 shrink:\n{shrink_combined}"
             );
         }
+    }
+
+    #[test]
+    fn multiline_input_prompt_renders_all_lines_beyond_three_rows() {
+        let mut state = UiState::new("session-multiline-input", "fixture-model");
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run-input".to_owned(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::WaitingInput {
+                run_id: "run-input".to_owned(),
+                request_id: "req-multiline".to_owned(),
+                prompt: "Please confirm the two choices:\n\n1. Trigger mode:\n   - A. Slash command + Agent tools\n   - B. Slash command only\n\n2. Lifecycle:\n   - A. Session-scoped\n   - B. Persistent".to_owned(),
+            },
+        );
+        let screen = render_to_string(&state, 80, 24);
+        assert!(screen.contains("1. Trigger mode:"), "{screen}");
+        assert!(screen.contains("2. Lifecycle:"), "{screen}");
+        assert!(screen.contains("B. Persistent"), "{screen}");
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {

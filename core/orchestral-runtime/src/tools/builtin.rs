@@ -3,6 +3,7 @@ mod guarded_artifact;
 mod guarded_exec;
 mod guarded_patch;
 mod guarded_pty;
+mod guarded_schedule;
 mod guarded_search;
 mod guarded_session;
 mod model_output;
@@ -33,6 +34,14 @@ pub use self::guarded_pty::{
     guarded_pty_read_descriptor, guarded_pty_write_descriptor, GuardedPtyCloseExecutor,
     GuardedPtyCreateExecutor, GuardedPtyListExecutor, GuardedPtyReadExecutor,
     GuardedPtyWriteExecutor, GUARDED_PTY_SANDBOX_PROFILE,
+};
+pub use self::guarded_schedule::{
+    format_duration_compact, guarded_schedule_create_descriptor,
+    guarded_schedule_delete_descriptor, guarded_schedule_list_descriptor, parse_loop_command,
+    parse_schedule_interval, FiredScheduledTask, GuardedScheduleCreateExecutor,
+    GuardedScheduleDeleteExecutor, GuardedScheduleListExecutor, ParsedLoopCommand,
+    ScheduledTaskView, SessionScheduleRegistry, DEFAULT_LOOP_INTERVAL, MAX_RECURRING_LIFETIME,
+    MAX_SCHEDULES_PER_SESSION, MAX_SCHEDULE_INTERVAL, MIN_SCHEDULE_INTERVAL,
 };
 pub use self::guarded_search::{
     guarded_file_search_descriptor, guarded_text_search_descriptor, GuardedFileSearchExecutor,
