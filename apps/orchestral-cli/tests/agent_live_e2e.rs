@@ -71,17 +71,19 @@ impl TestWorkspace {
         fs::create_dir_all(&root).expect("create isolated E2E workspace");
         let config = fs::read_to_string(repository_root().join("configs/orchestral.cli.yaml"))
             .expect("read canonical CLI config");
+        let mut parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
+        parsed["agent"]["compaction"]["strategy"] =
+            serde_yaml::Value::String("deterministic_extractive".into());
         #[cfg(windows)]
-        let config = {
+        {
             // Run platform fixtures under PowerShell even when the test
             // launcher (for example OpenSSH) sets SHELL to cmd.exe.
-            let mut parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
             let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
             parsed["tools"]["exec"]["shell"] =
                 serde_yaml::Value::String(shell.to_string_lossy().into_owned());
-            serde_yaml::to_string(&parsed).unwrap()
-        };
+        }
+        let config = serde_yaml::to_string(&parsed).unwrap();
         fs::write(root.join("orchestral.yaml"), config).expect("write isolated CLI config");
         Self { root }
     }
