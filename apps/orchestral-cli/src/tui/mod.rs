@@ -35,3 +35,6 @@ pub(crate) use render::RenderCache;
 #[cfg(test)]
 pub(crate) use state::TranscriptEntry;
 pub(crate) use state::{update, ApprovalChoice, UiEffect, UiMsg, UiPhase, UiState};
+pub(crate) use terminal::stderr_logging_suppressed;
+#[cfg(test)]
+pub(crate) use terminal::TerminalSession;

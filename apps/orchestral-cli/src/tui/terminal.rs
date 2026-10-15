@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::io::{self, Stdout, Write};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
@@ -13,6 +14,12 @@ use super::render::{draw_with_scrollback, DrawOutcome, RenderCache};
 use super::state::UiState;
 
 type CrosstermTerminal = Terminal<CrosstermBackend<FrameWriter>>;
+
+static ACTIVE_TERMINAL_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn stderr_logging_suppressed() -> bool {
+    ACTIVE_TERMINAL_SESSIONS.load(Ordering::Acquire) > 0
+}
 
 /// Buffers an entire scrollback + viewport frame in memory so `Stdout`'s
 /// `LineWriter` cannot flush an intermediate cleared screen when `append_lines`
@@ -133,6 +140,7 @@ impl TerminalSession {
                 return Err(error);
             }
         };
+        ACTIVE_TERMINAL_SESSIONS.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
             terminal,
             defer_flush,
@@ -170,6 +178,7 @@ impl TerminalSession {
             return Ok(());
         }
         self.active = false;
+        ACTIVE_TERMINAL_SESSIONS.fetch_sub(1, Ordering::AcqRel);
 
         let (_, rows) = self
             .terminal
@@ -234,6 +243,14 @@ impl TerminalSession {
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn set_stderr_logging_suppressed_for_test(suppressed: bool) {
+        if suppressed {
+            ACTIVE_TERMINAL_SESSIONS.fetch_add(1, Ordering::AcqRel);
+        } else {
+            ACTIVE_TERMINAL_SESSIONS.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }

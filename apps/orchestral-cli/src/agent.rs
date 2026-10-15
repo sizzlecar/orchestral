@@ -686,7 +686,7 @@ pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
         io::stdout().is_terminal(),
     )?;
     let local_input_available = options.input_mode.resolve(&entry_mode, stdin_is_terminal)?;
-    let session_timers_enabled = matches!(entry_mode, EntryMode::Tui);
+    let session_timers_enabled = local_input_available;
     let mut host = Arc::new(
         build_agent_host_with_journals(
             &options,
