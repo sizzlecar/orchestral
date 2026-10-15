@@ -53,12 +53,15 @@ use orchestral_runtime::tools::{
     approved_host_exec_command_descriptor, guarded_apply_patch_descriptor,
     guarded_artifact_read_v2_descriptor, guarded_file_edit_descriptor,
     guarded_file_read_descriptor, guarded_file_search_descriptor, guarded_file_write_descriptor,
-    guarded_session_read_descriptor, guarded_text_search_descriptor,
-    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
-    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
-    GuardedExecCommandExecutor, GuardedFileEditExecutor, GuardedFileReadExecutor,
-    GuardedFileSearchExecutor, GuardedFileWriteExecutor, GuardedSessionReadExecutor,
-    GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    guarded_schedule_create_descriptor, guarded_schedule_delete_descriptor,
+    guarded_schedule_list_descriptor, guarded_session_read_descriptor,
+    guarded_text_search_descriptor, workspace_exec_command_descriptor,
+    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
+    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileEditExecutor,
+    GuardedFileReadExecutor, GuardedFileSearchExecutor, GuardedFileWriteExecutor,
+    GuardedScheduleCreateExecutor, GuardedScheduleDeleteExecutor, GuardedScheduleListExecutor,
+    GuardedSessionReadExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
+    SessionScheduleRegistry,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, ContinuationPolicy,
@@ -242,12 +245,14 @@ pub struct AgentHost {
     pub session_history: crate::local_sessions::LocalSessionHistory,
     session_origin: SessionOrigin,
     pub(crate) skill_manager: SkillManager,
+    pub(crate) schedules: SessionScheduleRegistry,
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
     mcp_registry: McpToolsAdapterRegistry,
     // None denotes a Host with its own input channel (for example HTTP serve).
     // Local runs retain their resolved capability across TUI reconfiguration.
     local_input_available: Option<bool>,
+    session_timers_enabled: bool,
 }
 
 impl AgentHost {
@@ -262,6 +267,8 @@ impl AgentHost {
             options,
             Some(self.journals.clone()),
             self.local_input_available,
+            Some(self.schedules.clone()),
+            self.session_timers_enabled,
         )
         .await?;
         next.metadata.journal_location = self.metadata.journal_location.clone();
@@ -276,7 +283,14 @@ impl AgentHost {
         ) {
             self.reconfigure(options).await
         } else {
-            build_agent_host_with_journals(options, None, self.local_input_available).await
+            build_agent_host_with_journals(
+                options,
+                None,
+                self.local_input_available,
+                Some(self.schedules.clone()),
+                self.session_timers_enabled,
+            )
+            .await
         }
     }
 
@@ -286,13 +300,15 @@ impl AgentHost {
 }
 
 pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<AgentHost> {
-    build_agent_host_with_journals(options, None, None).await
+    build_agent_host_with_journals(options, None, None, None, false).await
 }
 
 async fn build_agent_host_with_journals(
     options: &AgentRunOptions,
     shared: Option<CliJournalStores>,
     local_input_available: Option<bool>,
+    shared_schedules: Option<SessionScheduleRegistry>,
+    session_timers_enabled: bool,
 ) -> anyhow::Result<AgentHost> {
     let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
     let config_path = prepare_runtime_config_path(
@@ -489,10 +505,11 @@ async fn build_agent_host_with_journals(
     recall_bounds.network = NetworkPolicy::default();
     recall_bounds.environment = EnvironmentPolicy::default();
     recall_bounds.allowed_credentials.clear();
+    let schedules = shared_schedules.unwrap_or_default();
     tool_runtime
         .register(
             guarded_session_read_descriptor(ToolRestriction {
-                bounds: recall_bounds,
+                bounds: recall_bounds.clone(),
             }),
             Arc::new(GuardedSessionReadExecutor::new(
                 run_journal.clone(),
@@ -500,6 +517,41 @@ async fn build_agent_host_with_journals(
             )),
         )
         .context("register guarded session_read Tool")?;
+    if session_timers_enabled {
+        tool_runtime
+            .register(
+                guarded_schedule_create_descriptor(ToolRestriction {
+                    bounds: recall_bounds.clone(),
+                }),
+                Arc::new(GuardedScheduleCreateExecutor::new(
+                    run_journal.clone(),
+                    schedules.clone(),
+                )),
+            )
+            .context("register guarded schedule_create Tool")?;
+        tool_runtime
+            .register(
+                guarded_schedule_list_descriptor(ToolRestriction {
+                    bounds: recall_bounds.clone(),
+                }),
+                Arc::new(GuardedScheduleListExecutor::new(
+                    run_journal.clone(),
+                    schedules.clone(),
+                )),
+            )
+            .context("register guarded schedule_list Tool")?;
+        tool_runtime
+            .register(
+                guarded_schedule_delete_descriptor(ToolRestriction {
+                    bounds: recall_bounds,
+                }),
+                Arc::new(GuardedScheduleDeleteExecutor::new(
+                    run_journal.clone(),
+                    schedules.clone(),
+                )),
+            )
+            .context("register guarded schedule_delete Tool")?;
+    }
     let mcp_registry = McpToolsAdapterRegistry::register(
         tool_runtime.as_ref(),
         mcp_configs,
@@ -609,12 +661,14 @@ async fn build_agent_host_with_journals(
                 .to_session_permissions(!config.tools.exec.network_targets.is_empty()),
         },
         skill_manager,
+        schedules,
         session_history,
         session_origin,
         controller,
         resources,
         mcp_registry,
         local_input_available,
+        session_timers_enabled,
     })
 }
 
@@ -632,8 +686,16 @@ pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
         io::stdout().is_terminal(),
     )?;
     let local_input_available = options.input_mode.resolve(&entry_mode, stdin_is_terminal)?;
+    let session_timers_enabled = matches!(entry_mode, EntryMode::Tui);
     let mut host = Arc::new(
-        build_agent_host_with_journals(&options, None, Some(local_input_available)).await?,
+        build_agent_host_with_journals(
+            &options,
+            None,
+            Some(local_input_available),
+            None,
+            session_timers_enabled,
+        )
+        .await?,
     );
     let tui_options = options.clone();
     let client = host.client(session_id.clone());

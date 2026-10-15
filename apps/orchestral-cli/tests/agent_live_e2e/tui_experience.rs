@@ -943,6 +943,81 @@ fn tui_pty_pastes_images_from_paths_and_clipboard_as_multimodal_content() {
     assert_eq!(server.join().unwrap().len(), 1);
 }
 
+#[test]
+fn tui_pty_loop_command_and_schedule_tools_fire_recurring_and_one_shot_runs() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("tui-loop-schedule");
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            let names = model_request_tool_names(&request.body);
+            assert!(names.contains(&"schedule_create"), "{names:?}");
+            assert!(names.contains(&"schedule_list"), "{names:?}");
+            assert!(names.contains(&"schedule_delete"), "{names:?}");
+            let text = model_request_text(&request.body);
+            assert!(
+                text.contains("[Scheduled loop-1 (every 1s)] Check build via slash loop"),
+                "{text}"
+            );
+            openai_tool_response(
+                "cancel-first-loop",
+                "schedule_delete",
+                json!({"id": "loop-1"}),
+            )
+        }),
+        Box::new(|request| {
+            let envelopes = model_tool_result_envelopes(&request.body);
+            assert_eq!(envelopes.last().unwrap()["result"]["deleted_count"], 1);
+            openai_tool_response(
+                "schedule-followup",
+                "schedule_create",
+                json!({
+                    "prompt": "Run follow-up timer check",
+                    "interval": "1s",
+                    "recurring": false
+                }),
+            )
+        }),
+        Box::new(|request| {
+            let envelopes = model_tool_result_envelopes(&request.body);
+            assert_eq!(envelopes.last().unwrap()["result"]["id"], "loop-2");
+            assert_eq!(
+                envelopes.last().unwrap()["result"]["schedule_spec"],
+                "once in 1s"
+            );
+            openai_text_response("FIRST_LOOP_HANDLED")
+        }),
+        Box::new(|request| {
+            let text = model_request_text(&request.body);
+            assert!(
+                text.contains("[Scheduled loop-2 (once in 1s)] Run follow-up timer check"),
+                "{text}"
+            );
+            openai_text_response("TIMER_FOLLOWUP_COMPLETED")
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    let mut tui = PtyHarness::spawn(local_tui_command(
+        &workspace,
+        "loop-schedule-session",
+        "Follow the user's request.",
+    ));
+    tui.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
+    tui.send_paste("/loop 1s Check build via slash loop");
+    tui.wait_for_screen(
+        |s| s.contains("Scheduled loop-1 (every 1s): Check build via slash loop"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.wait_for_screen(
+        |s| s.contains("TIMER_FOLLOWUP_COMPLETED") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    output.assert_terminal_restored();
+    assert_eq!(server.join().unwrap().len(), 4);
+}
+
 // Inspect long read-only panels through the same paging keys used by a person.
 fn read_panel_until(tui: &mut PtyHarness, marker: &str) -> String {
     for _ in 0..100 {

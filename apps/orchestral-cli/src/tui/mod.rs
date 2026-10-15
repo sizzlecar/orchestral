@@ -19,6 +19,7 @@ mod performance;
 #[cfg(test)]
 mod regression;
 mod render;
+mod schedule;
 mod services;
 mod skills;
 mod state;
