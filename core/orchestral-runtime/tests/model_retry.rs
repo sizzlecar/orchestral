@@ -9,7 +9,8 @@ use orchestral_core::agent_protocol::{
     spi::{AgentProvider, AgentRecoveryRequest},
     wire::{
         AgentEvent, AgentProtocolErrorCode, AgentProviderStreamItem, AgentRunEnvelope,
-        AgentSessionId, AgentStartRequest, Content, IncompleteReason, ProviderBindingRef, RunId,
+        AgentSessionId, AgentStartRequest, AgentTelemetry, Content, IncompleteReason,
+        ProviderBindingRef, RunId,
     },
     AGENT_PROTOCOL_V1,
 };
@@ -197,6 +198,150 @@ fn run() -> AgentRunEnvelope {
         vec![Content::text("finish this task")],
     )
     .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_waits_and_durable_failures_keep_attempt_and_cumulative_time() {
+    struct TimedModel {
+        calls: AtomicUsize,
+        requests: std::sync::Mutex<Vec<ModelRequest>>,
+    }
+
+    #[async_trait]
+    impl ModelBackend for TimedModel {
+        fn descriptor(&self) -> ModelDescriptor {
+            ModelDescriptor {
+                backend_id: "test/timed-retry".into(),
+                capabilities: Default::default(),
+                extensions: Default::default(),
+            }
+        }
+
+        async fn start(
+            &self,
+            request: ModelRequest,
+            _: CancellationToken,
+        ) -> Result<ModelStream, ModelError> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let request_id = request.request_id.clone();
+            self.requests.lock().unwrap().push(request);
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            let error = |phase| {
+                ModelError::new(ModelErrorCode::Unavailable, "fixture timeout")
+                    .with_retryable(true)
+                    .with_details(serde_json::json!({
+                        "phase": phase, "send_elapsed_ms": 25_000,
+                    }))
+            };
+            if attempt == 0 {
+                return Err(error("response_headers"));
+            }
+            let first = ModelStreamEvent {
+                request_id,
+                event_id: ModelEventId::new("partial"),
+                sequence: 1,
+                payload: ModelEvent::TextDelta {
+                    delta: "partial".into(),
+                },
+            };
+            let body_error = error("response_body");
+            Ok(stream::once(std::future::ready(Ok(first)))
+                .chain(stream::once(async move {
+                    tokio::time::sleep(Duration::from_secs(25)).await;
+                    Err(body_error)
+                }))
+                .boxed())
+        }
+    }
+
+    let model = Arc::new(TimedModel {
+        calls: AtomicUsize::new(0),
+        requests: Default::default(),
+    });
+    let store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let mut config = config();
+    config.model_retry.max_retries = 3;
+    config.model_retry.base_delay_ms = 2_000;
+    config.model_retry.max_delay_ms = 2_000;
+    let provider = InternalGenericAgentProvider::new(model.clone(), config)
+        .unwrap()
+        .with_checkpoint_store(store.clone())
+        .unwrap();
+    let request = AgentStartRequest::new(
+        run(),
+        ProviderBindingRef::new("binding"),
+        &provider.describe(),
+    )
+    .unwrap();
+    let mut stream = provider.start(request).await.unwrap().stream;
+    let mut notices = Vec::new();
+    let failure = tokio::time::timeout(Duration::from_secs(90), async {
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                AgentProviderStreamItem::Telemetry(telemetry) => {
+                    if let AgentTelemetry::ProgressReported { message, .. } = telemetry.payload {
+                        notices.push(message);
+                    }
+                }
+                AgentProviderStreamItem::Event(event) => {
+                    if let AgentEvent::RunFailed { failure } = event.payload {
+                        return failure;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("expected retry exhaustion");
+    })
+    .await
+    .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(
+        requests[0], requests[1],
+        "transport retry keeps the same request"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|message| message.starts_with("Attempt 1/4 · total 20s")),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|message| message.contains("retry 1/3 in 2000 ms · total 25s")),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|message| message.starts_with("Attempt 2/4 · total 37s")),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|message| message == "Attempt 2/4 · total 62s · Waiting for model output (10s)"),
+        "{notices:?}"
+    );
+    assert_eq!(failure.details["phase"], "response_body");
+    assert_eq!(failure.details["send_elapsed_ms"], 25_000);
+    assert_eq!(failure.details["attempt_number"], 2);
+    assert_eq!(failure.details["attempt_elapsed_ms"], 50_000);
+    assert_eq!(failure.details["logical_request_elapsed_ms"], 77_000);
+    let stored = store.load_run(&RunId::new("run")).unwrap().unwrap();
+    let retry = stored
+        .records
+        .iter()
+        .find_map(|record| match &record.payload {
+            GenericCheckpointEvent::ModelRetryScheduled { error, .. } => Some(error),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(retry.details["attempt_number"], 1);
+    assert_eq!(retry.details["logical_request_elapsed_ms"], 25_000);
+    assert_eq!(retry.details["phase"], "response_headers");
 }
 
 #[tokio::test]

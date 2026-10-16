@@ -213,7 +213,7 @@ impl GeminiModelConfig {
 }
 
 pub struct GeminiModelBackend {
-    client: Arc<RwLock<Client>>,
+    client: Arc<RwLock<HttpClientState>>,
     config: GeminiModelConfig,
     metadata: tokio::sync::OnceCell<Option<metadata::ResolvedMetadata>>,
     metadata_cache: Option<std::path::PathBuf>,
@@ -222,6 +222,89 @@ pub struct GeminiModelBackend {
     include_thoughts: bool,
     response_header_timeout: Duration,
     catalog_url: Option<String>,
+}
+
+struct HttpClientState {
+    client: Client,
+    generation: u64,
+}
+
+/// Request metadata only: never retain the prompt, image contents, credentials,
+/// tool arguments, or HTTP headers in diagnostics.
+struct RequestDiagnostics {
+    metadata: Map<String, Value>,
+    started: Instant,
+    auth_elapsed: Duration,
+    send_started: Option<Instant>,
+    send_elapsed: Option<Duration>,
+}
+
+impl RequestDiagnostics {
+    fn new(request: &ModelRequest, body: &Value, request_bytes: usize, generation: u64) -> Self {
+        let image_bytes: usize = body
+            .get("contents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message.get("parts").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|part| part.pointer("/inlineData/data").and_then(Value::as_str))
+            .map(str::len)
+            .sum();
+        Self {
+            metadata: Map::from_iter([
+                ("request_id".to_owned(), json!(request.request_id)),
+                ("request_bytes".to_owned(), json!(request_bytes)),
+                // This is the encoded data actually sent, not decoded image size.
+                ("inline_image_base64_bytes".to_owned(), json!(image_bytes)),
+                ("message_count".to_owned(), json!(request.messages.len())),
+                ("tool_count".to_owned(), json!(request.tools.len())),
+                ("client_generation".to_owned(), json!(generation)),
+            ]),
+            started: Instant::now(),
+            auth_elapsed: Duration::ZERO,
+            send_started: None,
+            send_elapsed: None,
+        }
+    }
+
+    fn attach(&self, mut error: ModelError) -> ModelError {
+        let mut details = match error.details {
+            Value::Object(details) => details,
+            Value::Null => Map::new(),
+            original => Map::from_iter([("cause".to_owned(), original)]),
+        };
+        details.extend(self.metadata.clone());
+        details.insert(
+            "auth_elapsed_ms".to_owned(),
+            json!(self.auth_elapsed.as_millis() as u64),
+        );
+        details.insert(
+            "request_elapsed_ms".to_owned(),
+            json!(self.started.elapsed().as_millis() as u64),
+        );
+        if let Some(elapsed) = self
+            .send_elapsed
+            .or_else(|| self.send_started.map(|started| started.elapsed()))
+        {
+            details.insert(
+                "send_elapsed_ms".to_owned(),
+                json!(elapsed.as_millis() as u64),
+            );
+            // reqwest's send future covers connection establishment, upload,
+            // and waiting for headers; it cannot isolate server queue time.
+            details.insert(
+                "send_scope".to_owned(),
+                json!("connect_upload_response_headers"),
+            );
+        }
+        error.details = Value::Object(details);
+        error
+    }
+
+    fn error(&self, error: ModelError, phase: &str) -> ModelError {
+        self.attach(request_timing(error, phase, self.started))
+    }
 }
 
 fn build_http_client(config: &GeminiModelConfig) -> Result<Client, ModelError> {
@@ -246,7 +329,10 @@ impl GeminiModelBackend {
         let catalog_url = metadata::public_google_endpoint(&config.endpoint)
             .then(|| "https://models.dev/api.json".to_owned());
         Ok(Self {
-            client: Arc::new(RwLock::new(client)),
+            client: Arc::new(RwLock::new(HttpClientState {
+                client,
+                generation: 0,
+            })),
             response_header_timeout: config.timeout,
             config,
             metadata: tokio::sync::OnceCell::new(),
@@ -259,18 +345,25 @@ impl GeminiModelBackend {
     }
 
     pub(crate) fn http_client(&self) -> Client {
-        self.client
+        self.http_client_snapshot().0
+    }
+
+    fn http_client_snapshot(&self) -> (Client, u64) {
+        let state = self
+            .client
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.client.clone(), state.generation)
     }
 
     fn reset_http_client(&self) {
         if let Ok(fresh) = build_http_client(&self.config) {
-            *self
+            let mut state = self
                 .client
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.client = fresh;
+            state.generation = state.generation.saturating_add(1);
         }
     }
 
@@ -308,8 +401,9 @@ impl GeminiModelBackend {
         self
     }
 
-    /// Bound waiting for HTTP response headers independently of streamed body
-    /// reads. This is not a total generation deadline; the SDK defaults to the
+    /// Bound the HTTP send through response headers, including connection and
+    /// upload, independently of streamed body reads. This is not a total
+    /// generation deadline; the SDK defaults to the
     /// configured idle timeout until the Host supplies a separate ceiling.
     pub fn with_response_header_timeout(mut self, timeout: Duration) -> Result<Self, ModelError> {
         if timeout.is_zero() {
@@ -534,58 +628,81 @@ impl ModelBackend for GeminiModelBackend {
         request.validate()?;
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
-        let started = Instant::now();
-        let client = self.http_client();
-        let http_request = self
+        // Serialize once so diagnostics measure exactly the bytes sent.
+        let encoded = serde_json::to_vec(&body)
+            .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
+        let (client, generation) = self.http_client_snapshot();
+        let mut diagnostics = RequestDiagnostics::new(&request, &body, encoded.len(), generation);
+        let authenticated = self
             .config
             .authentication
             .apply(client.post(self.config.stream_url()), &cancellation)
-            .await
-            .map_err(|error| request_timing(error, "authentication", started))?
-            .json(&body);
-        tracing::debug!(request_id = %request.request_id, elapsed_ms = started.elapsed().as_millis(), "Gemini authentication complete");
+            .await;
+        diagnostics.auth_elapsed = diagnostics.started.elapsed();
+        let http_request = authenticated
+            .map_err(|error| diagnostics.error(error, "authentication"))?
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(encoded);
+        tracing::debug!(
+            request_id = %request.request_id,
+            request_bytes = %diagnostics.metadata["request_bytes"],
+            inline_image_base64_bytes = %diagnostics.metadata["inline_image_base64_bytes"],
+            message_count = request.messages.len(),
+            tool_count = request.tools.len(),
+            client_generation = generation,
+            auth_elapsed_ms = diagnostics.auth_elapsed.as_millis(),
+            "Gemini authentication complete; starting HTTP send"
+        );
+        diagnostics.send_started = Some(Instant::now());
         let response = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(cancelled_error()),
+            _ = cancellation.cancelled() => return Err(diagnostics.error(cancelled_error(), "response_headers")),
             response = tokio::time::timeout(self.response_header_timeout, http_request.send()) => response,
-        }
+        };
+        diagnostics.send_elapsed = diagnostics.send_started.map(|started| started.elapsed());
+        let response = response
         .map_err(|_| {
             self.reset_http_client();
-            request_timing(
+            diagnostics.error(
                 ModelError::new(ModelErrorCode::Unavailable, format!(
-                    "Gemini response headers were not received within {:?}", self.response_header_timeout
+                    "Gemini HTTP send did not reach response headers within {:?} (includes connection, upload, and header wait)", self.response_header_timeout
                 )).with_retryable(true).with_details(json!({
                     "kind":"timeout", "timeout":true,
                     "response_header_timeout_ms":self.response_header_timeout.as_millis() as u64,
                 })),
-                "response_headers", started,
+                "response_headers",
             )
         })?
         .map_err(|error| {
             self.reset_http_client();
-            request_timing(map_transport_error(error), "response_headers", started)
+            diagnostics.error(map_transport_error(error), "response_headers")
         })?;
         let status = response.status();
-        tracing::debug!(request_id = %request.request_id, elapsed_ms = started.elapsed().as_millis(), %status, "Gemini response headers received");
+        tracing::debug!(
+            request_id = %request.request_id,
+            elapsed_ms = diagnostics.started.elapsed().as_millis(),
+            send_elapsed_ms = diagnostics.send_elapsed.map(|elapsed| elapsed.as_millis()),
+            client_generation = generation,
+            %status,
+            "Gemini response headers received"
+        );
         if !status.is_success() {
             let bytes = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Err(cancelled_error()),
+                _ = cancellation.cancelled() => return Err(diagnostics.error(cancelled_error(), "error_body")),
                 bytes = response.bytes() => bytes,
             }
-            .map_err(|error| request_timing(map_transport_error(error), "error_body", started))?;
-            return Err(request_timing(
-                map_http_error(status, &bytes),
-                "response_headers",
-                started,
-            ));
+            .map_err(|error| diagnostics.error(map_transport_error(error), "error_body"))?;
+            return Err(diagnostics.error(map_http_error(status, &bytes), "response_headers"));
         }
         Ok(gemini_event_stream(
             request,
             response.bytes_stream().boxed(),
             cancellation,
             self.config.max_buffered_events,
-        ))
+        )
+        .map(move |event| event.map_err(|error| diagnostics.attach(error)))
+        .boxed())
     }
 }
 
@@ -1627,6 +1744,10 @@ mod tests {
         assert_eq!(error.details["timeout"], true);
         assert_eq!(error.details["content_received"], true);
         assert_eq!(error.details["received_body_bytes"], expected_bytes);
+        assert_eq!(error.details["request_id"], request().request_id.as_str());
+        assert!(error.details["request_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(error.details["inline_image_base64_bytes"], 0);
+        assert_eq!(error.details["client_generation"], 0);
         assert!(error.details["idle_ms"].as_u64().unwrap() >= 100);
         assert!(
             events.next().await.is_none(),
@@ -1638,6 +1759,14 @@ mod tests {
     #[tokio::test]
     async fn response_header_deadline_is_independent_from_body_idle_timeout() {
         use axum::{routing::post, Router};
+        struct DelayedCredentials;
+        #[async_trait]
+        impl GeminiAccessTokenProvider for DelayedCredentials {
+            async fn access_token(&self) -> Result<String, ModelError> {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok("private-delayed-fixture-token".into())
+            }
+        }
         let app = Router::new().route(
             "/{*path}",
             post(|| async { std::future::pending::<String>().await }),
@@ -1648,7 +1777,7 @@ mod tests {
         let backend = GeminiModelBackend::new(GeminiModelConfig {
             backend_id: "headers-fixture".into(),
             endpoint,
-            authentication: GeminiAuthentication::ApiKey("fixture".into()),
+            authentication: GeminiAuthentication::AccessTokenProvider(Arc::new(DelayedCredentials)),
             model: "fixture".into(),
             temperature: 0.0,
             thinking_level: None,
@@ -1675,7 +1804,13 @@ mod tests {
         assert!(error.retryable);
         assert_eq!(error.details["phase"], "response_headers");
         assert_eq!(error.details["response_header_timeout_ms"], 100);
-        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(error.details["auth_elapsed_ms"].as_u64().unwrap() >= 50);
+        assert!(error.details["send_elapsed_ms"].as_u64().unwrap() >= 100);
+        assert!(error.details["request_elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains("private-delayed-fixture-token"));
+        assert!(started.elapsed() >= Duration::from_millis(150));
         assert!(backend
             .with_response_header_timeout(Duration::ZERO)
             .is_err());
@@ -1684,20 +1819,24 @@ mod tests {
 
     #[tokio::test]
     async fn response_header_timeout_rotates_the_pooled_http_client_for_retries() {
-        use axum::{routing::post, Router};
+        use axum::{response::IntoResponse, routing::post, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_handler = attempts.clone();
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_handler = bodies.clone();
         let app = Router::new().route(
             "/{*path}",
-            post(move || {
+            post(move |body: Bytes| {
                 let attempts = attempts_handler.clone();
+                let bodies = bodies_handler.clone();
                 async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        std::future::pending::<String>().await
-                    } else {
-                        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1}}\n\n".to_owned()
+                    bodies.lock().unwrap().push(body);
+                    match attempts.fetch_add(1, Ordering::SeqCst) {
+                        0 => std::future::pending().await,
+                        1 => (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response(),
+                        _ => "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1}}\n\n".into_response(),
                     }
                 }
             }),
@@ -1708,7 +1847,7 @@ mod tests {
         let backend = GeminiModelBackend::new(GeminiModelConfig {
             backend_id: "retry-rotation-fixture".into(),
             endpoint,
-            authentication: GeminiAuthentication::ApiKey("fixture".into()),
+            authentication: GeminiAuthentication::ApiKey("private-fixture-key".into()),
             model: "fixture".into(),
             temperature: 0.0,
             thinking_level: None,
@@ -1721,20 +1860,68 @@ mod tests {
         .with_response_header_timeout(Duration::from_millis(80))
         .unwrap();
 
+        let mut request = request();
+        request.messages[0].content = vec![
+            ModelContent::Text {
+                text: "private-fixture-prompt".into(),
+            },
+            ModelContent::Data {
+                media_type: "image/png".into(),
+                value: json!("data:image/png;base64,aGVsbG8="),
+            },
+        ];
         let first = backend
-            .start(request(), CancellationToken::new())
+            .start(request.clone(), CancellationToken::new())
             .await
             .err()
             .expect("first attempt must time out");
         assert_eq!(first.details["phase"], "response_headers");
-        let mut second = backend
-            .start(request(), CancellationToken::new())
+        assert_eq!(first.details["client_generation"], 0);
+        assert_eq!(
+            first.details["send_scope"],
+            "connect_upload_response_headers"
+        );
+        assert!(first.details["send_elapsed_ms"].as_u64().unwrap() >= 80);
+        let second = backend
+            .start(request.clone(), CancellationToken::new())
             .await
-            .expect("second attempt after client rotation must succeed");
+            .err()
+            .expect("second attempt receives a retryable HTTP failure");
+        assert_eq!(second.details["client_generation"], 1);
+        assert!(second.retryable);
+        for error in [&first, &second] {
+            assert_eq!(error.details["request_id"], request.request_id.as_str());
+            assert_eq!(
+                error.details["request_bytes"],
+                bodies.lock().unwrap()[0].len()
+            );
+            assert_eq!(error.details["inline_image_base64_bytes"], 8);
+            assert_eq!(error.details["message_count"], 1);
+            assert_eq!(error.details["tool_count"], 1);
+            assert!(error.details["auth_elapsed_ms"].is_u64());
+            assert!(
+                error.details["request_elapsed_ms"].as_u64().unwrap()
+                    >= error.details["send_elapsed_ms"].as_u64().unwrap()
+            );
+            let serialized = serde_json::to_string(error).unwrap();
+            for private in ["private-fixture-key", "private-fixture-prompt", "aGVsbG8="] {
+                assert!(!serialized.contains(private));
+            }
+        }
+        let mut third = backend
+            .start(request.clone(), CancellationToken::new())
+            .await
+            .expect("next attempt after client rotation must succeed");
+        let first_event = third.next().await.unwrap().unwrap();
+        assert_eq!(first_event.request_id, request.request_id);
         assert!(matches!(
-            second.next().await.unwrap().unwrap().payload,
+            first_event.payload,
             ModelEvent::TextDelta { ref delta } if delta == "recovered"
         ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[2]);
         server.abort();
     }
 

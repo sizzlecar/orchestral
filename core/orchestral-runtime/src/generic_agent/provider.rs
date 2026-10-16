@@ -264,6 +264,7 @@ impl InternalGenericAgentProvider {
         }
         if config.stream_buffer == 0
             || config.history_limit == 0
+            || config.compaction_working_set_tokens == Some(0)
             || config.max_context_tokens == 0
             || config.reserved_output_tokens >= config.max_context_tokens
         {

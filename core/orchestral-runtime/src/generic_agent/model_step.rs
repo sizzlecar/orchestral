@@ -313,6 +313,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
         };
 
         let mut model_stream = started.stream;
+        let model_timing = started.timing;
         let mut expected_sequence = started.expected_sequence;
         has_usage |= total_usage.input_tokens.is_some() || total_usage.output_tokens.is_some();
         let mut response = String::new();
@@ -365,7 +366,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                     }
                     continue 'model_rounds;
                 }
-                item = super::model_retry::next_model_event(&inner, &request, &mut model_stream) => item,
+                item = super::model_retry::next_model_event(&inner, &request, &mut model_stream, model_timing) => item,
             };
             // A Host stop may be accepted while polling the selected stream
             // item. Give that committed stop precedence over a late provider

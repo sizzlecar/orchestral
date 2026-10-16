@@ -8,7 +8,8 @@ use serde_json::{json, Map, Value};
 type Field = (&'static str, fn(&Value) -> bool);
 
 pub(super) fn contract(kind: &str) -> Value {
-    json!({ "contract": format!("orchestral.builtin-{kind}-model-output/v1") })
+    let version = if kind == "file-read" { 2 } else { 1 };
+    json!({ "contract": format!("orchestral.builtin-{kind}-model-output/v{version}") })
 }
 
 // A changed producer schema must opt in explicitly. Unknown fields and malformed
@@ -61,7 +62,7 @@ fn workspace(invocation: &ToolInvocation, output: &Value, view: &mut Map<String,
     }
 }
 
-pub(super) fn file_read(invocation: &ToolInvocation, output: &Value) -> Value {
+pub(super) fn file_read(_invocation: &ToolInvocation, output: &Value) -> Value {
     if !shape(
         output,
         &[
@@ -101,20 +102,25 @@ pub(super) fn file_read(invocation: &ToolInvocation, output: &Value) -> Value {
     if complete && output["file_size_bytes"].as_u64() != Some(content.len() as u64) {
         return output.clone();
     }
-    let mut view = select(output, &["path", "content"]);
-    workspace(invocation, output, &mut view);
-    if !complete {
-        view.extend(select(
-            output,
-            &["start_line", "end_line", "next_offset", "eof", "truncated"],
-        ));
-        for name in ["truncation_reasons", "truncated_line_numbers"] {
-            if !output[name].as_array().unwrap().is_empty() {
-                view.insert(name.to_owned(), output[name].clone());
-            }
-        }
-    }
-    Value::Object(view)
+    // These are continuation facts, including for a complete or empty file.
+    // Keep the workspace and revision so later reads and compaction do not
+    // combine the same relative path from different workspaces or revisions.
+    Value::Object(select(
+        output,
+        &[
+            "workspace",
+            "path",
+            "revision",
+            "content",
+            "start_line",
+            "end_line",
+            "next_offset",
+            "eof",
+            "truncated",
+            "truncation_reasons",
+            "truncated_line_numbers",
+        ],
+    ))
 }
 
 pub(super) fn exec(output: &Value) -> Value {

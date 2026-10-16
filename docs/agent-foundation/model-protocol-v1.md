@@ -48,6 +48,10 @@ Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重�
   `ModelAttemptOpen`，重试序号从 1 连续递增，不产生第二个顶层终态。
 - 该 checkpoint 只记录调度事实，不授权进程重启后重发请求。恢复仍将未闭合模型尝试
   收束为 `RunIncomplete(Interrupted)`；重试策略和项目指令快照均进入恢复配置摘要。
+- 等待提示显示当前 attempt 与整个逻辑请求累计时间，累计时间包含之前的失败尝试及退避，
+  不会在重试、收到 Usage 或进入流读取阶段后归零。错误详情保留 `attempt_number`、
+  `max_attempts`、`attempt_elapsed_ms` 和 `logical_request_elapsed_ms`，随重试 checkpoint
+  或最终失败持久化。开始输出后仍可报告等待，但不会重新执行推理。
 
 ## 模型容量发现与 Host 预算
 
@@ -89,8 +93,9 @@ Google 凭证。`discover_model_capabilities: false` 或显式 backend `max_cont
 可避免自动发现。诊断上下文显示容量来源。SDK 默认仍提供显式等待发现的模式；通过
 `with_background_metadata_refresh()` 和持久缓存启用与 CLI 相同的非阻塞策略。
 
-Gemini CLI 默认只等待 HTTP 响应头 120 秒，可通过 Google backend 的
-`response_header_timeout_secs` 调整。收到响应头后，`stream_idle_timeout_secs`（默认
+Gemini CLI 默认将 HTTP send 到收到响应头的总时间限制为 45 秒，可通过 Google backend 的
+`response_header_timeout_secs` 调整。该范围包含连接建立、上传和响应头等待，不是纯服务端
+排队或推理耗时；身份认证耗时单独记录。收到响应头后，`stream_idle_timeout_secs`（默认
 300 秒）独立约束流中两次读取之间的等待，不限制生成总时长。首响应超时作为
 `Unavailable` 进入现有有界重试策略，不重放已经执行的工具；它只能缩短挂起请求的
 恢复等待，不能保证上游推理延迟。SDK 可显式调用 `with_response_header_timeout`。
@@ -98,10 +103,15 @@ Gemini CLI 默认只等待 HTTP 响应头 120 秒，可通过 Google backend 的
 模型请求、首个内容事件或流中后续事件等待超过 10 秒时，运行时以 ProgressReported
 报告等待状态；收到后续内容时 UI 恢复内容展示。这一提示保留原有待完成读取，
 不重发请求，不改变重试及取消语义。Gemini 错误详情记录 authentication、response_headers、
-error_body 或 response_body 阶段及耗时；正文耗时从收到响应头起算。正文错误另记录已收到的
+error_body 或 response_body 阶段及耗时；`response_headers` 名称保持兼容，
+`send_scope = connect_upload_response_headers` 明确它覆盖整个 send。正文耗时从收到响应头起算。
+正文错误另记录已收到的
 字节数、是否收到正文内容及最后一次收到字节后的空闲时长，以区分整体耗时和流停顿。
-调试日志仅记录请求 ID、
-阶段和耗时，不记录提示词或凭据。
+诊断另记录 `request_id`、序列化后实际发送的 `request_bytes`、`inline_image_base64_bytes`
+（图片 Base64 数据长度，不是解码大小）、消息和工具定义数量、`auth_elapsed_ms`、
+`send_elapsed_ms`、`request_elapsed_ms` 与 `client_generation`。HTTP send 超时或失败后沿用
+原有连接池重建策略，重建成功时 generation 增加；它提供关联证据，不证明故障由连接池或代理引起。
+这些计数与计时进入错误详情和调试日志，不新增提示词、图片内容、工具参数或凭据记录。
 
 Gemini 规划计数使用字节估算与运行时的实测 input usage 前缀校准；请求前缀、模型配置
 或工具定义改变时放弃该校准。保守 JSON 字节上界继续用于严格 input/cost 预算。
@@ -155,7 +165,7 @@ Gemini Native。
 
 ## Opt-in live smoke
 
-默认测试不访问网络。显式提供 endpoint、model 和 credential 后可验证两个 production
+默认测试使用本地 fixture，不调用真实模型。显式提供 endpoint、model 和 credential 后可验证两个 production
 Adapter 的真实协议/wiring；任务质量单独观察，不作为形式化正确性证明。Gemini Native
 支持 Developer API 的 API key，也支持 Vertex AI 的短期 OAuth Bearer token。
 

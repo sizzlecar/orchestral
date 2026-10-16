@@ -119,7 +119,17 @@ fn assert_source_observation(request: &CapturedHttpRequest) {
         envelope["result"]["content"].as_str().unwrap().as_bytes(),
         SOURCE.as_bytes()
     );
-    assert!(envelope["result"].get("revision").is_none());
+    let revision: Digest = serde_json::from_value(envelope["result"]["revision"].clone())
+        .expect("file-read projection retains a revision digest");
+    assert!(revision.is_sha256());
+    assert_eq!(envelope["result"]["start_line"], 1);
+    assert_eq!(envelope["result"]["end_line"], SOURCE.lines().count());
+    assert_eq!(
+        envelope["result"]["next_offset"],
+        SOURCE.lines().count() + 1
+    );
+    assert_eq!(envelope["result"]["eof"], true);
+    assert_eq!(envelope["result"]["truncated"], false);
     assert!(envelope["result"].get("content_digest").is_none());
     // Inspect the actual model-facing text, not only a parsed round trip:
     // normal source lines must retain their original backslashes and quotes.
@@ -373,6 +383,22 @@ fn assert_source_edit_and_session_restart(
     assert_eq!(canonical_read["eof"], true);
     assert_eq!(canonical_read["truncated"], false);
     assert_eq!(canonical_read["file_size_bytes"], SOURCE.len());
+    for field in [
+        "workspace",
+        "revision",
+        "start_line",
+        "end_line",
+        "next_offset",
+        "eof",
+        "truncated",
+        "truncation_reasons",
+        "truncated_line_numbers",
+    ] {
+        assert_eq!(
+            observed_before[0].1["result"][field], canonical_read[field],
+            "{field}"
+        );
+    }
     assert_eq!(
         canonical_read["content_digest"],
         json!(Digest::sha256(SOURCE.as_bytes()))

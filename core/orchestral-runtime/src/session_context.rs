@@ -1,10 +1,12 @@
 //! Replay-derived model context for the Generic Agent.
 
+mod inspection_receipts;
 mod live_source;
 mod model_assisted;
 pub mod observed_prefix;
 mod placement;
 mod pressure;
+mod soft_attempts;
 mod summary_continuation;
 
 pub use self::model_assisted::ModelAssistedSessionSummarizer;
@@ -196,14 +198,13 @@ impl AgentSessionContextEngine {
             });
         }
 
-        // Bound historical context (summaries and older exchanges outside the
         // Bound total historical context (all non-pinned groups outside the
         // current Run) so barriers or uncompacted historical islands cannot
         // accumulate across a long Session. Older historical groups beyond this
         // cap become deferred_ranges and remain accessible via session_read.
         let historical_token_allowance = input_budget
             .saturating_sub(pinned_tokens)
-            .min((input_budget / 4).clamp(4_096, 24_576));
+            .min((input_budget / 4).max(4_096));
         let historical_budget = pinned_tokens
             .saturating_add(historical_token_allowance)
             .min(input_budget);
@@ -443,10 +444,7 @@ fn replay_groups(
                 );
             }
             AgentSessionEvent::ToolExchangeCommitted {
-                assistant,
-                tool,
-                retained_artifacts,
-                ..
+                assistant, tool, ..
             } => {
                 groups.insert(
                     record.session_seq,
@@ -456,8 +454,10 @@ fn replay_groups(
                         source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
                         messages: vec![assistant.clone(), tool.clone()],
-                        pinned: record.run_id == *current_run_id || !retained_artifacts.is_empty(),
-                        active_compactable: retained_artifacts.is_empty(),
+                        // Artifact authorization comes from the original Session
+                        // and Tool Effect journals, not permanent context pinning.
+                        pinned: record.run_id == *current_run_id,
+                        active_compactable: true,
                     },
                 );
             }
@@ -827,7 +827,6 @@ impl SessionCompactionPolicy {
 }
 
 const COMPACTION_SOURCE_VOLUME_BYTES: usize = 64 * 1024;
-const KEEP_RECENT_MAX_VOLUME_BYTES: usize = 64 * 1024;
 
 fn record_payload_bytes(record: &AgentSessionRecord) -> usize {
     match &record.payload {
@@ -877,47 +876,34 @@ pub fn select_compaction_source(
         })
         .collect::<Vec<_>>();
     let is_shadowed = |seq: u64| shadowed.iter().any(|source| source.contains(seq));
-    let historical_unshadowed_bytes: usize = records
+    // Protect the newest original historical records, independently of how many
+    // records the active Run has appended. Summary records and their shadowed
+    // sources must not consume slots in this verbatim tail.
+    let historical_indices = records
         .iter()
-        .filter(|record| {
-            record.run_id != *current_run_id
+        .enumerate()
+        .filter_map(|(index, record)| {
+            (record.run_id != *current_run_id
                 && !is_shadowed(record.session_seq)
-                && !is_compaction_summary_record(record)
+                && !is_compaction_summary_record(record))
+            .then_some(index)
         })
-        .map(record_payload_bytes)
+        .collect::<Vec<_>>();
+    let historical_unshadowed_bytes: usize = historical_indices
+        .iter()
+        .map(|index| record_payload_bytes(&records[*index]))
         .sum();
-    if records.len() < minimum_records
+    if historical_indices.len() < minimum_records
         && historical_unshadowed_bytes < COMPACTION_SOURCE_VOLUME_BYTES
     {
         return None;
     }
-
-    let trailing_current_run_compactions = records
+    let source_len = *historical_indices
         .iter()
         .rev()
-        .take_while(|record| {
-            record.run_id == *current_run_id && is_compaction_summary_record(record)
-        })
-        .count();
-    let effective_len = records
-        .len()
-        .saturating_sub(trailing_current_run_compactions);
-    let mut source_len = effective_len.saturating_sub(policy.keep_recent_records);
-    let mut retained_recent_bytes = 0usize;
-    for index in (source_len..effective_len).rev() {
-        let record = &records[index];
-        if record.run_id == *current_run_id
-            || is_shadowed(record.session_seq)
-            || is_compaction_summary_record(record)
-        {
-            continue;
-        }
-        retained_recent_bytes = retained_recent_bytes.saturating_add(record_payload_bytes(record));
-        if retained_recent_bytes > KEEP_RECENT_MAX_VOLUME_BYTES {
-            source_len = index + 1;
-            break;
-        }
-    }
+        .nth(policy.keep_recent_records - 1)?;
+    // Large recent results remain protected. The volume threshold can make an
+    // older source eligible, but cannot silently consume the retained tail.
 
     let groups = if shadowed.is_empty() {
         None
@@ -967,14 +953,11 @@ pub fn select_compaction_source(
     for record in &records[..source_len] {
         let shadowed_record = is_shadowed(record.session_seq);
         let is_barrier = record.run_id == *current_run_id
-            || match &record.payload {
+            || matches!(
+                &record.payload,
                 AgentSessionEvent::SkillLoaded { .. }
-                | AgentSessionEvent::EffectUncertaintyCommitted { .. } => true,
-                AgentSessionEvent::ToolExchangeCommitted {
-                    retained_artifacts, ..
-                } => !retained_artifacts.is_empty(),
-                _ => false,
-            };
+                    | AgentSessionEvent::EffectUncertaintyCommitted { .. }
+            );
         if shadowed_record || is_barrier {
             // Any unshadowed historical segment before a shadowed range or a
             // historical barrier is already sealed and can no longer grow;
@@ -1043,9 +1026,7 @@ pub fn select_active_run_compaction_source(
     let mut live = BTreeSet::new();
     for record in records {
         match &record.payload {
-            AgentSessionEvent::ToolExchangeCommitted {
-                retained_artifacts, ..
-            } if record.run_id == *current_run_id && retained_artifacts.is_empty() => {
+            AgentSessionEvent::ToolExchangeCommitted { .. } if record.run_id == *current_run_id => {
                 live.insert(record.session_seq);
             }
             AgentSessionEvent::ActiveRunCompactionCommitted { source, .. } => {
@@ -1257,6 +1238,18 @@ pub struct SessionSummarizerDescriptor {
     pub config_digest: Digest,
 }
 
+/// One generated summary and the strategy that actually produced it.
+///
+/// A configured model summarizer can fall back without disguising an
+/// extractive excerpt as a completed semantic handoff. `fallback_reason` is a
+/// stable diagnostic code, never provider response text or transcript data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummaryGeneration {
+    pub message: ModelMessage,
+    pub descriptor: SessionSummarizerDescriptor,
+    pub fallback_reason: Option<String>,
+}
+
 impl SessionSummarizerDescriptor {
     pub fn validate(&self) -> Result<(), SessionContextError> {
         if self.strategy.trim().is_empty()
@@ -1291,7 +1284,7 @@ impl DeterministicExtractiveSessionSummarizer {
             ));
         }
         let config = serde_json::json!({
-            "contract": "deterministic-extractive-session-summary/v7",
+            "contract": "deterministic-extractive-session-summary/v8",
             "max_summary_chars": max_summary_chars,
         });
         let bytes = serde_jcs::to_vec(&config).map_err(|error| {
@@ -1304,7 +1297,7 @@ impl DeterministicExtractiveSessionSummarizer {
             descriptor: SessionSummarizerDescriptor {
                 strategy: "deterministic-extractive".to_owned(),
                 model: None,
-                version: "7".to_owned(),
+                version: "8".to_owned(),
                 config_digest: Digest::sha256(bytes),
             },
         })
@@ -1329,8 +1322,22 @@ struct ExtractiveCandidate {
 
 #[async_trait]
 impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
+    fn may_call_model(&self) -> bool {
+        false
+    }
+
     fn descriptor(&self) -> SessionSummarizerDescriptor {
         self.descriptor.clone()
+    }
+
+    async fn generate_with_char_budget(
+        &self,
+        input: SessionCompactionInput,
+        max_chars: usize,
+    ) -> Result<SessionSummaryGeneration, SessionContextError> {
+        Self::new(self.max_summary_chars.min(max_chars))?
+            .generate(input)
+            .await
     }
 
     async fn summarize_with_char_budget(
@@ -1431,6 +1438,71 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
         let mut remaining = self
             .max_summary_chars
             .saturating_sub(header.chars().count());
+        // A single Artifact page has a smaller, already validated continuation
+        // receipt. Reserve that complete receipt before the more detailed JSON
+        // index, but only if all other inspections remain represented or have
+        // an explicit retrievable omission. Mixed exchanges stay in the index.
+        let mut observations = Vec::new();
+        let mut continuation_groups = BTreeSet::new();
+        for candidate in candidates.iter().rev() {
+            let Some(continuation) = &candidate.continuation_observation else {
+                continue;
+            };
+            let contents = input.groups[candidate.index]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content);
+            if contents
+                .clone()
+                .filter(|content| matches!(content, ModelContent::ToolCall { .. }))
+                .count()
+                != 1
+                || contents
+                    .filter(|content| matches!(content, ModelContent::ToolResult { .. }))
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let chars = continuation.chars().count() + 2;
+            let Some(after) = remaining.checked_sub(chars) else {
+                continue;
+            };
+            continuation_groups.insert(candidate.index);
+            let budget = if after < 512 { after } else { after / 2 };
+            let others = input
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !continuation_groups.contains(index))
+                .map(|(_, group)| group);
+            if inspection_receipts::inspection_receipts(others, budget.saturating_sub(2)).is_err() {
+                continuation_groups.remove(&candidate.index);
+                continue;
+            }
+            observations.push(continuation.clone());
+            remaining = after;
+        }
+        // File and remaining Artifact observations keep atomic JSON. Omissions
+        // identify original journal records, never clipped paths or revisions.
+        let receipt_budget = if remaining < 512 {
+            remaining
+        } else {
+            remaining / 2
+        };
+        let receipt_groups = input
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !continuation_groups.contains(index))
+            .map(|(_, group)| group);
+        let receipts = inspection_receipts::inspection_receipts(
+            receipt_groups,
+            receipt_budget.saturating_sub(2),
+        )?;
+        if let Some(receipts) = &receipts {
+            remaining = remaining.saturating_sub(receipts.chars().count() + 2);
+        }
         // Relevance scores alone can keep old failures and source listings
         // while losing current observations. Reserve space for recent Tool
         // results independently of vocabulary, retaining the latest occurrence
@@ -1440,9 +1512,11 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
         } else {
             remaining
         };
-        let mut observations = Vec::new();
         let mut seen_calls = BTreeSet::new();
         for candidate in candidates.iter().rev() {
+            if continuation_groups.contains(&candidate.index) {
+                continue;
+            }
             let Some((key, observation)) = &candidate.tool_observation else {
                 continue;
             };
@@ -1545,6 +1619,10 @@ impl AgentSessionSummarizer for DeterministicExtractiveSessionSummarizer {
         }
         selected.sort_by_key(|(index, _)| *index);
         let mut summary = header;
+        if let Some(receipts) = receipts {
+            summary.push_str("\n\n");
+            summary.push_str(&receipts);
+        }
         for observation in observations {
             summary.push_str("\n\n");
             summary.push_str(&observation);
@@ -1982,6 +2060,14 @@ fn sanitize_inline_data_payloads(text: &str) -> String {
 pub trait AgentSessionSummarizer: Send + Sync {
     fn descriptor(&self) -> SessionSummarizerDescriptor;
 
+    /// Whether generation may issue an additional, separately metered model
+    /// request. Unknown external implementations default conservatively to
+    /// true. Such summarizers cannot run under cumulative Run usage ceilings
+    /// until summary usage participates in the Run's reservation ledger.
+    fn may_call_model(&self) -> bool {
+        true
+    }
+
     async fn summarize(
         &self,
         input: SessionCompactionInput,
@@ -1997,6 +2083,33 @@ pub trait AgentSessionSummarizer: Send + Sync {
         _max_chars: usize,
     ) -> Result<ModelMessage, SessionContextError> {
         self.summarize(input).await
+    }
+
+    /// Generate with per-result provenance. The default preserves existing
+    /// summarizer implementations; adaptive implementations should report
+    /// their actual strategy and any fallback rather than their configured one.
+    async fn generate(
+        &self,
+        input: SessionCompactionInput,
+    ) -> Result<SessionSummaryGeneration, SessionContextError> {
+        Ok(SessionSummaryGeneration {
+            message: self.summarize(input).await?,
+            descriptor: self.descriptor(),
+            fallback_reason: None,
+        })
+    }
+
+    /// The provenance-bearing equivalent of `summarize_with_char_budget`.
+    async fn generate_with_char_budget(
+        &self,
+        input: SessionCompactionInput,
+        max_chars: usize,
+    ) -> Result<SessionSummaryGeneration, SessionContextError> {
+        Ok(SessionSummaryGeneration {
+            message: self.summarize_with_char_budget(input, max_chars).await?,
+            descriptor: self.descriptor(),
+            fallback_reason: None,
+        })
     }
 }
 
@@ -2056,6 +2169,7 @@ pub struct AgentSessionCompactor {
     summarizer: Arc<dyn AgentSessionSummarizer>,
     summarizer_descriptor: SessionSummarizerDescriptor,
     policy: SessionCompactionPolicy,
+    soft_attempts: std::sync::Mutex<soft_attempts::SoftCompactionAttempts>,
 }
 
 impl AgentSessionCompactor {
@@ -2072,6 +2186,7 @@ impl AgentSessionCompactor {
             summarizer,
             summarizer_descriptor,
             policy,
+            soft_attempts: std::sync::Mutex::new(soft_attempts::SoftCompactionAttempts::default()),
         })
     }
 
@@ -2081,6 +2196,10 @@ impl AgentSessionCompactor {
 
     pub fn summarizer_descriptor(&self) -> &SessionSummarizerDescriptor {
         &self.summarizer_descriptor
+    }
+
+    pub fn may_call_model(&self) -> bool {
+        self.summarizer.may_call_model()
     }
 
     pub async fn has_compaction_candidate(
@@ -2098,12 +2217,42 @@ impl AgentSessionCompactor {
         session_id: &AgentSessionId,
         current_run_id: &RunId,
     ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        self.compact_history(session_id, current_run_id, true).await
+    }
+
+    pub async fn compact_history_for_working_set(
+        &self,
+        session_id: &AgentSessionId,
+        current_run_id: &RunId,
+    ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        match self
+            .compact_history(session_id, current_run_id, false)
+            .await
+        {
+            Err(SessionContextError::Compaction(reason)) => {
+                tracing::warn!(%reason, %session_id,
+                    "soft history compaction unavailable; original context retained");
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
+    async fn compact_history(
+        &self,
+        session_id: &AgentSessionId,
+        current_run_id: &RunId,
+        allow_fallback: bool,
+    ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
         let records = self.journal.load_session(session_id).await?;
         validate_session_trace(session_id, &records)?;
         let Some(source) = select_compaction_source(&records, current_run_id, &self.policy) else {
             return Ok(None);
         };
         let source_digest = session_range_digest(&records, &source)?;
+        if !allow_fallback && !self.begin_soft_attempt(session_id, current_run_id, &source_digest) {
+            return Ok(None);
+        }
         let policy_digest = self.policy.digest()?;
         let groups = replay_groups(&records, current_run_id, &BTreeMap::new())?;
         let source_groups = original_compaction_groups(&records, &source)?;
@@ -2112,15 +2261,22 @@ impl AgentSessionCompactor {
             .filter(|group| group.pinned && !source.contains(group.producer_seq))
             .flat_map(|group| group.messages.clone())
             .collect();
-        let summary = self
+        let generation = self
             .summarizer
-            .summarize(SessionCompactionInput {
+            .generate(SessionCompactionInput {
                 session_id: session_id.clone(),
                 source: source.clone(),
                 groups: source_groups,
                 focus_messages,
             })
             .await?;
+        if !allow_fallback && generation.fallback_reason.is_some() {
+            tracing::warn!(reason = ?generation.fallback_reason, %session_id,
+                "history compaction deferred; semantic handoff unavailable");
+            return Ok(None);
+        }
+        let descriptor = actual_summary_descriptor(&generation)?;
+        let summary = generation.message;
         summary.validate().map_err(|error| {
             SessionContextError::Compaction(format!("invalid summary message: {error}"))
         })?;
@@ -2145,11 +2301,11 @@ impl AgentSessionCompactor {
                     source,
                     source_digest,
                     policy_digest,
-                    summary_config_digest: self.summarizer_descriptor.config_digest.clone(),
+                    summary_config_digest: descriptor.config_digest,
                     summary,
-                    strategy: self.summarizer_descriptor.strategy.clone(),
-                    model: self.summarizer_descriptor.model.clone(),
-                    version: self.summarizer_descriptor.version.clone(),
+                    strategy: descriptor.strategy,
+                    model: descriptor.model,
+                    version: descriptor.version,
                 },
             })
             .await?;
@@ -2183,19 +2339,20 @@ impl AgentSessionCompactor {
             .filter(|group| group.pinned && !source.contains(group.producer_seq))
             .flat_map(|group| group.messages.clone())
             .collect();
-        let summary = self
+        let generation = self
             .summarizer
-            .summarize(SessionCompactionInput {
+            .generate(SessionCompactionInput {
                 session_id: session_id.clone(),
                 source: source.clone(),
                 groups: source_groups,
                 focus_messages,
             })
             .await?;
-        self.commit_active_run_summary(&records, current_run_id, source, summary)
+        self.commit_active_run_generation(&records, current_run_id, source, generation)
             .await
     }
 
+    #[cfg(test)]
     async fn commit_active_run_summary(
         &self,
         records: &[AgentSessionRecord],
@@ -2203,6 +2360,28 @@ impl AgentSessionCompactor {
         source: SessionSourceRange,
         summary: ModelMessage,
     ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        self.commit_active_run_generation(
+            records,
+            current_run_id,
+            source,
+            SessionSummaryGeneration {
+                message: summary,
+                descriptor: self.summarizer_descriptor.clone(),
+                fallback_reason: None,
+            },
+        )
+        .await
+    }
+
+    async fn commit_active_run_generation(
+        &self,
+        records: &[AgentSessionRecord],
+        current_run_id: &RunId,
+        source: SessionSourceRange,
+        generation: SessionSummaryGeneration,
+    ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        let descriptor = actual_summary_descriptor(&generation)?;
+        let summary = generation.message;
         let session_id = &records[0].session_id;
         let groups = replay_groups(records, current_run_id, &BTreeMap::new())?;
         if !live_source::valid_active_source(&groups, records, &source, current_run_id) {
@@ -2238,16 +2417,30 @@ impl AgentSessionCompactor {
                     source,
                     source_digest,
                     policy_digest,
-                    summary_config_digest: self.summarizer_descriptor.config_digest.clone(),
+                    summary_config_digest: descriptor.config_digest,
                     summary,
-                    strategy: self.summarizer_descriptor.strategy.clone(),
-                    model: self.summarizer_descriptor.model.clone(),
-                    version: self.summarizer_descriptor.version.clone(),
+                    strategy: descriptor.strategy,
+                    model: descriptor.model,
+                    version: descriptor.version,
                 },
             })
             .await?;
         Ok(Some(appended.record))
     }
+}
+
+fn actual_summary_descriptor(
+    generation: &SessionSummaryGeneration,
+) -> Result<SessionSummarizerDescriptor, SessionContextError> {
+    let mut descriptor = generation.descriptor.clone();
+    descriptor.validate()?;
+    if let Some(reason) = &generation.fallback_reason {
+        // Persist provenance without changing the durable event schema. Older
+        // readers already treat strategy as an opaque descriptor string.
+        descriptor.strategy = format!("{}/fallback:{reason}", descriptor.strategy);
+        tracing::warn!(%reason, strategy = %descriptor.strategy, "session summary used fallback");
+    }
+    Ok(descriptor)
 }
 
 #[cfg(test)]
@@ -2557,7 +2750,7 @@ mod tests {
                 _ => panic!("expected compaction record"),
             };
         assert_eq!(source.first_session_seq, 1);
-        assert_eq!(source.last_session_seq, 5);
+        assert_eq!(source.last_session_seq, 4);
         let records = store
             .load_session(&AgentSessionId::new("session-1"))
             .await
@@ -2599,7 +2792,7 @@ mod tests {
             .iter()
             .map(|message| serde_json::to_string(message).unwrap())
             .collect::<Vec<_>>();
-        assert!(rendered[0].contains("summary of 5 messages"));
+        assert!(rendered[0].contains("summary of 4 messages"));
         assert!(!rendered.join(" ").contains("old-1"));
         assert!(rendered.last().unwrap().contains("current-input"));
     }
@@ -3812,8 +4005,17 @@ mod tests {
                 let second = select_compaction_source(&records, &current_run_id, &policy);
                 assert_eq!(first, second);
 
-                let source_len = record_count.saturating_sub(keep_recent_records);
-                let expected = if record_count < minimum_source_records + keep_recent_records {
+                let historical_sequences = (1..=record_count as u64)
+                    .filter(|sequence| *sequence != current_sequence)
+                    .collect::<Vec<_>>();
+                let source_len = historical_sequences
+                    .iter()
+                    .rev()
+                    .nth(keep_recent_records - 1)
+                    .map_or(0, |sequence| (*sequence - 1) as usize);
+                let expected = if historical_sequences.len()
+                    < minimum_source_records + keep_recent_records
+                {
                     None
                 } else if current_sequence as usize > source_len {
                     Some(SessionSourceRange {
@@ -3843,7 +4045,13 @@ mod tests {
                     assert!(source_records
                         .iter()
                         .all(|record| record.run_id != current_run_id));
-                    assert!(source.last_session_seq as usize <= record_count - keep_recent_records);
+                    assert!(
+                        historical_sequences
+                            .iter()
+                            .filter(|sequence| **sequence > source.last_session_seq)
+                            .count()
+                            >= keep_recent_records
+                    );
                     assert!(session_range_digest(&records, &source).unwrap().is_sha256());
                     selected += 1;
                 } else {
@@ -3858,7 +4066,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_advances_around_artifact_and_uncertain_effect_barriers() {
+    fn compaction_includes_artifacts_and_advances_around_uncertain_effect_barriers() {
         let session_id = AgentSessionId::new("barrier-session");
         let old_run_id = RunId::new("barrier-old-run");
         let current_run_id = RunId::new("barrier-current-run");
@@ -3917,7 +4125,7 @@ mod tests {
             first,
             SessionSourceRange {
                 first_session_seq: 1,
-                last_session_seq: 3,
+                last_session_seq: 7,
             }
         );
         let source_digest = session_range_digest(&records, &first).unwrap();
@@ -3955,8 +4163,8 @@ mod tests {
         assert_eq!(
             second,
             SessionSourceRange {
-                first_session_seq: 5,
-                last_session_seq: 7,
+                first_session_seq: 9,
+                last_session_seq: 12,
             }
         );
     }
@@ -4227,7 +4435,17 @@ mod tests {
                 let rendered = serde_json::to_string(&projection.messages).unwrap();
                 assert!(rendered.contains("stable system policy"));
                 assert!(rendered.contains(&format!("current-task-{history_index}")));
-                assert!(rendered.contains(artifact.artifact_ref.as_str()));
+                let artifact_selected = selected.iter().any(|seq| {
+                    matches!(
+                        &records[(*seq - 1) as usize].payload,
+                        AgentSessionEvent::ToolExchangeCommitted { retained_artifacts, .. }
+                            if retained_artifacts.contains(&artifact)
+                    )
+                });
+                assert_eq!(
+                    rendered.contains(artifact.artifact_ref.as_str()),
+                    artifact_selected
+                );
                 assert!(rendered.contains(&uncertain_effect_call));
                 assert!(rendered.contains(&uncertain_model_call));
                 assert!(rendered.contains(&format!("pending-input-call-{history_index}")));
@@ -4361,3 +4579,6 @@ mod tests {
         assert_eq!(groups[&2].messages[0], current_image);
     }
 }
+
+#[cfg(test)]
+mod historical_retention_tests;

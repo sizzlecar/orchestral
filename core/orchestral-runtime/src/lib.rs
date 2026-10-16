@@ -57,6 +57,7 @@ pub use session_context::{
     DeterministicExtractiveSessionSummarizer, JsonSizeTokenMeter, ModelAssistedSessionSummarizer,
     SessionCompactionGroup, SessionCompactionInput, SessionCompactionPolicy, SessionContextError,
     SessionContextProjection, SessionContextRequest, SessionSummarizerDescriptor,
+    SessionSummaryGeneration,
 };
 pub use skill::{
     LoadedSkillSet, SkillConflict, SkillLoadOutcome, SkillRoot, SkillRuntime, SkillRuntimeError,

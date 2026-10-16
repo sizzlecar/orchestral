@@ -359,6 +359,12 @@ async fn build_agent_host_with_journals(
         max_tool_calls: config.agent.max_tool_calls,
     };
     agent_config.history_limit = config.agent.history_limit;
+    if config.agent.compaction.working_set_tokens == Some(0)
+        || config.agent.compaction.model_timeout_secs == 0
+    {
+        anyhow::bail!("compaction working_set_tokens and model_timeout_secs must be positive");
+    }
+    agent_config.compaction_working_set_tokens = config.agent.compaction.working_set_tokens;
     let declared_context_capacity = model_descriptor.capabilities.max_context_tokens;
     agent_config.max_context_tokens = model_context_budget(&config, declared_context_capacity);
     let (output_budget, output_budget_source) = model_output_budget(
@@ -568,6 +574,7 @@ async fn build_agent_host_with_journals(
     let (skills, skill_manager) =
         build_skill_setup(&config, &workspaces.primary, options.no_skills)?;
     let summarizer_backend = model_backend.clone();
+    let summarizer_token_meter = token_meter.clone();
     let provider = match skills.clone() {
         Some(skills) => {
             InternalGenericAgentProvider::new_with_tools_approval_skills_and_session_journal(
@@ -600,7 +607,13 @@ async fn build_agent_host_with_journals(
                     Some(model.clone()),
                     config.agent.compaction.summary_max_chars,
                 )
-                .context("configure model-assisted Session summarizer")?,
+                .context("configure model-assisted Session summarizer")?
+                .with_token_meter(summarizer_token_meter)
+                .context("configure Session summarizer token meter")?
+                .with_request_timeout(Duration::from_secs(
+                    config.agent.compaction.model_timeout_secs,
+                ))
+                .context("configure Session summarizer timeout")?,
             ),
             SessionSummarizerStrategy::DeterministicExtractive => Arc::new(
                 DeterministicExtractiveSessionSummarizer::new(

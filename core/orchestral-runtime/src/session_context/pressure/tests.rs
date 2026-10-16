@@ -4,6 +4,7 @@ use orchestral_core::agent_session::InMemoryAgentSessionJournalStore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod live_ranges;
+mod soft_attempts;
 
 #[tokio::test]
 async fn compacting_the_latest_exchange_leaves_input_context_and_replays_without_changing_history()
@@ -699,7 +700,7 @@ async fn historical_context_budget_caps_accumulated_summaries_and_summarizer_eli
     assert!(!text.contains(&"A".repeat(64)));
 
     // Multiple historical compaction summaries separated by barriers must be capped
-    // by the historical context budget (25% of input budget, max 24K tokens),
+    // by the historical context budget (25% of input budget),
     // deferring older summaries instead of accumulating without bound.
     let fixture = Fixture::new(&[], "initial").await;
     let compactor = fixture.compactor(default_summarizer());
@@ -734,7 +735,174 @@ async fn historical_context_budget_caps_accumulated_summaries_and_summarizer_eli
     let projected = fixture.engine.project(request).await.unwrap();
     assert!(
         !projected.deferred_ranges.is_empty(),
-        "older historical summaries exceeding the 24K historical budget cap must be deferred"
+        "older historical summaries exceeding this request's historical allowance must be deferred"
     );
     assert!(projected.used_input_tokens <= 28_000);
+    let mut large_request = fixture.request(1_000_000);
+    large_request.history_limit = 64;
+    let large_projection = fixture.engine.project(large_request).await.unwrap();
+    assert!(large_projection.deferred_ranges.is_empty());
+    let text = serde_json::to_string(&large_projection.messages).unwrap();
+    for index in 0..6 {
+        assert!(text.contains(&format!("summary-{index}:")));
+    }
+}
+
+#[tokio::test]
+async fn soft_pressure_preserves_the_configured_recent_exchanges_across_repeated_calls() {
+    let fixture = Fixture::new(&[8_000; 6], "Inspect and implement").await;
+    let compactor = AgentSessionCompactor::new(
+        fixture.store.clone(),
+        default_summarizer(),
+        SessionCompactionPolicy {
+            minimum_source_records: 2,
+            keep_recent_records: 3,
+        },
+    )
+    .unwrap();
+    let originals = fixture.records().await;
+    let recent = originals[originals.len() - 3..].to_vec();
+    let compacted = compactor
+        .compact_active_run_for_working_set(
+            &fixture.engine,
+            fixture.request(10_000),
+            ContextTokenPolicy::UpperBound,
+        )
+        .await
+        .unwrap()
+        .expect("older exchanges can be summarized");
+    let AgentSessionEvent::ActiveRunCompactionCommitted { source, .. } = compacted.payload else {
+        panic!("expected active summary");
+    };
+    assert!(recent
+        .iter()
+        .all(|record| !source.contains(record.session_seq)));
+    let before = fixture.records().await;
+    assert!(compactor
+        .compact_active_run_for_working_set(
+            &fixture.engine,
+            fixture.request(1_000),
+            ContextTokenPolicy::UpperBound,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(fixture.records().await, before);
+    let groups = replay_groups(&before, &RunId::new("current"), &BTreeMap::new()).unwrap();
+    for original in recent {
+        let AgentSessionEvent::ToolExchangeCommitted {
+            assistant, tool, ..
+        } = original.payload
+        else {
+            panic!("tool result");
+        };
+        let group = groups
+            .values()
+            .find(|group| group.producer_seq == original.session_seq)
+            .unwrap();
+        assert_eq!(group.messages, vec![assistant, tool]);
+    }
+}
+
+#[tokio::test]
+async fn soft_pressure_does_not_summarize_when_only_the_recent_tail_remains() {
+    let fixture = Fixture::new(&[40_000; 3], "Keep complete recent observations").await;
+    let compactor = AgentSessionCompactor::new(
+        fixture.store.clone(),
+        default_summarizer(),
+        SessionCompactionPolicy {
+            minimum_source_records: 2,
+            keep_recent_records: 16,
+        },
+    )
+    .unwrap();
+    let before = fixture.records().await;
+    assert!(compactor
+        .compact_active_run_for_working_set(
+            &fixture.engine,
+            fixture.request(20_000),
+            ContextTokenPolicy::UpperBound,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(fixture.records().await, before);
+}
+
+struct FallbackSummarizer;
+
+#[async_trait]
+impl AgentSessionSummarizer for FallbackSummarizer {
+    fn descriptor(&self) -> SessionSummarizerDescriptor {
+        SessionSummarizerDescriptor {
+            strategy: "model-assisted".to_owned(),
+            model: Some("test".to_owned()),
+            version: "1".to_owned(),
+            config_digest: Digest::sha256("fallback fixture"),
+        }
+    }
+    async fn summarize(
+        &self,
+        _input: SessionCompactionInput,
+    ) -> Result<ModelMessage, SessionContextError> {
+        Ok(ModelMessage::text(
+            ModelRole::Assistant,
+            "recover originals through session_read",
+        ))
+    }
+    async fn generate(
+        &self,
+        input: SessionCompactionInput,
+    ) -> Result<SessionSummaryGeneration, SessionContextError> {
+        Ok(SessionSummaryGeneration {
+            message: self.summarize(input).await?,
+            descriptor: DeterministicExtractiveSessionSummarizer::new(1024)?.descriptor(),
+            fallback_reason: Some("model_timeout".to_owned()),
+        })
+    }
+    async fn generate_with_char_budget(
+        &self,
+        input: SessionCompactionInput,
+        _: usize,
+    ) -> Result<SessionSummaryGeneration, SessionContextError> {
+        self.generate(input).await
+    }
+}
+
+#[tokio::test]
+async fn soft_summary_failure_keeps_raw_context_and_hard_fallback_records_actual_provenance() {
+    let fixture = Fixture::new(&[40_000; 4], "Continue the current task").await;
+    let compactor = fixture.compactor(Arc::new(FallbackSummarizer));
+    let before = fixture.records().await;
+    assert!(compactor
+        .compact_active_run_for_working_set(
+            &fixture.engine,
+            fixture.request(10_000),
+            ContextTokenPolicy::UpperBound,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(fixture.records().await, before);
+    let record = compactor
+        .compact_active_run_for_context(
+            &fixture.engine,
+            fixture.request(10_000),
+            ContextTokenPolicy::UpperBound,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentSessionEvent::ActiveRunCompactionCommitted {
+        strategy,
+        model,
+        version,
+        ..
+    } = record.payload
+    else {
+        panic!("active summary");
+    };
+    assert_eq!(strategy, "deterministic-extractive/fallback:model_timeout");
+    assert_eq!(model, None);
+    assert_eq!(version, "8");
 }

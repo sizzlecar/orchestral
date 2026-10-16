@@ -256,6 +256,66 @@ async fn reference_requires_committed_producer_and_registered_session_before_blo
 }
 
 #[tokio::test]
+async fn compacting_artifact_context_preserves_authorization_after_restart() {
+    let scope = TestSessionScope::new().await;
+    let fixture = fixture();
+    let blobs = Arc::new(ProbeBlobStore::default());
+    let artifacts = store(blobs.clone());
+    let runtime = page_runtime(&fixture, artifacts.clone(), Some(&scope));
+    let artifact = produce(&runtime, &fixture, "run", "source").await;
+    scope.commit("session", "run", "source", &artifact).await;
+    let before = scope
+        .sessions
+        .load_session(&AgentSessionId::new("session"))
+        .await
+        .unwrap();
+    let producer = before.last().unwrap().clone();
+    let compactor = orchestral_runtime::AgentSessionCompactor::new(
+        scope.sessions.clone(),
+        Arc::new(orchestral_runtime::DeterministicExtractiveSessionSummarizer::new(4096).unwrap()),
+        orchestral_runtime::SessionCompactionPolicy {
+            minimum_source_records: 1,
+            keep_recent_records: 1,
+        },
+    )
+    .unwrap();
+    let summary = compactor
+        .compact_active_run_for_pressure(&AgentSessionId::new("session"), &RunId::new("run"))
+        .await
+        .unwrap()
+        .expect("an artifact exchange is compactable");
+    let AgentSessionEvent::ActiveRunCompactionCommitted {
+        source, summary, ..
+    } = summary.payload
+    else {
+        panic!("expected active compaction");
+    };
+    assert!(source.contains(producer.session_seq));
+    assert!(serde_json::to_string(&summary)
+        .unwrap()
+        .contains(artifact.artifact.artifact_ref.as_str()));
+    assert_eq!(
+        scope
+            .sessions
+            .load_session(&AgentSessionId::new("session"))
+            .await
+            .unwrap()[(producer.session_seq - 1) as usize],
+        producer
+    );
+    drop(runtime);
+    let restarted = page_runtime(&fixture, artifacts, Some(&scope));
+    let result =
+        completed(read(&restarted, &fixture, "later", "after-compaction", &artifact).await);
+    assert_eq!(result["digest"], json!(artifact.artifact.digest));
+    let read_count = blobs.reads.load(Ordering::SeqCst);
+    rejected_with(
+        read(&restarted, &fixture, "foreign", "still-denied", &artifact).await,
+        "artifact_reference_invalid",
+    );
+    assert_eq!(blobs.reads.load(Ordering::SeqCst), read_count);
+}
+
+#[tokio::test]
 async fn copied_foreign_producer_does_not_grant_artifact_access() {
     let scope = TestSessionScope::new().await;
     let fixture = fixture();

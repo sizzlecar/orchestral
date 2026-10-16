@@ -317,12 +317,37 @@ async fn assistant_summary_and_repeated_compaction_keep_the_original_history_pos
     );
 }
 
-fn barriers() -> Vec<AgentSessionEvent> {
+fn artifact_exchange() -> AgentSessionEvent {
     let call = ModelToolCallId::new("retained-call");
     let artifact = ArtifactRefWithDigest {
         artifact_ref: ArtifactRef::new("retained-artifact"),
         digest: Digest::sha256("retained-content"),
     };
+    AgentSessionEvent::ToolExchangeCommitted {
+        request_id: ModelRequestId::new("retained-request"),
+        assistant: ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::ToolCall {
+                call_id: call.clone(),
+                name: "inspect".into(),
+                arguments: json!({}),
+                extensions: Default::default(),
+            }],
+        },
+        tool: ModelMessage {
+            role: ModelRole::Tool,
+            content: vec![ModelContent::ToolResult {
+                call_id: call,
+                result: json!({"kind": "artifact", "artifact": artifact.clone()}),
+                is_error: false,
+            }],
+        },
+        retained_artifacts: vec![artifact],
+        usage: None,
+    }
+}
+
+fn barriers() -> Vec<AgentSessionEvent> {
     vec![
         AgentSessionEvent::RunInputCommitted {
             message: ModelMessage::text(ModelRole::User, "Correction: preserve the existing mode"),
@@ -332,28 +357,6 @@ fn barriers() -> Vec<AgentSessionEvent> {
             model_call_id: ModelToolCallId::new("uncertain-call"),
             tool_name: "update".into(),
             message: "The operation may already have happened".into(),
-        },
-        AgentSessionEvent::ToolExchangeCommitted {
-            request_id: ModelRequestId::new("retained-request"),
-            assistant: ModelMessage {
-                role: ModelRole::Assistant,
-                content: vec![ModelContent::ToolCall {
-                    call_id: call.clone(),
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                    extensions: Default::default(),
-                }],
-            },
-            tool: ModelMessage {
-                role: ModelRole::Tool,
-                content: vec![ModelContent::ToolResult {
-                    call_id: call,
-                    result: json!({"artifact": artifact.clone()}),
-                    is_error: false,
-                }],
-            },
-            retained_artifacts: vec![artifact],
-            usage: None,
         },
         AgentSessionEvent::SkillLoaded {
             load: Box::new(SkillLoad {
@@ -374,6 +377,98 @@ fn barriers() -> Vec<AgentSessionEvent> {
             }),
         },
     ]
+}
+
+#[tokio::test]
+async fn artifact_exchanges_compact_atomically_and_keep_references_across_recompaction() {
+    let fixture = Fixture::new();
+    append_input(
+        &fixture.store,
+        1,
+        "current",
+        "Inspect the repository".into(),
+    )
+    .await;
+    append_tool_exchange(&fixture.store, 1, "current", 7000).await;
+    let artifact = fixture.append(artifact_exchange()).await;
+    append_tool_exchange(&fixture.store, 2, "current", 7000).await;
+    append_tool_exchange(&fixture.store, 3, "current", 7000).await;
+    let before = fixture.records().await;
+    let historical = replay_groups(&before, &RunId::new("later"), &BTreeMap::new()).unwrap();
+    assert!(!historical[&artifact.session_seq].pinned);
+    assert!(historical[&artifact.session_seq].active_compactable);
+
+    let first = fixture
+        .compactor()
+        .compact_active_run_for_pressure(&AgentSessionId::new("session-1"), &RunId::new("current"))
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentSessionEvent::ActiveRunCompactionCommitted { source, .. } = &first.payload else {
+        panic!("expected active compaction");
+    };
+    assert_eq!(
+        *source,
+        SessionSourceRange {
+            first_session_seq: 2,
+            last_session_seq: 4
+        }
+    );
+    assert!(serde_json::to_string(&saved_summary(&first))
+        .unwrap()
+        .contains("retained-artifact"));
+    append_tool_exchange(&fixture.store, 4, "current", 7000).await;
+    append_tool_exchange(&fixture.store, 5, "current", 7000).await;
+    let second = fixture
+        .compactor()
+        .compact_active_run_for_pressure(&AgentSessionId::new("session-1"), &RunId::new("current"))
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentSessionEvent::ActiveRunCompactionCommitted { source, .. } = &second.payload else {
+        panic!("expected repeated active compaction");
+    };
+    let records = fixture.records().await;
+    assert_eq!(records[(artifact.session_seq - 1) as usize], artifact);
+    let originals = original_compaction_groups(&records, source).unwrap();
+    assert_eq!(
+        originals
+            .iter()
+            .filter(|group| group.source.contains(artifact.session_seq))
+            .count(),
+        1
+    );
+    let projection = fixture
+        .engine()
+        .project(fixture.request(50_000))
+        .await
+        .unwrap();
+    let text = serde_json::to_string(&projection.messages).unwrap();
+    assert!(text.contains("retained-artifact"));
+    assert!(!text.contains("retained-call"));
+    let calls = projection
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|content| matches!(content, ModelContent::ToolCall { .. }))
+        .count();
+    let results = projection
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|content| matches!(content, ModelContent::ToolResult { .. }))
+        .count();
+    assert_eq!(calls, results);
+    let restarted = fixture.restart().await;
+    assert_eq!(
+        restarted
+            .engine()
+            .project(restarted.request(50_000))
+            .await
+            .unwrap()
+            .messages,
+        projection.messages
+    );
 }
 
 #[tokio::test]
@@ -536,11 +631,11 @@ async fn historical_summary_keeps_cross_run_user_anchor_and_disjoint_provenance(
 }
 
 #[tokio::test]
-async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_barrier() {
+async fn historical_artifacts_compact_with_older_history_while_bulky_recent_tail_is_retained() {
     let fixture = Fixture::new();
     let policy = SessionCompactionPolicy {
         minimum_source_records: 32,
-        keep_recent_records: 16,
+        keep_recent_records: 4,
     };
     let compactor = AgentSessionCompactor::new(
         fixture.store.clone(),
@@ -550,7 +645,7 @@ async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_
     .unwrap();
 
     // 1..=10: an earlier segment that is shorter than minimum_source_records (32)
-    // and contains a large inline payload before an artifact barrier at seq 11.
+    // and contains a large inline payload followed by an Artifact at seq 11.
     for index in 1..=9 {
         append_input(
             &fixture.store,
@@ -599,8 +694,8 @@ async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_
         .await
         .unwrap();
 
-    // 12..=16: fewer than keep_recent_records (16), but 12..=14 are bulky
-    // tool exchanges (> 64 KB total) that must not hide inside keep_recent.
+    // 12..=15 are the four newest historical records. Even though their
+    // payload exceeds 64 KiB, current Run growth must not consume this tail.
     for index in 12..=14 {
         append_tool_exchange(&fixture.store, index, "run-2", 32 * 1024).await;
     }
@@ -611,7 +706,7 @@ async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_
         .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
         .await
         .unwrap()
-        .expect("sealed island before artifact barrier must compact");
+        .expect("older history, including its artifact exchange, must compact");
     let AgentSessionEvent::CompactionCommitted {
         source: first_source,
         ..
@@ -623,24 +718,9 @@ async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_
         *first_source,
         SessionSourceRange {
             first_session_seq: 1,
-            last_session_seq: 10,
+            last_session_seq: 11,
         }
     );
-
-    let second = compactor
-        .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
-        .await
-        .unwrap()
-        .expect("oversized post-barrier segment must compact without crossing displaced summary");
-    let AgentSessionEvent::CompactionCommitted {
-        source: second_source,
-        ..
-    } = &second.payload
-    else {
-        panic!("expected second historical compaction");
-    };
-    assert_eq!(second_source.first_session_seq, 12);
-    assert!(second_source.last_session_seq >= 13);
 
     assert!(compactor
         .compact_if_needed(&AgentSessionId::new("session-1"), &RunId::new("current"))
@@ -653,7 +733,11 @@ async fn sealed_historical_island_and_bulky_recent_tail_compact_across_artifact_
         .project(fixture.request(500_000))
         .await
         .unwrap();
-    assert!(projected.used_input_tokens < 40_000);
+    let rendered = serde_json::to_string(&projected.messages).unwrap();
+    assert!(rendered.contains("barrier-artifact-ref"));
+    for index in 12..=14 {
+        assert!(rendered.contains(&format!("active-call-{index}")));
+    }
     let restarted = fixture.restart().await;
     let replayed = restarted
         .engine()
