@@ -107,6 +107,23 @@ fn model_or_tool_progress_replaces_a_stale_recovery_notice() {
     );
     assert!(state.working_detail.is_none());
     assert!(state.ui_notice.is_none());
+    update(
+        &mut state,
+        UiMsg::ProgressReported {
+            summary: "Compacting conversation history…".into(),
+        },
+    );
+    assert_eq!(
+        state.working_detail.as_deref(),
+        Some("Compacting conversation history…")
+    );
+    update(
+        &mut state,
+        UiMsg::ProgressReported {
+            summary: String::new(),
+        },
+    );
+    assert!(state.working_detail.is_none());
 }
 
 #[test]

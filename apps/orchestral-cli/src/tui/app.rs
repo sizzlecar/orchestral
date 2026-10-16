@@ -1319,6 +1319,7 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
     ) {
         state.context_input_tokens = Some((context.input_tokens, context.input_tokens_estimated));
         state.context_budget = context.max_context_tokens;
+        state.working_detail = None;
         return;
     }
     if let Some(summary) =
@@ -1354,9 +1355,14 @@ fn project_telemetry(run: &mut ActiveRun, state: &mut UiState, telemetry: AgentT
             }
         }
         AgentTelemetry::ProgressReported { message, fraction } => {
-            let summary = fraction
-                .map(|fraction| format!("{:.0}% {message}", fraction * 100.0))
-                .unwrap_or(message);
+            let trimmed = message.trim();
+            let summary = if trimmed.is_empty() {
+                String::new()
+            } else {
+                fraction
+                    .map(|fraction| format!("{:.0}% {trimmed}", fraction * 100.0))
+                    .unwrap_or_else(|| trimmed.to_owned())
+            };
             update(state, UiMsg::ProgressReported { summary });
         }
         AgentTelemetry::ToolActivity {

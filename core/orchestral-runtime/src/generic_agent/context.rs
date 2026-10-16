@@ -70,8 +70,17 @@ pub(super) async fn project_model_context(
     // Replaying it must never append a new compaction fact to the Session.
     if through_session_seq.is_none() {
         if let Some(compactor) = &inner.session_compactor {
-            for step in 0..8 {
-                if step == 0 {
+            let mut reported_compaction = false;
+            for _ in 0..8 {
+                if !reported_compaction
+                    && compactor
+                        .has_compaction_candidate(
+                            &request.run.spec.session_id,
+                            &request.run.spec.run_id,
+                        )
+                        .await?
+                {
+                    reported_compaction = true;
                     publish_telemetry(
                         inner,
                         &request.run.spec.run_id,
