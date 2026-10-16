@@ -45,7 +45,8 @@ async function checkDrafts(browser, scenario) {
   page.setDefaultTimeout(10000);
   page.on("pageerror", error => errors.push(error.message));
   const upper = page.locator('.session-pane[data-pane="primary"]'), lower = page.locator('.session-pane[data-pane="secondary"]');
-  const upperInput = upper.getByRole("textbox", { name: "消息草稿" }), lowerInput = lower.getByRole("textbox", { name: "消息草稿" });
+  const upperInput = upper.locator(".message-input"), lowerInput = lower.locator(".message-input");
+  const activate = pane => pane.locator(".pane-activate").click();
   const select = async (pane, id) => {
     await pane.getByRole("button", { name: "打开会话列表" }).click();
     await pane.locator(".thread-button").filter({ hasText: `会话 ${id.toUpperCase()}` }).click();
@@ -63,11 +64,14 @@ async function checkDrafts(browser, scenario) {
           return original.call(this, key, value);
         };
       });
+      await activate(upper);
       await upperInput.fill("A 尚未持久化的草稿");
+      await activate(lower);
       await lowerInput.fill("B 尚未持久化的草稿");
-      await upper.getByText("草稿保存失败，请先复制草稿再刷新", { exact: true }).waitFor();
+      await lower.getByText("草稿保存失败，请先复制草稿再刷新", { exact: true }).waitFor();
       await select(upper, "c");
       assert.equal(await upperInput.inputValue(), "");
+      await activate(upper);
       await upperInput.fill("C 独立草稿");
       await select(upper, "a");
       assert.equal(await upperInput.inputValue(), "A 尚未持久化的草稿", "storage rejection must not discard the in-memory draft during a session switch");
@@ -75,19 +79,23 @@ async function checkDrafts(browser, scenario) {
       await select(upper, "c");
       assert.equal(await upperInput.inputValue(), "C 独立草稿");
     } else {
+      await activate(upper);
       await upperInput.fill("A 上传前草稿");
       await upper.locator('input[type="file"]').setInputFiles({ name: "photo.png", mimeType: "image/png", buffer: png });
       const deadline = Date.now() + 10000;
       while (!releaseUpload) { assert(Date.now() < deadline, "upload did not reach local fixture"); await new Promise(resolve => setTimeout(resolve, 25)); }
       await select(upper, "c");
+      await activate(upper);
       await upperInput.fill("C 不应收到 A 的附件");
       await select(lower, "a");
+      await activate(lower);
       await lowerInput.fill("A 已在下屏继续编辑");
       releaseUpload();
       await lower.locator(".composer-attachment").waitFor();
       assert.equal(await lowerInput.inputValue(), "A 已在下屏继续编辑", "late upload must merge with the draft now edited in the other pane");
       assert.equal(await upperInput.inputValue(), "C 不应收到 A 的附件");
       assert.equal(await upper.locator(".composer-attachment").count(), 0, "late upload belongs to the originating session, not the original pane");
+      await activate(lower);
       await lowerInput.fill("A 附件到达后继续编辑");
       assert.equal(await lower.locator(".composer-attachment").count(), 1, "typing after upload preserves the merged attachment");
     }

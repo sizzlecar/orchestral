@@ -3209,6 +3209,16 @@ svg {
   color: var(--muted);
 }
 
+.conversation-header__title { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.conversation-header__title > .eyebrow { flex-basis: 100%; }
+.pane-activate { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 28px; padding: 0; background: transparent; color: var(--ink); text-align: left; }
+.pane-activate h1 { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-position { flex-shrink: 0; color: var(--muted); font-size: 10px; font-weight: 500; }
+.pane-action-icon, .run-status__compact, .composer-target { display: none; }
+.pane-session-details { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 8px; margin: 8px 0 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); font-size: 11px; }
+.pane-session-details dt { color: var(--muted); }
+.pane-session-details dd { margin: 0; overflow-wrap: anywhere; }
+
 .session-pane .conversation-header__meta {
   max-height: 24px;
 }
@@ -3304,6 +3314,59 @@ svg {
   .session-pane .conversation-header { padding: 4px 10px; }
   .session-pane .message-list { padding: 10px 12px 14px; }
   .session-pane .composer-dock { padding: 5px 8px; }
+}
+
+/* Phones keep two reading panes and one shared input area. Composer instances
+   stay mounted in their own sessions so uploads and pending sends survive
+   switching the input target. Their containing block is the whole workspace. */
+@media (max-width: 859px) {
+  .app-shell.split-workspace { position: relative; }
+  .workspace-topbar { min-height: 48px; padding-top: env(safe-area-inset-top); padding-bottom: 0; }
+  .workspace-source, .workspace-actions .icon-button { min-height: 44px; }
+  .session-panes { padding-bottom: var(--workspace-composer-height, 82px); }
+  .session-pane { position: static; container-type: normal; }
+  .session-pane .conversation { position: static; grid-template-rows: auto minmax(0, 1fr) minmax(0, auto); }
+  .session-pane .conversation-header { min-height: 44px; padding: 0 8px; gap: 4px; background: var(--page-raised); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .session-pane .conversation-header__title { flex-wrap: nowrap; }
+  .session-pane .conversation-header .eyebrow,
+  .session-pane .conversation-header__meta { display: none; }
+  .session-pane .pane-activate { flex: 1 1 auto; min-height: 44px; max-width: calc(100% - 32px); }
+  .session-pane .pane-activate h1 { font-size: 13px; }
+  .session-pane .pane-session-select { flex: 0 0 32px; justify-content: center; min-height: 44px; }
+  .session-pane .conversation-header__controls { gap: 4px; }
+  .session-pane .conversation-header__controls .session-actions-button { min-width: 32px; min-height: 44px; padding: 0 6px; border: 0; background: transparent; }
+  .pane-action-label, .session-pane .run-status__full { display: none; }
+  .pane-action-icon { display: inline; font-size: 22px; }
+  .session-pane .run-status { min-width: 0; min-height: 28px; gap: 5px; padding: 0 6px; border: 0; background: transparent; font-size: 10px; }
+  .session-pane .run-status > .run-status__compact { display: inline; }
+  .session-pane .message-list { padding: 10px 12px 14px; }
+  .session-pane .composer-dock { display: none; position: absolute; inset: auto 0 0; z-index: 20; padding: 3px max(8px, env(safe-area-inset-right)) max(5px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); border-top: 1px solid var(--line); background: var(--page-raised); }
+  .split-workspace[data-active-pane="primary"] .session-pane[data-pane="primary"] .composer-dock:not([hidden]),
+  .split-workspace[data-active-pane="secondary"] .session-pane[data-pane="secondary"] .composer-dock:not([hidden]) { display: block; }
+  .split-workspace[data-active-pane="primary"] .session-pane[data-pane="primary"] .conversation-header,
+  .split-workspace[data-active-pane="secondary"] .session-pane[data-pane="secondary"] .conversation-header { box-shadow: inset 3px 0 var(--accent); }
+  .composer-target { display: flex; align-items: center; gap: 8px; min-height: 20px; max-width: 820px; margin: 0 auto; color: var(--accent); font-size: 10px; }
+  .composer-target__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .composer-target button { display: none; flex-shrink: 0; min-width: 56px; min-height: 32px; margin-left: auto; padding: 0 8px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 11px; }
+  .session-pane .composer-form { min-height: 52px; padding-left: 10px; border-radius: 14px; box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .session-pane .composer-form textarea { max-height: 100px; }
+  .session-pane .composer-hint { display: none; }
+  .session-pane .composer-hint.is-important { display: block; max-height: 32px; overflow-y: auto; margin: 2px auto 0; font-size: 10px; }
+  .session-pane .composer-attachments { max-height: 84px; overflow-y: auto; margin-bottom: 4px; }
+  .session-pane .pending-panel { max-height: min(22dvh, 140px); }
+  .session-pane .toast-region { bottom: calc(var(--workspace-composer-height, 82px) + 8px); }
+  .pane-session-drawer { inset: 0; width: 100%; }
+  :root[data-keyboard-pane] .session-panes { grid-template-rows: minmax(0, 1fr); }
+  :root[data-keyboard-pane="primary"] .session-pane[data-pane="secondary"],
+  :root[data-keyboard-pane="secondary"] .session-pane[data-pane="primary"] { display: none; }
+  :root[data-keyboard-pane] .composer-target button { display: block; }
+  :root[data-keyboard-pane] .session-pane .composer-form textarea { max-height: min(72px, 24dvh); }
+  :root[data-keyboard-pane] .session-pane .composer-attachments { max-height: 54px; }
+  :root[data-keyboard-pane] .session-pane .composer-dock { padding-bottom: 4px; }
+}
+
+@media (max-width: 379px) {
+  .workspace-source { padding-right: 6px; padding-left: 6px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

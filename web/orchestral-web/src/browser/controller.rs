@@ -3244,9 +3244,6 @@ impl AppController {
 
     pub fn window_listeners(self) -> Vec<Closure<dyn FnMut(web_sys::Event)>> {
         let mut listeners = Vec::new();
-        if let Ok(listener) = platform::install_visual_viewport_sync() {
-            listeners.push(listener);
-        }
         if let Ok(listener) = platform::add_window_listener("online", move |_| {
             let mut controller = self;
             controller.state.write().connection.online = true;

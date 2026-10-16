@@ -229,6 +229,7 @@ const server = http.createServer(async (req, res) => {
       await update.waitFor();
       assert.equal(await update.count(), 1, "one global update action serves both panes");
 
+      await lower.locator(".pane-activate").click();
       holdNextUpload = true;
       await lower.locator('input[type="file"]').setInputFiles({ name: "photo.png", mimeType: "image/png", buffer: png });
       await wait(() => releaseUpload !== undefined);
@@ -271,13 +272,17 @@ const server = http.createServer(async (req, res) => {
       await page.getByRole("tab", { name: "Codex", exact: true }).click();
       const mainSession = page.locator(".session-pane").filter({ has: page.getByText("看看这张图", { exact: true }) });
       const uploadSession = page.locator(".session-pane").filter({ has: page.getByText("下屏发送进行中", { exact: true }) });
+      await mainSession.locator(".pane-activate").click();
       await mainSession.getByRole("textbox", { name: "消息草稿" }).fill("升级后保留上屏草稿");
+      await uploadSession.locator(".pane-activate").click();
       await uploadSession.getByRole("textbox", { name: "消息草稿" }).fill("升级后保留下屏草稿");
       await Promise.all([page.waitForNavigation({ waitUntil: "domcontentloaded" }), update.click()]);
+      await mainSession.locator(".pane-activate").click();
       await mainSession.getByRole("textbox", { name: "消息草稿" }).waitFor();
+      await uploadSession.locator(".pane-activate").click();
       await uploadSession.getByRole("textbox", { name: "消息草稿" }).waitFor();
-      assert.equal(await mainSession.getByRole("textbox", { name: "消息草稿" }).inputValue(), "升级后保留上屏草稿");
-      assert.equal(await uploadSession.getByRole("textbox", { name: "消息草稿" }).inputValue(), "升级后保留下屏草稿");
+      assert.equal(await mainSession.locator(".message-input").inputValue(), "升级后保留上屏草稿");
+      assert.equal(await uploadSession.locator(".message-input").inputValue(), "升级后保留下屏草稿");
       console.log(JSON.stringify({ singleGlobalUpdate: true, lowerUploadBlocksUpdate: true, lowerSendBlocksUpdate: true, backgroundRetryBlocksUpdateAfterSourceSwitch: true, bothDraftsSurviveUpdate: true }));
     }
     assert.deepEqual(errors, [], "browser must remain free of runtime errors");

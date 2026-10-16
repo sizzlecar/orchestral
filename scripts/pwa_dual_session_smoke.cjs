@@ -3,8 +3,9 @@ const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const assert = require("node:assert/strict");
-const { chromium } = require("playwright");
-const dist = path.join(process.cwd(), "web/orchestral-web/dist");
+const { chromium, webkit } = require("playwright");
+const dist = process.env.PWA_SMOKE_DIST || path.join(process.cwd(), "web/orchestral-web/dist");
+const mobileLayout = process.env.PWA_SMOKE_MOBILE_LAYOUT === "1";
 const width = Number(process.env.PWA_SMOKE_WIDTH || 390);
 const now = Date.now();
 const connectorId = product => product === "codex" ? "fixture/editor-a" : "fixture/editor-b";
@@ -24,8 +25,8 @@ for (const product of ["codex", "claude"]) {
   }
 }
 const summary = session => ({
-  connector_id: connectorId(session.product), session_id: session.id, title: `会话 ${session.id}`,
-  state: "busy_elsewhere", input_action: "fixture.input", cwd: "/fixture/project",
+  connector_id: connectorId(session.product), session_id: session.id, title: `会话 ${session.id}${mobileLayout ? " · 很长的会话标题也应保持单行并清楚显示发送目标" : ""}`,
+  state: "busy_elsewhere", input_action: "fixture.input", cwd: mobileLayout ? `/fixture/${"nested-project/".repeat(20)}` : "/fixture/project",
   created_at_unix_ms: now - 60000, updated_at_unix_ms: now - session.rank * 1000,
 });
 const detail = session => ({ summary: summary(session), turns: session.turns, controlled_runs: [], pending_requests: [], stream_cursor: session.changes.length });
@@ -98,9 +99,12 @@ const server = http.createServer(async (req, res) => {
 
 (async () => {
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  const browser = await chromium.launch({ headless: true, channel: process.env.PWA_SMOKE_CHANNEL || "chrome" });
-  const context = await browser.newContext({ viewport: { width, height: 844 }, isMobile: width < 600, hasTouch: true, serviceWorkers: "block" });
+  const browser = process.env.PWA_SMOKE_ENGINE === "webkit"
+    ? await webkit.launch({ headless: true })
+    : await chromium.launch({ headless: true, channel: process.env.PWA_SMOKE_CHANNEL || "chrome" });
+  const context = await browser.newContext({ viewport: { width, height: 844 }, isMobile: width < 600, hasTouch: true, serviceWorkers: "block", colorScheme: mobileLayout ? "dark" : "light" });
   const page = await context.newPage(), errors = [];
+  if (mobileLayout) await require("./pwa_mobile_layout_smoke.cjs").installViewportFixture(page);
   page.on("pageerror", error => errors.push(error.message));
   page.on("console", message => {
     if (message.type() === "error" && message.text().includes("Orchestral browser error:")) errors.push(message.text());
@@ -108,6 +112,7 @@ const server = http.createServer(async (req, res) => {
   page.setDefaultTimeout(15000);
   const primary = page.locator('.session-pane[data-pane="primary"]');
   const secondary = page.locator('.session-pane[data-pane="secondary"]');
+  const activate = pane => pane.locator(".pane-activate").click();
   const wait = async predicate => { const deadline = Date.now() + 15000; while (!predicate()) { assert(Date.now() < deadline, "dual-session fixture timed out"); await new Promise(resolve => setTimeout(resolve, 50)); } };
   const atBottom = pane => pane.locator(".message-list").evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop <= 3);
   try {
@@ -124,22 +129,33 @@ const server = http.createServer(async (req, res) => {
     assert.ok(primaryBox.y + primaryBox.height <= secondaryBox.y + 2, "sessions occupy independent top and bottom panes");
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
 
+    if (mobileLayout) {
+      await require("./pwa_mobile_layout_smoke.cjs").checkMobileLayout({ page, primary, secondary, sessions, submissions, publish, wait, width });
+      assert.deepEqual(errors, []);
+      return;
+    }
+
     publish(sessions.get("codex-1"), "上屏独立实时消息");
     publish(sessions.get("codex-2"), "下屏独立实时消息");
     await primary.getByText("上屏独立实时消息", { exact: true }).waitFor();
     await secondary.getByText("下屏独立实时消息", { exact: true }).waitFor();
     assert.equal(await secondary.getByText("上屏独立实时消息", { exact: true }).count(), 0);
     assert.equal(await primary.getByText("下屏独立实时消息", { exact: true }).count(), 0);
-    const upperInput = primary.getByRole("textbox", { name: "消息草稿" });
-    const lowerInput = secondary.getByRole("textbox", { name: "消息草稿" });
+    const upperInput = primary.locator(".message-input");
+    const lowerInput = secondary.locator(".message-input");
+    await activate(primary);
     await upperInput.fill("上屏消息");
+    await activate(secondary);
     await lowerInput.fill("下屏保留草稿");
+    await activate(primary);
     await primary.getByRole("button", { name: "发送消息", exact: true }).click();
     await primary.locator(".message--user").getByText("上屏消息", { exact: true }).waitFor();
     await wait(() => submissions.length === 1);
     assert.equal(submissions[0].session_id, "codex-1", "upper composer routes to its own running session");
     assert.equal(await lowerInput.inputValue(), "下屏保留草稿", "upper send must not clear the lower draft");
+    await activate(primary);
     await upperInput.fill("上屏后续草稿");
+    await activate(secondary);
     await secondary.getByRole("button", { name: "发送消息", exact: true }).click();
     await secondary.locator(".message--user").getByText("下屏保留草稿", { exact: true }).waitFor();
     await wait(() => submissions.length === 2);
@@ -169,7 +185,9 @@ const server = http.createServer(async (req, res) => {
     await secondary.getByText("上屏切换后下屏流仍然存活", { exact: true }).waitFor();
 
     nextActionMode = "hold";
+    await activate(secondary);
     await lowerInput.fill("切换来源前下屏正在提交的消息");
+    await activate(secondary);
     await secondary.getByRole("button", { name: "发送消息", exact: true }).click();
     await wait(() => pendingReplies.length === 1);
     await tabs.getByRole("tab", { name: "Claude Code", exact: true }).click();
@@ -200,16 +218,19 @@ const server = http.createServer(async (req, res) => {
     const secondSession = page.locator(".session-pane").filter({ has: page.getByText("下屏继续跟随最新消息", { exact: true }) });
     await firstSession.waitFor();
     await secondSession.waitFor();
-    const firstInput = firstSession.getByRole("textbox", { name: "消息草稿" });
-    const secondInput = secondSession.getByRole("textbox", { name: "消息草稿" });
+    const firstInput = firstSession.locator(".message-input");
+    const secondInput = secondSession.locator(".message-input");
     assert.equal(await firstInput.inputValue(), "上屏后续草稿", "source switching restores the session-specific draft");
 
     nextActionMode = "retry";
+    await activate(secondSession);
     await secondInput.fill("会话二需要后台确认的消息");
     await secondSession.getByRole("button", { name: "发送消息", exact: true }).click();
     await wait(() => pendingReplies.length === 2);
+    await activate(secondSession);
     await secondInput.fill("会话二等待中的下一条草稿");
-    assert.equal(await secondSession.getByRole("button", { name: "发送消息", exact: true }).isDisabled(), true, "a pending retry blocks only its own session");
+    assert.equal(await secondSession.locator(".send-button").isDisabled(), true, "a pending retry blocks only its own session");
+    await activate(firstSession);
     await firstInput.fill("会话一不受另一屏后台重试影响");
     assert.equal(await firstSession.getByRole("button", { name: "发送消息", exact: true }).isEnabled(), true, "another pane stays writable while shared outbox retries");
     await firstSession.getByRole("button", { name: "发送消息", exact: true }).click();
@@ -227,6 +248,7 @@ const server = http.createServer(async (req, res) => {
     await page.screenshot({ path: `target/pwa-smoke/dual-session-${width}.png` });
     console.log(JSON.stringify({ dualSessionBrowser: true, defaultCodex: true, latestTwo: true, independentStreams: true, isolatedDraftsAndRoutes: true, independentScroll: true, paneHistorySwitch: true, sourceSwitch: true, lateReplyKeepsNewSource: true, retryDoesNotBlockOtherPane: true, width, paidModelRequests: 0 }));
   } catch (error) {
+    console.error(await page.evaluate(() => ({ viewport: { width: visualViewport.width, height: visualViewport.height, scale: visualViewport.scale, top: visualViewport.offsetTop }, layout: { width: innerWidth, height: innerHeight }, touchPoints: navigator.maxTouchPoints, coarsePointer: matchMedia("(pointer: coarse)").matches, focused: document.activeElement.outerHTML.slice(0, 150), keyboardPane: document.documentElement.dataset.keyboardPane, activePane: document.querySelector(".split-workspace")?.dataset.activePane, composerHeight: document.documentElement.style.getPropertyValue("--workspace-composer-height") })));
     fs.mkdirSync("target/pwa-smoke", { recursive: true });
     await page.screenshot({ path: `target/pwa-smoke/dual-session-failed-${width}.png` });
     console.error(JSON.stringify({ requests, submissions: submissions.map(({ session_id, action_id }) => ({ session_id, action_id })), errors }));
