@@ -221,6 +221,11 @@ pub struct AgentConnectorDescriptor {
     pub provider_binding: ProviderBindingRef,
     /// Stable family name such as `coding-agent`; never a concrete wire method.
     pub agent_family: String,
+    /// Optional stable product grouping key, such as `codex` or `claude`.
+    /// This presentation identity is independent of the capability family,
+    /// opaque connector identity, and provider-native wire protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_product: Option<String>,
     pub display_name: String,
     pub capabilities: AgentSessionCapabilities,
     /// Declarative creation form. The Host and UI render this contract without
@@ -1160,6 +1165,7 @@ mod tests {
             connector_id: AgentConnectorId::new("fixture/default"),
             provider_binding: ProviderBindingRef::new("fixture/provider"),
             agent_family: "coding-agent".to_owned(),
+            agent_product: None,
             display_name: "Fixture Agent".to_owned(),
             capabilities: AgentSessionCapabilities::discoverable(),
             creation: None,
@@ -1180,6 +1186,21 @@ mod tests {
         descriptor.actions.push(descriptor.actions[0].clone());
         let error = descriptor.validate().expect_err("duplicates must fail");
         assert_eq!(error.code, AgentConnectorErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn descriptor_product_metadata_is_optional_and_keeps_family_independent() {
+        let legacy = serde_json::to_value(descriptor()).unwrap();
+        assert!(legacy.get("agent_product").is_none());
+        let decoded: AgentConnectorDescriptor = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.agent_product, None);
+        let mut product = legacy;
+        product["agent_product"] = serde_json::json!("codex");
+        let decoded: AgentConnectorDescriptor = serde_json::from_value(product.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.agent_family, "coding-agent");
+        assert_eq!(decoded.agent_product.as_deref(), Some("codex"));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), product);
     }
 
     #[test]

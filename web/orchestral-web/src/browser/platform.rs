@@ -5,7 +5,12 @@ use js_sys::{Array, Function, Reflect, Uint8Array};
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-const TIMELINE_FOLLOW_EDGE_PX: i32 = 8;
+mod timeline;
+pub use timeline::{
+    begin_timeline_session, end_timeline_session, restore_timeline_scroll_anchor,
+    scroll_timeline_to_end, set_timeline_follow, timeline_is_near_end, timeline_scroll_anchor,
+    timeline_should_follow,
+};
 
 pub fn window() -> Result<web_sys::Window, String> {
     web_sys::window().ok_or_else(|| "Browser window is unavailable".to_owned())
@@ -150,64 +155,6 @@ fn sync_visual_viewport(viewport: &web_sys::VisualViewport) -> Result<(), String
         .set_property("--visual-viewport-height", &css_px(viewport.height()))
         .map_err(js_error)?;
     Ok(())
-}
-
-pub fn scroll_timeline_to_end() {
-    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-        return;
-    };
-    let Ok(Some(element)) = document.query_selector(".message-list") else {
-        return;
-    };
-    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
-        return;
-    };
-    element.set_scroll_top(element.scroll_height());
-}
-
-/// Whether live updates should keep following the transcript. Once the user
-/// scrolls up to read history, updates must not yank the viewport away.
-pub fn timeline_is_near_end() -> bool {
-    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-        return true;
-    };
-    let Ok(Some(element)) = document.query_selector(".message-list") else {
-        return true;
-    };
-    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
-        return true;
-    };
-    let remaining = element
-        .scroll_height()
-        .saturating_sub(element.client_height())
-        .saturating_sub(element.scroll_top());
-    remaining <= TIMELINE_FOLLOW_EDGE_PX
-}
-
-pub fn timeline_scroll_anchor() -> Option<(i32, i32)> {
-    let document = web_sys::window()?.document()?;
-    let element = document
-        .query_selector(".message-list")
-        .ok()??
-        .dyn_into::<web_sys::HtmlElement>()
-        .ok()?;
-    Some((element.scroll_top(), element.scroll_height()))
-}
-
-/// Keeps the same content under the viewport after older transcript entries
-/// are inserted above it.
-pub fn restore_timeline_scroll_anchor((scroll_top, scroll_height): (i32, i32)) {
-    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-        return;
-    };
-    let Ok(Some(element)) = document.query_selector(".message-list") else {
-        return;
-    };
-    let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() else {
-        return;
-    };
-    let added_height = element.scroll_height().saturating_sub(scroll_height);
-    element.set_scroll_top(scroll_top.saturating_add(added_height));
 }
 
 pub async fn copy_text(text: &str) -> Result<(), String> {

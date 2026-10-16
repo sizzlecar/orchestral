@@ -12,7 +12,7 @@ const content = (text) => [{ body: { kind: "inline", value: text } }];
 const calls = [], submissions = [], streams = new Set(), changes = [];
 let sequence = 0, pendingReply, releaseReply;
 const summary = () => ({
-  connector_id: "fixture/local", session_id: "native", title: "原生会话输入验证",
+  connector_id: "codex/local", session_id: "native", title: "原生会话输入验证",
   state: "busy_elsewhere", input_action: "fixture.input",
   created_at_unix_ms: now - 60000, updated_at_unix_ms: now,
   cwd: "/workspace/demo",
@@ -31,7 +31,7 @@ const detail = () => ({
   })),
 });
 const publish = (change) => {
-  const item = { connector_id: "fixture/local", session_id: "native", sequence: ++sequence, change };
+  const item = { connector_id: "codex/local", session_id: "native", sequence: ++sequence, change };
   changes.push(item);
   for (const stream of streams) stream.write(`id: ${item.sequence}\nevent: session_changed\ndata: ${JSON.stringify(item)}\n\n`);
 };
@@ -48,7 +48,7 @@ const server = http.createServer(async (req, res) => {
     if (route === "/me") return json(res, { auth_mode: "gateway_jwt" });
     if (route === "/devices" || route === "/sessions") return json(res, []);
     if (route === "/agent-connectors") return json(res, [{
-      connector_id: "fixture/local", provider_binding: "fixture/local", agent_family: "coding-agent",
+      connector_id: "codex/local", provider_binding: "codex/local", agent_family: "coding-agent", agent_product: "codex",
       display_name: "Native Agent", capabilities: { list: true, read: true, create: false },
       actions: [{ action_id: "fixture.input", title: "发送文字", description: "Native input fixture", input_channel: true, execution: "immediate" }],
     }]);
@@ -87,42 +87,41 @@ const server = http.createServer(async (req, res) => {
   const browser = await chromium.launch({ headless: true, channel: process.env.PWA_SMOKE_CHANNEL || "chrome" });
   const context = await browser.newContext({ viewport: { width, height: 844 }, isMobile: true, hasTouch: true, serviceWorkers: process.env.PWA_SMOKE_SW === "1" ? "allow" : "block" });
   const page = await context.newPage(), errors = [];
+  const pane = page.locator('.session-pane[data-pane="primary"]');
   page.on("pageerror", (error) => errors.push(error.stack || error.message));
   page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
   page.setDefaultTimeout(12000);
   try {
     await page.goto(`http://127.0.0.1:${server.address().port}`);
-    const drawer = page.getByRole("button", { name: "打开会话列表" });
+    const drawer = pane.getByRole("button", { name: "打开会话列表" });
     await drawer.click();
-    await page.getByRole("tab", { name: /Native Agent/ }).click();
-    await page.locator(".thread-button").first().click();
+    await pane.locator(".thread-button").first().click();
     for (let sent = 1; sent <= 2; sent++) {
-      await page.getByRole("textbox", { name: "消息草稿" }).fill("继续检查");
-      await page.getByRole("button", { name: "发送消息", exact: true }).click();
-      await page.waitForFunction((count) => document.querySelectorAll(".message--user").length === count, sent);
-      await page.waitForFunction(() => Array.from(document.querySelectorAll(".message__meta")).some((item) => item.textContent.includes("发送中")));
+      await pane.getByRole("textbox", { name: "消息草稿" }).fill("继续检查");
+      await pane.getByRole("button", { name: "发送消息", exact: true }).click();
+      await page.waitForFunction((count) => document.querySelectorAll('.session-pane[data-pane="primary"] .message--user').length === count, sent);
+      await page.waitForFunction(() => Array.from(document.querySelectorAll('.session-pane[data-pane="primary"] .message__meta')).some((item) => item.textContent.includes("发送中")));
       // Read another snapshot while HTTP is still pending. The message must
       // remain visible, even when the native transcript has no echo yet.
       await drawer.click();
-      await Promise.all([page.waitForResponse((res) => new URL(res.url()).pathname === "/api/v1/agent-session"), page.locator(".thread-button").first().click()]);
-      assert.equal(await page.locator(".message--user").count(), sent);
+      await Promise.all([page.waitForResponse((res) => new URL(res.url()).pathname === "/api/v1/agent-session"), pane.locator(".thread-button").first().click()]);
+      assert.equal(await pane.locator(".message--user").count(), sent);
       releaseReply();
-      await page.waitForFunction(() => document.querySelector(".message-input").value === "");
-      await page.waitForFunction(() => Array.from(document.querySelectorAll(".message__meta")).some((item) => item.textContent.includes("等待原 Agent 确认")));
+      await page.waitForFunction(() => document.querySelector('.session-pane[data-pane="primary"] .message-input').value === "");
+      await page.waitForFunction(() => Array.from(document.querySelectorAll('.session-pane[data-pane="primary"] .message__meta')).some((item) => item.textContent.includes("等待原 Agent 确认")));
       const entry = submissions[sent - 1];
       entry.echo = true;
       publish({ type: "activity_upsert", turn_id: `native:${entry.id}`, turn_status: "completed", activity: activity(entry) });
-      await page.waitForFunction((id) => document.querySelector(`[data-message-id="native:${id}"]`) !== null, entry.id);
-      assert.equal(await page.locator(".message--user").count(), sent, "native echo must replace pending input by identity");
-      assert.equal(await page.locator(".message--deferred").count(), 0);
+      await page.waitForFunction((id) => document.querySelector(`.session-pane[data-pane="primary"] [data-message-id="native:${id}"]`) !== null, entry.id);
+      assert.equal(await pane.locator(".message--user").count(), sent, "native echo must replace pending input by identity");
+      assert.equal(await pane.locator(".message--deferred").count(), 0);
     }
     assert.equal(calls.length, 2, "each input must have one dispatch");
     assert.notEqual(calls[0].arguments.submission_id, calls[1].arguments.submission_id, "identical text is two distinct submissions");
     await page.reload();
     await drawer.click();
-    await page.getByRole("tab", { name: /Native Agent/ }).click();
-    await page.locator(".thread-button").first().click();
-    await page.waitForFunction(() => document.querySelectorAll(".message--user").length === 2);
+    await pane.locator(".thread-button").first().click();
+    await page.waitForFunction(() => document.querySelectorAll('.session-pane[data-pane="primary"] .message--user').length === 2);
     assert.deepEqual(errors, [], "native input must not produce browser runtime errors");
     fs.mkdirSync("target/pwa-smoke", { recursive: true });
     await page.screenshot({ path: `target/pwa-smoke/native-input-${width}.png` });

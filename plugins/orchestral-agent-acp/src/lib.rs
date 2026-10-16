@@ -272,6 +272,7 @@ impl AgentConnector for AcpConnector {
             connector_id: self.connector_id(),
             provider_binding: self.provider_binding(),
             agent_family: "coding-agent".to_owned(),
+            agent_product: None,
             display_name: self.config.display_name.clone(),
             capabilities: AgentSessionCapabilities {
                 list: true,

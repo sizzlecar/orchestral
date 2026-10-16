@@ -71,12 +71,12 @@ records.push({
   },
 });
 const summary = (id) => ({
-  connector_id: "fixture/local",
+  connector_id: "codex/local",
   session_id: id,
-  title: id === "a" ? "同步验证会话" : id === "created" ? "新建实时会话" : id === "recovery" ? "运行恢复验证" : "另一个会话",
+  title: id === "a" ? "同步验证会话" : id === "created" ? "新建实时会话" : id === "recovery" ? "运行恢复验证" : id === "pinned" ? "保持在下屏的会话" : "另一个会话",
   state: "active",
   created_at_unix_ms: now - 60000,
-  updated_at_unix_ms: now - 30000,
+  updated_at_unix_ms: now - (id === "a" ? 10000 : id === "pinned" ? 20000 : 30000),
   cwd: "/workspace/demo",
 });
 const view = () => ({
@@ -175,7 +175,7 @@ const writeSessionChange = (res, change) => {
 };
 const publishCreatedSessionMessage = (text) => {
   const change = {
-    connector_id: "fixture/local",
+    connector_id: "codex/local",
     session_id: "created",
     sequence: createdSessionChanges.length + 1,
     change: {
@@ -196,7 +196,7 @@ const publishCreatedSessionMessage = (text) => {
 };
 const publishRecoveryChange = (change) => {
   const event = {
-    connector_id: "fixture/local",
+    connector_id: "codex/local",
     session_id: "recovery",
     sequence: recoveryChanges.length + 1,
     change,
@@ -217,9 +217,9 @@ const server = http.createServer(async (req, res) => {
     if (route === "/agent-connectors")
       return json(res, [
         {
-          connector_id: "fixture/local",
+          connector_id: "codex/local",
           display_name: "Test Agent",
-          agent_family: "fixture",
+          agent_family: "coding-agent", agent_product: "codex",
           capabilities: {
             list: true,
             read: true,
@@ -236,11 +236,11 @@ const server = http.createServer(async (req, res) => {
       ]);
     if (route === "/agent-sessions") {
       if (req.method === "POST") {
-        assert.equal(body.connector_id, "fixture/local");
+        assert.equal(body.connector_id, "codex/local");
         createdSession = true;
         return json(res, summary("created"));
       }
-      return json(res, { sessions: [summary("a"), summary("b"), summary("recovery"), ...(createdSession ? [summary("created")] : [])] });
+      return json(res, { sessions: [summary("a"), summary("pinned"), summary("b"), summary("recovery"), ...(createdSession ? [summary("created")] : [])] });
     }
     if (route === "/agent-session/actions") {
       assert.equal(body.session_id, "created");
@@ -436,6 +436,7 @@ const server = http.createServer(async (req, res) => {
     serviceWorkers: testWorker ? "allow" : "block",
   });
   const page = await context.newPage();
+  const pane = page.locator('.session-pane[data-pane="primary"]');
   let documentLoads = 0;
   page.on("framenavigated", frame => {
     if (frame === page.mainFrame()) documentLoads++;
@@ -456,19 +457,18 @@ const server = http.createServer(async (req, res) => {
       title,
       ...(sessionId === "a" ? ["检查当前工作区", ...effects.values()] : ["历史任务 7"]),
     ].map(value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`);
-    await page.getByRole("button", { name: "打开会话列表" }).click();
-    await page.getByRole("tab", { name: /Test Agent/ }).click();
+    await pane.getByRole("button", { name: "打开会话列表" }).click();
     await Promise.all([
       page.waitForResponse(response => {
         const url = new URL(response.url());
         return url.pathname === "/api/v1/agent-session" && url.searchParams.get("session_id") === sessionId;
       }),
-      page.locator(".thread-button")
+      pane.locator(".thread-button")
         .filter({ has: page.locator(".thread-button__title", { hasText: displayTitles }) })
         .click(),
     ]);
-    await page.getByRole("heading", { name: displayTitles }).waitFor();
-    await page.locator(".message-input").waitFor();
+    await pane.getByRole("heading", { name: displayTitles }).waitFor();
+    await pane.locator(".message-input").waitFor();
   };
   try {
     await page.goto("http://127.0.0.1:" + server.address().port);
@@ -481,7 +481,7 @@ const server = http.createServer(async (req, res) => {
     await page.getByText("创建弹窗关闭后实时消息仍然到达", { exact: true }).waitFor();
     assert.equal(lifecycleSnapshotReads, 0, "new session message must arrive through the live stream");
 
-    await page.getByRole("button", { name: "打开会话操作" }).click();
+    await pane.getByRole("button", { name: "打开会话操作" }).click();
     await page.locator(".session-action-card").filter({ hasText: "更新会话配置" })
       .getByRole("button", { name: "执行", exact: true }).click();
     await page.getByRole("button", { name: "关闭会话操作" }).waitFor({ state: "detached" });
@@ -491,35 +491,35 @@ const server = http.createServer(async (req, res) => {
     await page.getByText("操作弹窗关闭后实时消息仍然到达", { exact: true }).waitFor();
     assert.equal(documentLoads, lifecycleDocumentLoads, "session creation and actions must not require a page reload");
 
-    await page.getByRole("button", { name: "打开会话列表" }).click();
-    await page.locator(".thread-button").filter({ hasText: "运行恢复验证" }).click();
-    const oldFailure = page.locator(".run-failure").filter({ hasText: "cancelled" });
+    await pane.getByRole("button", { name: "打开会话列表" }).click();
+    await pane.locator(".thread-button").filter({ hasText: "运行恢复验证" }).click();
+    const oldFailure = pane.locator(".run-failure").filter({ hasText: "cancelled" });
     await oldFailure.filter({ hasText: "旧回合被 watchdog 安全停止" }).waitFor();
     const recoveryDocumentLoads = documentLoads;
     recoveryPhase = "running";
     publishRecoveryChange({ type: "refresh_required", reason: "new_controlled_run" });
-    await page.locator(".message--user .message__content").filter({ hasText: "继续新的正常回合" }).waitFor();
+    await pane.locator(".message--user .message__content").filter({ hasText: "继续新的正常回合" }).waitFor();
     await oldFailure.waitFor({ state: "detached" });
-    assert.equal(await page.locator(".message--user .message__content").filter({ hasText: "继续新的正常回合" }).count(), 1,
+    assert.equal(await pane.locator(".message--user .message__content").filter({ hasText: "继续新的正常回合" }).count(), 1,
       "native client identity must deduplicate the latest Host mirror");
-    await page.locator(".message--user .message__content").filter({ hasText: "保留旧回合的输入记录" }).waitFor();
+    await pane.locator(".message--user .message__content").filter({ hasText: "保留旧回合的输入记录" }).waitFor();
     recoveryPhase = "failed";
     publishRecoveryChange({ type: "turn_status", turn_id: "recovery-native-turn", status: "failed", failure: recoveryFailure });
-    await page.locator(".run-failure").filter({ hasText: "provider_unavailable" }).filter({ hasText: "当前回合连接失败" }).waitFor();
+    await pane.locator(".run-failure").filter({ hasText: "provider_unavailable" }).filter({ hasText: "当前回合连接失败" }).waitFor();
     assert.equal(await oldFailure.count(), 0, "current failure must not revive a cancelled historical footer");
     assert.equal(documentLoads, recoveryDocumentLoads, "recovery and current failure must update without a page reload");
 
     await openSession("同步验证会话");
-    await page
+    await pane
       .locator(".pending-card")
       .filter({ hasText: "保存你要求的修改" })
       .waitFor();
     assert.equal(
-      await page.locator(".pending-card").count(),
+      await pane.locator(".pending-card").count(),
       2,
       "both Host input and native approval must be visible",
     );
-    const reasoning = page.locator(".reasoning-summary");
+    const reasoning = pane.locator(".reasoning-summary");
     await reasoning.waitFor();
     assert.equal(await reasoning.count(), 1);
     assert.equal(await reasoning.getAttribute("open"), null, "summary starts collapsed");
@@ -528,7 +528,7 @@ const server = http.createServer(async (req, res) => {
     assert.equal((await reasoning.locator(".message__content").innerText()).trim(), "正在核对接口行为。".repeat(30) + "下一步检查调用结果。");
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "long thinking preview must fit mobile viewport");
     await reasoning.locator("summary").click();
-    const input = page.getByRole("textbox", { name: "消息草稿" });
+    const input = pane.getByRole("textbox", { name: "消息草稿" });
     await input.fill("保留在会话 A 的草稿");
     await openSession("另一个会话");
     assert.equal(await input.inputValue(), "");
@@ -542,10 +542,10 @@ const server = http.createServer(async (req, res) => {
       isComposing: true,
     });
     assert.equal(calls.length, 0, "IME confirmation must not send");
-    await page.getByRole("button", { name: "发送消息", exact: true }).click();
-    await page.getByRole("button", { name: "正在发送", exact: true }).waitFor();
+    await pane.getByRole("button", { name: "发送消息", exact: true }).click();
+    await pane.getByRole("button", { name: "正在发送", exact: true }).waitFor();
     await page.waitForFunction(
-      () => document.querySelector(".message-input").value === "",
+      () => document.querySelector('.session-pane[data-pane="primary"] .message-input').value === "",
     );
     await page
       .getByText("正在确认上一条消息的发送状态，可以继续编辑草稿", {
@@ -554,7 +554,7 @@ const server = http.createServer(async (req, res) => {
       .waitFor();
     await input.fill("下一条草稿");
     assert.equal(
-      await page
+      await pane
         .getByRole("button", { name: "发送消息", exact: true })
         .isDisabled(),
       true,
@@ -566,9 +566,9 @@ const server = http.createServer(async (req, res) => {
       "下一条草稿",
       "blocked Enter preserves the next draft",
     );
-    await page.getByRole("button", { name: "发送消息", exact: true }).waitFor();
+    await pane.getByRole("button", { name: "发送消息", exact: true }).waitFor();
     await page.waitForFunction(
-      () => !document.querySelector(".send-button").disabled,
+      () => !document.querySelector('.session-pane[data-pane="primary"] .send-button').disabled,
     );
     await input.fill("");
     assert.equal(
@@ -583,14 +583,14 @@ const server = http.createServer(async (req, res) => {
       "retry retains the original operation id",
     );
     assert.equal(
-      await page
+      await pane
         .locator(".message--user .message__content")
         .filter({ hasText: "中文确认不会误发送" })
         .count(),
       1,
       "redirected outbox echo appears once",
     );
-    const card = page
+    const card = pane
       .locator(".pending-card")
       .filter({ hasText: "保存你要求的修改" });
     // The browser only knows the Run mirror. The request now exists in the
@@ -622,13 +622,13 @@ const server = http.createServer(async (req, res) => {
       false,
       "no horizontal page overflow",
     );
-    await page.locator(".pending-panel__body").evaluate((el) => {
+    await pane.locator(".pending-panel__body").evaluate((el) => {
       el.scrollTop = el.scrollHeight;
     });
-    const headerBottom = await page
+    const headerBottom = await pane
       .locator(".pending-panel__header")
       .evaluate((el) => el.getBoundingClientRect().bottom);
-    const bodyTop = await page
+    const bodyTop = await pane
       .locator(".pending-panel__body")
       .evaluate((el) => el.getBoundingClientRect().top);
     assert.ok(
@@ -638,7 +638,7 @@ const server = http.createServer(async (req, res) => {
     const button = card.getByRole("button", { name: "允许一次" });
     const box = await button.boundingBox();
     assert.ok(box.height >= 44, "approval touch target");
-    const composerTop = await page
+    const composerTop = await pane
       .locator(".composer-dock")
       .evaluate((el) => el.getBoundingClientRect().top);
     assert.ok(
@@ -660,7 +660,7 @@ const server = http.createServer(async (req, res) => {
     });
     await openSession("另一个会话");
     await openSession("同步验证会话");
-    const nativeInput = page.locator('[data-request-id="native-input"]');
+    const nativeInput = pane.locator('[data-request-id="native-input"]');
     await nativeInput.getByRole("textbox").fill("继续检查");
     await nativeInput
       .getByRole("button", { name: "继续", exact: true })
@@ -670,7 +670,7 @@ const server = http.createServer(async (req, res) => {
     await input.fill("离线草稿");
     assert.equal(await input.isEnabled(), true);
     assert.equal(
-      await page
+      await pane
         .getByRole("button", { name: "发送消息", exact: true })
         .isDisabled(),
       true,
@@ -679,13 +679,22 @@ const server = http.createServer(async (req, res) => {
     await page.waitForFunction(
       () =>
         !document
-          .querySelector(".composer-hint")
+          .querySelector('.session-pane[data-pane="primary"] .composer-hint')
           .textContent.includes("当前离线"),
     );
     if (testWorker) {
       await page.waitForFunction(async () => {
         const registration = await navigator.serviceWorker.getRegistration();
         return registration?.active && navigator.serviceWorker.controller;
+      });
+      // An active controller does not mean a reconnect/foreground update job
+      // has settled. Drain a check of revision 0 before publishing revision 1,
+      // or the app can legitimately coalesce our visibility event into an
+      // earlier in-flight check. The new revision below must still be found
+      // by the application's foreground listener, not this baseline barrier.
+      await page.evaluate(async () => {
+        const registration = await navigator.serviceWorker.ready;
+        await registration.update();
       });
       await input.fill("升级后保留的草稿");
       workerRevision = 1;
@@ -701,6 +710,8 @@ const server = http.createServer(async (req, res) => {
         exact: true,
       });
       await update.waitFor();
+      assert.ok(workerRequests.includes(1), "the app's foreground check must request the newly published worker");
+      assert.equal(await update.count(), 1, "the two-pane workspace exposes one global update action");
       assert.equal(
         await input.inputValue(),
         "升级后保留的草稿",

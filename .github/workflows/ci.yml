@@ -166,6 +166,8 @@ jobs:
           node scripts/pwa_image_message_smoke.cjs
           node scripts/pwa_native_input_smoke.cjs
           node scripts/pwa_local_host_smoke.cjs
+          node scripts/pwa_dual_session_smoke.cjs
+          node scripts/pwa_draft_smoke.cjs
           PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
           PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_image_message_smoke.cjs
           PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_native_input_smoke.cjs

@@ -10,6 +10,7 @@ use crate::model::{
 const MAX_TELEMETRY_IDS: usize = 800;
 const INITIAL_INPUT_ORDER: u64 = 0;
 const SESSION_HISTORY_ANCHOR_EXTENSION: &str = "orchestral.dev/session-history-anchor";
+const BUILTIN_HISTORY_RUN_PAGE_LIMIT: usize = 20;
 
 /// Browser-independent state machine for collapsing invalidation bursts into
 /// one authoritative read plus, when events arrive during that read, one
@@ -82,7 +83,20 @@ pub struct SessionsState {
     pub stream_cursors: BTreeMap<String, u64>,
     /// Bounded live suffix used to rebase snapshots read concurrently with SSE.
     pub recent_changes: BTreeMap<String, Vec<AgentSessionChangeView>>,
+    /// Presentation windows only; the full Run catalog remains available for
+    /// live control and pending request routing.
+    pub builtin_history: BTreeMap<String, BuiltinHistoryState>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BuiltinHistoryState {
+    /// Any surviving member locates the visible suffix if its oldest Run is
+    /// removed (for example by a snapshot returning 404).
+    pub visible_run_ids: BTreeSet<String>,
+    pub loading_before: Option<String>,
+    loading_run_ids: Vec<String>,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1217,6 +1231,155 @@ impl AppState {
 
     pub fn ensure_run(&mut self, run_id: &str, session_id: Option<String>) -> &mut RunState {
         self.ensure_run_source(run_id, session_id, None)
+    }
+
+    /// Reopening a built-in conversation starts at its recent suffix, even
+    /// when older snapshots are still cached from an earlier visit.
+    pub fn open_builtin_history(&mut self, session_key: &str) {
+        let Some(session) = self
+            .sessions
+            .items
+            .iter()
+            .find(|session| session.key() == session_key && session.connector_id.is_none())
+        else {
+            return;
+        };
+        let visible_run_ids = session
+            .run_ids
+            .iter()
+            .skip(
+                session
+                    .run_ids
+                    .len()
+                    .saturating_sub(BUILTIN_HISTORY_RUN_PAGE_LIMIT),
+            )
+            .cloned()
+            .collect();
+        let generation = self
+            .sessions
+            .builtin_history
+            .get(session_key)
+            .map_or(1, |history| history.generation.wrapping_add(1));
+        self.sessions.builtin_history.insert(
+            session_key.to_owned(),
+            BuiltinHistoryState {
+                visible_run_ids,
+                loading_before: None,
+                loading_run_ids: Vec::new(),
+                generation,
+            },
+        );
+    }
+
+    fn builtin_history_start(&self, session: &SessionView) -> usize {
+        self.sessions
+            .builtin_history
+            .get(&session.key())
+            .and_then(|history| {
+                session
+                    .run_ids
+                    .iter()
+                    .position(|id| history.visible_run_ids.contains(id))
+            })
+            .unwrap_or_else(|| {
+                session
+                    .run_ids
+                    .len()
+                    .saturating_sub(BUILTIN_HISTORY_RUN_PAGE_LIMIT)
+            })
+    }
+
+    /// Snapshot requests are newest first. Known live Runs outside the
+    /// presentation window still refresh, so pagination never loses control.
+    pub fn session_snapshot_run_ids(&self, session: &SessionView) -> Vec<String> {
+        let start = if session.connector_id.is_none() {
+            self.builtin_history_start(session)
+        } else {
+            0
+        };
+        session
+            .run_ids
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, id)| !id.starts_with("agent-history:"))
+            .filter(|(index, id)| {
+                *index >= start
+                    || self.runs.get(*id).is_some_and(|run| {
+                        matches!(
+                            run.status.as_str(),
+                            "submitting" | "accepted" | "running" | "waiting" | "stopping"
+                        ) || !run.pending.is_empty()
+                    })
+            })
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+
+    pub fn builtin_history_pagination(&self, session: &SessionView) -> Option<bool> {
+        (session.connector_id.is_none() && self.builtin_history_start(session) > 0).then(|| {
+            self.sessions
+                .builtin_history
+                .get(&session.key())
+                .is_some_and(|history| history.loading_before.is_some())
+        })
+    }
+
+    /// Fetch a page without changing the visible boundary until all of its
+    /// snapshots have settled. The boundary also identifies this request.
+    pub fn begin_builtin_history_page(
+        &mut self,
+        session_key: &str,
+    ) -> Option<(u64, String, Vec<String>)> {
+        let session = self
+            .sessions
+            .items
+            .iter()
+            .find(|session| session.key() == session_key && session.connector_id.is_none())?;
+        if self.builtin_history_pagination(session)? {
+            return None;
+        }
+        let end = self.builtin_history_start(session);
+        let start = end.saturating_sub(BUILTIN_HISTORY_RUN_PAGE_LIMIT);
+        let first = session.run_ids.get(start)?.clone();
+        let run_ids = session.run_ids[start..end]
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        let history = self
+            .sessions
+            .builtin_history
+            .entry(session_key.to_owned())
+            .or_default();
+        history.loading_before = Some(first.clone());
+        history.loading_run_ids = run_ids.clone();
+        history.generation = history.generation.wrapping_add(1);
+        Some((history.generation, first, run_ids))
+    }
+
+    pub fn finish_builtin_history_page(
+        &mut self,
+        session_key: &str,
+        generation: u64,
+        first: &str,
+        success: bool,
+    ) -> bool {
+        let Some(history) = self.sessions.builtin_history.get_mut(session_key) else {
+            return false;
+        };
+        if history.generation != generation || history.loading_before.as_deref() != Some(first) {
+            return false;
+        }
+        if success {
+            history
+                .visible_run_ids
+                .extend(std::mem::take(&mut history.loading_run_ids));
+        } else {
+            history.loading_run_ids.clear();
+        }
+        history.loading_before = None;
+        true
     }
 
     pub fn ensure_run_source(
@@ -2440,6 +2603,11 @@ pub fn timeline_run_ids_for_session(state: &AppState, session: &SessionView) -> 
     session
         .run_ids
         .iter()
+        .skip(if session.connector_id.is_none() {
+            state.builtin_history_start(session)
+        } else {
+            0
+        })
         .filter(|run_id| {
             run_id.starts_with("agent-history:") || !represented_runs.contains(run_id.as_str())
         })
@@ -3106,6 +3274,169 @@ mod tests {
 
     fn content(value: &str) -> Value {
         serde_json::json!([{"body": {"kind": "inline", "value": value}}])
+    }
+
+    fn builtin_history_fixture(count: usize) -> AppState {
+        let mut state = AppState::new(true);
+        let session: SessionView = serde_json::from_value(serde_json::json!({
+            "id": "builtin-history", "created_at_unix_ms": 1, "updated_at_unix_ms": 2,
+            "run_ids": (0..count).map(|index| format!("turn-{index}")).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        for id in &session.run_ids {
+            let run = state.ensure_run(id, Some(session.id.clone()));
+            run.optimistic_start_input(id.clone(), 1.0, None);
+            run.status = "delivered".to_owned();
+        }
+        state.sessions.selected_id = Some(session.key());
+        state.sessions.items.push(session);
+        state.open_builtin_history("builtin-history");
+        state
+    }
+
+    #[test]
+    fn builtin_history_opens_recent_runs_newest_request_first_even_with_cached_history() {
+        let state = builtin_history_fixture(65);
+        let session = state.selected_session().unwrap();
+        let requested = state.session_snapshot_run_ids(session);
+        assert_eq!(requested.len(), 20);
+        assert_eq!(requested.first().unwrap(), "turn-64");
+        assert_eq!(requested.last().unwrap(), "turn-45");
+        let displayed = timeline_blocks_for_session(&state, session);
+        assert_eq!(displayed.len(), 20);
+        assert_eq!(displayed.first().unwrap().run_id, "turn-45");
+        assert_eq!(displayed.last().unwrap().run_id, "turn-64");
+        assert_eq!(
+            session.run_ids.len(),
+            65,
+            "control catalog must not be truncated"
+        );
+        assert_eq!(state.builtin_history_pagination(session), Some(false));
+    }
+
+    #[test]
+    fn builtin_history_page_is_atomic_and_new_turns_do_not_shift_the_older_boundary() {
+        let mut state = builtin_history_fixture(65);
+        let (generation, first, requests) =
+            state.begin_builtin_history_page("builtin-history").unwrap();
+        assert_eq!(requests.first().unwrap(), "turn-44");
+        assert_eq!(requests.last().unwrap(), "turn-25");
+        assert!(state
+            .begin_builtin_history_page("builtin-history")
+            .is_none());
+        assert_eq!(
+            timeline_run_ids_for_session(&state, state.selected_session().unwrap()).len(),
+            20
+        );
+        state.sessions.items[0].run_ids.push("turn-65".to_owned());
+        assert!(state.finish_builtin_history_page("builtin-history", generation, &first, true));
+        let session = state.selected_session().unwrap();
+        let displayed = timeline_run_ids_for_session(&state, session);
+        assert_eq!(displayed.len(), 41);
+        assert_eq!(displayed.first().unwrap(), "turn-25");
+        assert_eq!(displayed.last().unwrap(), "turn-65");
+        assert_eq!(
+            state.session_snapshot_run_ids(session).first().unwrap(),
+            "turn-65"
+        );
+        let (generation, first, _) = state.begin_builtin_history_page("builtin-history").unwrap();
+        assert!(state.finish_builtin_history_page("builtin-history", generation, &first, true));
+        let (generation, first, requests) =
+            state.begin_builtin_history_page("builtin-history").unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(state.finish_builtin_history_page("builtin-history", generation, &first, true));
+        assert_eq!(
+            state.builtin_history_pagination(state.selected_session().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn builtin_history_reopening_rejects_previous_page_completion_and_resets_cached_prefix() {
+        let mut state = builtin_history_fixture(65);
+        let (old_generation, old_first, _) =
+            state.begin_builtin_history_page("builtin-history").unwrap();
+        state.open_builtin_history("builtin-history");
+        let (new_generation, first, _) =
+            state.begin_builtin_history_page("builtin-history").unwrap();
+        assert_eq!(old_first, first);
+        assert!(!state.finish_builtin_history_page(
+            "builtin-history",
+            old_generation,
+            &old_first,
+            true
+        ));
+        assert!(state.finish_builtin_history_page("builtin-history", new_generation, &first, true));
+        assert_eq!(
+            timeline_run_ids_for_session(&state, state.selected_session().unwrap()).len(),
+            40
+        );
+        state.open_builtin_history("builtin-history");
+        assert_eq!(
+            timeline_run_ids_for_session(&state, state.selected_session().unwrap()).len(),
+            20
+        );
+    }
+
+    #[test]
+    fn builtin_history_window_keeps_older_live_run_and_approval_routing_available() {
+        let mut state = builtin_history_fixture(65);
+        let run = state.runs.get_mut("turn-2").unwrap();
+        run.status = "waiting".to_owned();
+        run.pending =
+            vec![serde_json::json!({"request_id": "approval", "payload": {"type": "approval"}})];
+        let session = state.selected_session().unwrap();
+        let requests = state.session_snapshot_run_ids(session);
+        assert_eq!(requests.len(), 21);
+        assert_eq!(requests.last().unwrap(), "turn-2");
+        assert_eq!(state.current_run().unwrap().id, "turn-2");
+        assert_eq!(
+            state.current_run().unwrap().pending[0]["request_id"],
+            "approval"
+        );
+        assert_eq!(timeline_run_ids_for_session(&state, session).len(), 20);
+    }
+
+    #[test]
+    fn builtin_history_missing_boundary_runs_keep_surviving_pages_visible() {
+        let mut state = builtin_history_fixture(65);
+        let (generation, first, _) = state.begin_builtin_history_page("builtin-history").unwrap();
+        state.sessions.items[0]
+            .run_ids
+            .retain(|id| id != "turn-25" && id != "turn-45");
+        assert!(state.finish_builtin_history_page("builtin-history", generation, &first, true));
+        let session = state.selected_session().unwrap();
+        let visible = timeline_run_ids_for_session(&state, session);
+        assert_eq!(visible.first().unwrap(), "turn-26");
+        assert_eq!(visible.last().unwrap(), "turn-64");
+        assert_eq!(visible.len(), 38);
+        assert_eq!(state.builtin_history_pagination(session), Some(false));
+    }
+
+    #[test]
+    fn builtin_history_failed_page_keeps_its_boundary_and_can_retry() {
+        let mut state = builtin_history_fixture(65);
+        let (generation, first, requests) =
+            state.begin_builtin_history_page("builtin-history").unwrap();
+        assert!(state.finish_builtin_history_page("builtin-history", generation, &first, false));
+        assert_eq!(
+            timeline_run_ids_for_session(&state, state.selected_session().unwrap()).len(),
+            20
+        );
+        let (_, next_first, retry_requests) =
+            state.begin_builtin_history_page("builtin-history").unwrap();
+        assert_eq!(first, next_first);
+        assert_eq!(requests, retry_requests);
+    }
+
+    #[test]
+    fn external_history_keeps_its_connector_pagination_contract() {
+        let mut state = builtin_history_fixture(65);
+        state.sessions.items[0].connector_id = Some("external/local".to_owned());
+        let session = &state.sessions.items[0];
+        assert_eq!(state.builtin_history_pagination(session), None);
+        assert_eq!(state.session_snapshot_run_ids(session).len(), 65);
+        assert_eq!(timeline_run_ids_for_session(&state, session).len(), 65);
     }
 
     #[test]

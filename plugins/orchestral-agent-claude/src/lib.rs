@@ -196,7 +196,8 @@ impl AgentConnector for ClaudeCodeConnector {
     fn describe(&self) -> AgentConnectorDescriptor {
         AgentConnectorDescriptor {
             connector_id: AgentConnectorId::new(CONNECTOR_ID), provider_binding: ProviderBindingRef::new(CONNECTOR_ID),
-            agent_family: "coding-agent".to_owned(), display_name: "Claude Code".to_owned(),
+            agent_family: "coding-agent".to_owned(),
+            agent_product: Some("claude".to_owned()), display_name: "Claude Code".to_owned(),
             capabilities: AgentSessionCapabilities { list: true, read: true, create: true, resolve_requests: self.native_approvals_enabled() },
             creation: Some(AgentSessionCreationDescriptor {
                 accepts_cwd: true, default_cwd: std::env::current_dir().ok().map(|path| path.to_string_lossy().into_owned()), input_schema: None,
@@ -670,6 +671,15 @@ mod tests {
             session_store_dir: root.join("host"),
             request_timeout: Duration::from_secs(2),
         })
+    }
+
+    #[test]
+    fn descriptor_exposes_product_without_changing_capability_family() {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = connector(root.path()).describe();
+        assert_eq!(descriptor.agent_family, "coding-agent");
+        assert_eq!(descriptor.agent_product.as_deref(), Some("claude"));
+        descriptor.validate().unwrap();
     }
 
     #[tokio::test]

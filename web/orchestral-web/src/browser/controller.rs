@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use dioxus::dioxus_core::Task;
@@ -142,6 +142,10 @@ pub struct LiveTransportControls {
 #[derive(Clone, Copy)]
 pub struct AppController {
     task_scope: AppTaskScope,
+    pub timeline_scope: &'static str,
+    submission_count: Signal<usize>,
+    outbox_owner: Signal<bool>,
+    outbox_sessions: Signal<BTreeSet<String>>,
     pub state: Signal<AppState>,
     pub token: Signal<Option<ApiCredential>>,
     pub pairing_secret: Signal<Option<String>>,
@@ -167,6 +171,10 @@ impl AppController {
     ) -> Self {
         Self {
             task_scope,
+            timeline_scope: "primary",
+            submission_count: Signal::new(0),
+            outbox_owner: Signal::new(false),
+            outbox_sessions: Signal::new(BTreeSet::new()),
             state,
             token,
             pairing_secret,
@@ -181,10 +189,71 @@ impl AppController {
         }
     }
 
+    /// Independent conversation state/transports, shared authentication and
+    /// durable Outbox coordination. Both controllers are owned by App.
+    pub(crate) fn fork(
+        self,
+        state: Signal<AppState>,
+        streams: LiveTransportControls,
+        timeline_scope: &'static str,
+    ) -> Self {
+        Self {
+            state,
+            timeline_scope,
+            stream_abort: streams.run_abort,
+            stream_generation: streams.run_generation,
+            agent_session_stream_abort: streams.agent_session_abort,
+            agent_session_stream_generation: streams.agent_session_generation,
+            agent_session_reconcile: streams.agent_session_reconcile,
+            ..self
+        }
+    }
+
+    pub(crate) fn clear_selection(mut self) {
+        if self.state.peek().sessions.selected_id.is_none()
+            && self.state.peek().ui.loading_session.is_none()
+            && self.stream_abort.peek().is_none()
+            && self.agent_session_stream_abort.peek().is_none()
+        {
+            return;
+        }
+        self.stop_stream_and_set_idle();
+        platform::end_timeline_session(self.timeline_scope);
+        let mut state = self.state.write();
+        state.sessions.selected_id = None;
+        state.ui.loading_session = None;
+        state.ui.drawer_open = false;
+        state.ui.session_actions_open = false;
+        state.ui.timeline_scrolled_away = false;
+    }
+
+    pub(crate) fn sync_catalog(mut self, source: &crate::catalog::CatalogSnapshot) {
+        if !source.matches(&self.state.peek()) {
+            source.apply(&mut self.state.write());
+        }
+    }
+
     /// Run a session operation independently of the dialog or request card
     /// that initiated it. Only App-owned state may be captured by the task.
     pub fn spawn(self, future: impl Future<Output = ()> + 'static) -> Task {
         self.task_scope.spawn(future)
+    }
+
+    /// Page reload must wait for messages across all sessions, including those
+    /// no longer selected in either pane.
+    pub fn has_pending_submissions(self) -> bool {
+        *self.submission_count.read() > 0 || *self.outbox_owner.read()
+    }
+
+    pub fn outbox_is_flushing(self) -> bool {
+        *self.outbox_owner.read()
+            && self
+                .state
+                .read()
+                .sessions
+                .selected_id
+                .as_ref()
+                .is_some_and(|key| self.outbox_sessions.read().contains(key))
     }
 
     pub async fn bootstrap(mut self) {
@@ -300,6 +369,7 @@ impl AppController {
 
     pub async fn clear_auth(mut self, message: Option<String>) {
         self.stop_stream();
+        self.set_busy(false);
         self.token.set(None);
         let _ = storage::clear_token().await;
         let online = self.state.read().connection.online;
@@ -322,13 +392,15 @@ impl AppController {
     }
 
     async fn flush_outbox(mut self) {
-        if self.state.read().ui.outbox_flushing || self.state.read().ui.composer_busy {
+        if *self.outbox_owner.read() || *self.submission_count.read() > 0 {
             return;
         }
+        self.outbox_owner.set(true);
         self.state.write().ui.outbox_flushing = true;
         while platform::is_online()
             && platform::is_document_visible()
             && self.token.read().is_some()
+            && *self.submission_count.read() == 0
         {
             if !self.flush_outbox_pass().await {
                 break;
@@ -336,6 +408,8 @@ impl AppController {
             TimeoutFuture::new(3_000).await;
         }
         self.state.write().ui.outbox_flushing = false;
+        self.outbox_owner.set(false);
+        self.outbox_sessions.write().clear();
     }
 
     async fn flush_outbox_pass(mut self) -> bool {
@@ -353,7 +427,22 @@ impl AppController {
             }
         };
         let mut delivered = false;
+        self.outbox_sessions.set(
+            entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .connector_id
+                        .as_ref()
+                        .map(|connector| format!("{connector}\0{}", entry.session_id))
+                        .unwrap_or_else(|| entry.session_id.clone())
+                })
+                .collect(),
+        );
         for entry in entries {
+            if *self.submission_count.read() > 0 {
+                break;
+            }
             let native_session = if let OutboxOperation::SessionInput { submission_id, .. } =
                 &entry.operation
             {
@@ -711,6 +800,7 @@ impl AppController {
                     let mut state = self.state.write();
                     let stream_cursors = std::mem::take(&mut state.sessions.stream_cursors);
                     let recent_changes = std::mem::take(&mut state.sessions.recent_changes);
+                    let builtin_history = std::mem::take(&mut state.sessions.builtin_history);
                     state.sessions = SessionsState {
                         status: LoadStatus::Ready,
                         items: sessions,
@@ -718,6 +808,7 @@ impl AppController {
                         connector_pages,
                         stream_cursors,
                         recent_changes,
+                        builtin_history,
                         error: None,
                     };
                 }
@@ -908,25 +999,11 @@ impl AppController {
             state.ui.timeline_scrolled_away = false;
         }
         self.load_session_inner(session_key.clone()).await;
-        let still_selected = {
+        {
             let mut state = self.state.write();
             if state.ui.loading_session.as_deref() == Some(session_key.as_str()) {
                 state.ui.loading_session = None;
             }
-            state.sessions.selected_id.as_deref() == Some(session_key.as_str())
-        };
-        if still_selected {
-            let controller = self;
-            self.spawn(async move {
-                // Let Dioxus commit the newly projected timeline before
-                // measuring its scroll height.
-                TimeoutFuture::new(0).await;
-                if controller.state.read().sessions.selected_id.as_deref()
-                    == Some(session_key.as_str())
-                {
-                    platform::scroll_timeline_to_end();
-                }
-            });
         }
     }
 
@@ -950,7 +1027,9 @@ impl AppController {
             state.ui.drawer_open = false;
             state.ui.session_actions_open = false;
             state.ui.timeline_scrolled_away = false;
+            state.open_builtin_history(&session_key);
         }
+        platform::begin_timeline_session(self.timeline_scope, &session_key);
         let mut initial_observer_errors = 0;
         if let Some(connector_id) = session.connector_id.as_deref() {
             let Some(token) = self.token.read().clone() else {
@@ -1010,15 +1089,16 @@ impl AppController {
                 }
             }
         }
-        let current_run_ids = self
-            .state
-            .read()
-            .sessions
-            .items
-            .iter()
-            .find(|item| item.key() == session_key)
-            .map(|item| item.run_ids.clone())
-            .unwrap_or_default();
+        let current_run_ids = {
+            let state = self.state.read();
+            state
+                .sessions
+                .items
+                .iter()
+                .find(|item| item.key() == session_key)
+                .map(|session| state.session_snapshot_run_ids(session))
+                .unwrap_or_default()
+        };
         let run_ids = current_run_ids
             .iter()
             .filter(|run_id| !run_id.starts_with("agent-history:"))
@@ -1062,6 +1142,16 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return;
         };
+        let builtin_session = self
+            .state
+            .read()
+            .selected_session()
+            .filter(|session| session.connector_id.is_none())
+            .cloned();
+        if let Some(session) = builtin_session {
+            self.load_earlier_builtin_history(session).await;
+            return;
+        }
         let Some((session_key, connector_id, session_id, run_id, cursor)) = ({
             let state = self.state.read();
             state.selected_session().and_then(|session| {
@@ -1102,14 +1192,14 @@ impl AppController {
                 let still_selected =
                     self.state.read().sessions.selected_id.as_deref() == Some(session_key.as_str());
                 let anchor = still_selected
-                    .then(platform::timeline_scroll_anchor)
+                    .then(|| platform::timeline_scroll_anchor(self.timeline_scope))
                     .flatten();
+                if anchor.is_some() {
+                    self.state.write().ui.timeline_scrolled_away = true;
+                }
                 self.state.write().prepend_agent_session_history(detail);
                 if let Some(anchor) = anchor {
-                    self.spawn(async move {
-                        TimeoutFuture::new(0).await;
-                        platform::restore_timeline_scroll_anchor(anchor);
-                    });
+                    platform::restore_timeline_scroll_anchor(self.timeline_scope, anchor);
                 }
             }
             Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
@@ -1122,14 +1212,66 @@ impl AppController {
         }
     }
 
+    async fn load_earlier_builtin_history(mut self, session: SessionView) {
+        let session_key = session.key();
+        let Some((generation, first, run_ids)) =
+            self.state.write().begin_builtin_history_page(&session_key)
+        else {
+            return;
+        };
+        let loaded = stream::iter(run_ids)
+            .map(|run_id| {
+                let controller = self;
+                let session_id = session.id.clone();
+                async move {
+                    controller
+                        .load_run_snapshot(&run_id, &session_id, None)
+                        .await
+                }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        let success = loaded.into_iter().all(|loaded| loaded);
+        let still_selected =
+            self.state.read().sessions.selected_id.as_deref() == Some(session_key.as_str());
+        let pending = self
+            .state
+            .read()
+            .sessions
+            .builtin_history
+            .get(&session_key)
+            .is_some_and(|history| {
+                history.generation == generation
+                    && history.loading_before.as_deref() == Some(first.as_str())
+            });
+        let anchor = (still_selected && pending && success)
+            .then(|| platform::timeline_scroll_anchor(self.timeline_scope))
+            .flatten();
+        {
+            let mut state = self.state.write();
+            if state.finish_builtin_history_page(&session_key, generation, &first, success)
+                && anchor.is_some()
+            {
+                state.ui.timeline_scrolled_away = true;
+            }
+        }
+        if let Some(anchor) = anchor {
+            platform::restore_timeline_scroll_anchor(self.timeline_scope, anchor);
+        }
+        if still_selected && pending && !success {
+            self.notice("部分历史记录加载失败，请重试", "error");
+        }
+    }
+
     async fn load_run_snapshot(
         mut self,
         run_id: &str,
         session_id: &str,
         connector_id: Option<&str>,
-    ) {
+    ) -> bool {
         let Some(token) = self.token.read().clone() else {
-            return;
+            return false;
         };
         let cursor = {
             let mut state = self.state.write();
@@ -1145,6 +1287,7 @@ impl AppController {
             self.api.events(&token, run_id, cursor, connector_id),
             self.api.get_run(&token, run_id, connector_id)
         );
+        let events_loaded = events.is_ok();
         if let Ok(page) = events {
             let now = platform::now();
             let mut state = self.state.write();
@@ -1169,8 +1312,12 @@ impl AppController {
                     )
                     .apply_view(view, platform::now());
                 state.reconcile_request_actions(run_id);
+                events_loaded
             }
-            Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
+            Err(error) if error.status == 401 => {
+                self.clear_auth(Some(error.message)).await;
+                false
+            }
             Err(error) if error.status == 404 => {
                 let mut state = self.state.write();
                 state.runs.remove(run_id);
@@ -1178,6 +1325,7 @@ impl AppController {
                 for session in &mut state.sessions.items {
                     session.run_ids.retain(|id| id != run_id);
                 }
+                true
             }
             Err(error) => {
                 let mut state = self.state.write();
@@ -1190,6 +1338,7 @@ impl AppController {
                 if run.status == "loading" {
                     run.status = "unknown".to_owned();
                 }
+                false
             }
         }
     }
@@ -1270,6 +1419,7 @@ impl AppController {
                 let session = summary.into_session();
                 let session_key = session.key();
                 self.stop_stream();
+                platform::begin_timeline_session(self.timeline_scope, &session_key);
                 self.upsert_session(session.clone(), false);
                 {
                     let mut state = self.state.write();
@@ -1449,7 +1599,7 @@ impl AppController {
         let input = text.trim().to_owned();
         if (input.is_empty() && attachments.is_empty())
             || self.state.read().ui.composer_busy
-            || self.state.read().ui.outbox_flushing
+            || self.outbox_is_flushing()
         {
             return false;
         }
@@ -1557,7 +1707,11 @@ impl AppController {
                         self.notice(&message, "info");
                     }
                     self.spawn(async move {
-                        self.load_session(operation_session_key).await;
+                        if self.state.read().sessions.selected_id.as_deref()
+                            == Some(operation_session_key.as_str())
+                        {
+                            self.load_session(operation_session_key).await;
+                        }
                     });
                     true
                 }
@@ -1638,10 +1792,7 @@ impl AppController {
                     native_anchor_id.clone(),
                 );
             self.state.write().ui.timeline_scrolled_away = false;
-            self.spawn(async move {
-                TimeoutFuture::new(0).await;
-                platform::scroll_timeline_to_end();
-            });
+            platform::scroll_timeline_to_end(self.timeline_scope);
             let accepted = match self
                 .api
                 .steer(
@@ -1747,10 +1898,7 @@ impl AppController {
             .optimistic_start_input(display_input.clone(), now, native_anchor_id.clone());
         self.state.write().ui.timeline_scrolled_away = false;
         self.stop_stream();
-        self.spawn(async move {
-            TimeoutFuture::new(0).await;
-            platform::scroll_timeline_to_end();
-        });
+        platform::scroll_timeline_to_end(self.timeline_scope);
 
         let start = match session.connector_id.as_deref() {
             Some(connector_id) => {
@@ -2238,15 +2386,14 @@ impl AppController {
                             self.state.read().observable_run().map(|run| run.id.clone());
                         let missing = {
                             let mut state = self.state.write();
-                            let missing = session
-                                .run_ids
-                                .iter()
+                            let missing = state
+                                .session_snapshot_run_ids(&session)
+                                .into_iter()
                                 .filter(|id| {
-                                    state.runs.get(*id).is_none_or(|run| {
+                                    state.runs.get(id).is_none_or(|run| {
                                         run.view.is_none() || run.cursor < run.server_cursor
                                     })
                                 })
-                                .cloned()
                                 .collect::<Vec<_>>();
                             merge_session_page(&mut state.sessions.items, vec![session]);
                             if self.stream_abort.read().is_none() {
@@ -3160,7 +3307,7 @@ impl AppController {
     }
 
     pub fn update_timeline_scroll_state(mut self) {
-        let scrolled_away = !platform::timeline_is_near_end();
+        let scrolled_away = !platform::timeline_should_follow(self.timeline_scope);
         let mut state = self.state.write();
         if state.ui.timeline_scrolled_away != scrolled_away {
             state.ui.timeline_scrolled_away = scrolled_away;
@@ -3168,17 +3315,16 @@ impl AppController {
     }
 
     fn follow_timeline_after_render(self) {
-        self.spawn(async move {
-            TimeoutFuture::new(0).await;
-            if !self.state.read().ui.timeline_scrolled_away {
-                platform::scroll_timeline_to_end();
-            }
-        });
+        if !self.state.read().ui.timeline_scrolled_away
+            && platform::timeline_should_follow(self.timeline_scope)
+        {
+            platform::scroll_timeline_to_end(self.timeline_scope);
+        }
     }
 
     pub fn jump_timeline_to_latest(mut self) {
         self.state.write().ui.timeline_scrolled_away = false;
-        platform::scroll_timeline_to_end();
+        platform::scroll_timeline_to_end(self.timeline_scope);
     }
 
     pub fn set_theme(mut self, theme: String) {
@@ -3203,7 +3349,15 @@ impl AppController {
     }
 
     fn set_busy(mut self, busy: bool) {
-        self.state.write().ui.composer_busy = busy;
+        if self.state.peek().ui.composer_busy != busy {
+            self.state.write().ui.composer_busy = busy;
+            let count = *self.submission_count.peek();
+            self.submission_count.set(if busy {
+                count.saturating_add(1)
+            } else {
+                count.saturating_sub(1)
+            });
+        }
     }
 
     fn upsert_session(mut self, session: SessionView, select: bool) {
@@ -3229,6 +3383,9 @@ impl AppController {
         state.sessions.status = LoadStatus::Ready;
         state.sessions.error = None;
         if select {
+            if state.sessions.selected_id.as_deref() != Some(session_key.as_str()) {
+                platform::begin_timeline_session(self.timeline_scope, &session_key);
+            }
             state.sessions.selected_id = Some(session_key);
             state.ui.timeline_scrolled_away = false;
         }

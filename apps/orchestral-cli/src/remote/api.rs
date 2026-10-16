@@ -3905,6 +3905,7 @@ mod tests {
                 connector_id: AgentConnectorId::new("fixture/local"),
                 provider_binding: ProviderBindingRef::new("fixture/external"),
                 agent_family: "test-agent".to_owned(),
+                agent_product: None,
                 display_name: "Fixture Agent".to_owned(),
                 capabilities: AgentSessionCapabilities {
                     create: true,

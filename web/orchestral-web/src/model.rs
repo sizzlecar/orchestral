@@ -111,6 +111,8 @@ pub struct AgentConnectorView {
     pub connector_id: String,
     pub display_name: String,
     pub agent_family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_product: Option<String>,
     pub capabilities: AgentSessionCapabilitiesView,
     #[serde(default)]
     pub creation: Option<AgentSessionCreationView>,

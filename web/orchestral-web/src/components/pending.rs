@@ -7,6 +7,7 @@ use crate::state::{content_text, RunState};
 #[component]
 pub fn PendingPanel() -> Element {
     let controller = consume_context::<AppController>();
+    let mut collapsed = use_signal(|| false);
     let requests = {
         let state = controller.state.read();
         state
@@ -32,8 +33,16 @@ pub fn PendingPanel() -> Element {
     let count = requests.len();
     rsx! {
         section { class: "pending-panel", aria_label: "待处理请求", aria_live: "polite",
-            div { class: "pending-panel__header", role: "status", "需要你处理 · {count} 项" }
-            div { class: "pending-panel__body", tabindex: "0", aria_label: "待处理请求列表",
+            div { class: "pending-panel__header",
+                span { role: "status", "需要你处理 · {count} 项" }
+                button { class: "pending-panel__toggle", r#type: "button",
+                    aria_label: if collapsed() { "展开待处理请求" } else { "收起待处理请求" },
+                    aria_expanded: !collapsed(),
+                    onclick: move |_| collapsed.toggle(),
+                    if collapsed() { "展开" } else { "收起" }
+                }
+            }
+            div { class: "pending-panel__body", hidden: collapsed(), tabindex: "0", aria_label: "待处理请求列表",
                 for (run, request, can_resolve) in requests {
                     PendingCard { key: "{run.id}:{request_id(&request)}", run, request, can_resolve }
                 }

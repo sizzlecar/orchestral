@@ -4,6 +4,17 @@ The mobile control surface is a Dioxus 0.7 WebAssembly application. It consumes
 the existing `/api/v1` Host API; browser rendering is not coupled to runtime or
 model-provider code.
 
+The workspace starts on Codex. The Codex, Claude Code, and Orch tabs open the
+two most recently updated sessions in vertically stacked panes. Each pane owns
+its selection, transcript, controls, draft, and live connection. Background
+refresh preserves manually selected sessions. Open the pane's title to choose
+an older session; a session already shown in the other pane is excluded.
+
+Opening a conversation follows the latest message after layout commits. Built-in
+Orch sessions initially load their latest 20 Runs, newest first, while displaying
+them chronologically. Earlier Runs are loaded on demand with the reading position
+preserved. Run event streams remain complete for correct protocol reduction.
+
 ## Boundaries
 
 - `state.rs` is the deterministic reducer and timeline projection.
@@ -49,6 +60,8 @@ Run from the repository root:
 ```sh
 node scripts/pwa_browser_smoke.cjs
 node scripts/pwa_local_host_smoke.cjs
+node scripts/pwa_dual_session_smoke.cjs
+node scripts/pwa_draft_smoke.cjs
 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_image_message_smoke.cjs
@@ -61,6 +74,9 @@ the real release bundle with an isolated HTTP fixture on a random loopback
 port. It checks ambiguous submission retry, stable identity, message ordering,
 approval visibility and retry, per-session drafts, IME Enter, offline editing,
 and mobile layout. Screenshots are written to `target/pwa-smoke/`.
+
+The draft smoke verifies that storage failures preserve in-memory drafts and
+that uploads completing after a session moves between panes remain visible.
 
 The image-message smoke uploads real image bytes and reconciles the local
 preview, HTTP acknowledgement, durable input event, refreshed signed attachment
