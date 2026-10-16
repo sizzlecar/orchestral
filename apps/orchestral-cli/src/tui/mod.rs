@@ -8,6 +8,7 @@ mod app;
 mod clipboard;
 mod editor;
 mod files;
+mod goal;
 mod history;
 mod input_queue;
 mod insights;

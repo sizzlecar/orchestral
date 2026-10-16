@@ -54,15 +54,16 @@ use orchestral_runtime::tools::{
     approved_host_exec_command_descriptor, guarded_apply_patch_descriptor,
     guarded_artifact_read_v2_descriptor, guarded_file_edit_descriptor,
     guarded_file_read_descriptor, guarded_file_search_descriptor, guarded_file_write_descriptor,
-    guarded_schedule_create_descriptor, guarded_schedule_delete_descriptor,
-    guarded_schedule_list_descriptor, guarded_session_read_descriptor,
-    guarded_text_search_descriptor, workspace_exec_command_descriptor,
-    workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedApplyPatchExecutor,
-    GuardedArtifactReadExecutor, GuardedExecCommandExecutor, GuardedFileEditExecutor,
-    GuardedFileReadExecutor, GuardedFileSearchExecutor, GuardedFileWriteExecutor,
+    guarded_goal_update_descriptor, guarded_schedule_create_descriptor,
+    guarded_schedule_delete_descriptor, guarded_schedule_list_descriptor,
+    guarded_session_read_descriptor, guarded_text_search_descriptor,
+    workspace_exec_command_descriptor, workspace_write_stdin_descriptor,
+    CommandEnvironmentSnapshot, GuardedApplyPatchExecutor, GuardedArtifactReadExecutor,
+    GuardedExecCommandExecutor, GuardedFileEditExecutor, GuardedFileReadExecutor,
+    GuardedFileSearchExecutor, GuardedFileWriteExecutor, GuardedGoalUpdateExecutor,
     GuardedScheduleCreateExecutor, GuardedScheduleDeleteExecutor, GuardedScheduleListExecutor,
     GuardedSessionReadExecutor, GuardedTextSearchExecutor, GuardedWriteStdinExecutor,
-    SessionScheduleRegistry,
+    SessionGoalRegistry, SessionScheduleRegistry,
 };
 use orchestral_runtime::{
     AgentClient, AgentControlEvent, AgentController, AgentSessionSummarizer, ContinuationPolicy,
@@ -248,6 +249,7 @@ pub struct AgentHost {
     session_origin: SessionOrigin,
     pub(crate) skill_manager: SkillManager,
     pub(crate) schedules: SessionScheduleRegistry,
+    pub(crate) goals: SessionGoalRegistry,
     controller: Arc<AgentController>,
     resources: Vec<ResourceBinding>,
     mcp_registry: McpToolsAdapterRegistry,
@@ -270,6 +272,7 @@ impl AgentHost {
             Some(self.journals.clone()),
             self.local_input_available,
             Some(self.schedules.clone()),
+            Some(self.goals.clone()),
             self.session_timers_enabled,
         )
         .await?;
@@ -290,6 +293,7 @@ impl AgentHost {
                 None,
                 self.local_input_available,
                 Some(self.schedules.clone()),
+                Some(self.goals.clone()),
                 self.session_timers_enabled,
             )
             .await
@@ -302,7 +306,7 @@ impl AgentHost {
 }
 
 pub async fn build_agent_host(options: &AgentRunOptions) -> anyhow::Result<AgentHost> {
-    build_agent_host_with_journals(options, None, None, None, false).await
+    build_agent_host_with_journals(options, None, None, None, None, false).await
 }
 
 async fn build_agent_host_with_journals(
@@ -310,6 +314,7 @@ async fn build_agent_host_with_journals(
     shared: Option<CliJournalStores>,
     local_input_available: Option<bool>,
     shared_schedules: Option<SessionScheduleRegistry>,
+    shared_goals: Option<SessionGoalRegistry>,
     session_timers_enabled: bool,
 ) -> anyhow::Result<AgentHost> {
     let workspaces = CliWorkspaceSet::resolve(options.cwd.as_deref(), &options.add_dirs)?;
@@ -514,6 +519,7 @@ async fn build_agent_host_with_journals(
     recall_bounds.environment = EnvironmentPolicy::default();
     recall_bounds.allowed_credentials.clear();
     let schedules = shared_schedules.unwrap_or_default();
+    let goals = shared_goals.unwrap_or_default();
     tool_runtime
         .register(
             guarded_session_read_descriptor(ToolRestriction {
@@ -526,6 +532,17 @@ async fn build_agent_host_with_journals(
         )
         .context("register guarded session_read Tool")?;
     if session_timers_enabled {
+        tool_runtime
+            .register(
+                guarded_goal_update_descriptor(ToolRestriction {
+                    bounds: recall_bounds.clone(),
+                }),
+                Arc::new(GuardedGoalUpdateExecutor::new(
+                    run_journal.clone(),
+                    goals.clone(),
+                )),
+            )
+            .context("register guarded goal_update Tool")?;
         tool_runtime
             .register(
                 guarded_schedule_create_descriptor(ToolRestriction {
@@ -689,6 +706,7 @@ async fn build_agent_host_with_journals(
         },
         skill_manager,
         schedules,
+        goals,
         session_history,
         session_origin,
         controller,
@@ -719,6 +737,7 @@ pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
             &options,
             None,
             Some(local_input_available),
+            None,
             None,
             session_timers_enabled,
         )

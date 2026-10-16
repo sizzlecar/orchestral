@@ -323,6 +323,7 @@ pub(crate) struct UiState {
     pub context_budget: Option<u64>,
     /// Latest model input tokens and whether the count is estimated.
     pub context_input_tokens: Option<(u64, bool)>,
+    pub goal_badge: Option<String>,
     pub input_queue: super::input_queue::InputQueueState,
     pub terminal_size: (u16, u16),
     pub phase: UiPhase,
@@ -381,6 +382,7 @@ impl UiState {
             model: model.into(),
             context_budget: None,
             context_input_tokens: None,
+            goal_badge: None,
             input_queue: Default::default(),
             terminal_size: (80, 24),
             phase: UiPhase::Idle,

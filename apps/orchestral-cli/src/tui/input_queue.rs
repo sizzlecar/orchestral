@@ -132,7 +132,25 @@ pub(crate) fn menu(state: &UiState) -> Menu {
                 LocalAction::WithdrawQueuedInput(message.id.clone()),
                 "Remove this message if the Agent has not received it yet",
             ));
+        } else {
+            choices.push(Choice::action(
+                format!("Dismiss unsent message {}", index + 1),
+                LocalAction::DismissQueuedInput(message.id.clone()),
+                "Remove this unsent message from the queue",
+            ));
         }
+    }
+    if state
+        .input_queue
+        .pending
+        .iter()
+        .any(|message| !is_active(state, message))
+    {
+        choices.push(Choice::action(
+            "Clear all unsent messages",
+            LocalAction::ClearUnsentInputs,
+            "Remove all unsent messages from the queue",
+        ));
     }
     Menu::new(
         MenuKind::Commands,
@@ -143,7 +161,21 @@ pub(crate) fn menu(state: &UiState) -> Menu {
 
 pub(crate) fn route_effect(effect: &UiEffect, state: &mut UiState) -> Option<Vec<UiEffect>> {
     match effect {
-        UiEffect::HostCommand { command } if command == "/queue" => {
+        UiEffect::HostCommand { command }
+            if command == "/queue" || command.starts_with("/queue ") =>
+        {
+            if matches!(
+                command.trim(),
+                "/queue clear" | "/queue dismiss" | "/queue clean"
+            ) {
+                return route_effect(
+                    &UiEffect::LocalAction {
+                        action: LocalAction::ClearUnsentInputs,
+                        return_to: None,
+                    },
+                    state,
+                );
+            }
             state.menu = Some(menu(state));
             Some(Vec::new())
         }
@@ -177,7 +209,13 @@ pub(crate) fn route_effect(effect: &UiEffect, state: &mut UiState) -> Option<Vec
                 }
                 state.composer = message.text;
                 state.composer_cursor = state.composer.len();
-                state.input_queue.editing = active.then_some(message.id);
+                state.input_queue.editing = active.then_some(message.id.clone());
+                if !active {
+                    state
+                        .input_queue
+                        .pending
+                        .retain(|pending| pending.id != message.id);
+                }
                 state.menu = None;
             } else {
                 state.ui_notice = Some("This message is no longer queued".to_owned());
@@ -207,6 +245,42 @@ pub(crate) fn route_effect(effect: &UiEffect, state: &mut UiState) -> Option<Vec
                     })
                     .unwrap_or_default(),
             )
+        }
+        UiEffect::LocalAction {
+            action: LocalAction::DismissQueuedInput(id),
+            ..
+        } => {
+            let active_ids = state
+                .input_queue
+                .pending
+                .iter()
+                .filter(|message| is_active(state, message))
+                .map(|message| message.id.clone())
+                .collect::<BTreeSet<_>>();
+            state
+                .input_queue
+                .pending
+                .retain(|message| &message.id != id || active_ids.contains(&message.id));
+            state.menu = (!state.input_queue.pending.is_empty()).then(|| menu(state));
+            Some(Vec::new())
+        }
+        UiEffect::LocalAction {
+            action: LocalAction::ClearUnsentInputs,
+            ..
+        } => {
+            let active_ids = state
+                .input_queue
+                .pending
+                .iter()
+                .filter(|message| is_active(state, message))
+                .map(|message| message.id.clone())
+                .collect::<BTreeSet<_>>();
+            state
+                .input_queue
+                .pending
+                .retain(|message| active_ids.contains(&message.id));
+            state.menu = (!state.input_queue.pending.is_empty()).then(|| menu(state));
+            Some(Vec::new())
         }
         _ => None,
     }
@@ -352,8 +426,8 @@ mod tests {
         assert!(!is_active(&state, &state.input_queue.pending[0]));
         assert_eq!(
             menu(&state).choices.len(),
-            1,
-            "unsent input can be copied, not edited in a stopped Run"
+            3,
+            "unsent input can be copied or dismissed, not edited in a stopped Run"
         );
     }
 
