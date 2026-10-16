@@ -106,9 +106,20 @@ impl AgentSessionCompactor {
                 .collect::<Vec<_>>();
             let serialized = serde_json::to_string(&current_messages)
                 .map_err(|error| SessionContextError::Compaction(error.to_string()))?;
+            let original_messages = originals
+                .iter()
+                .flat_map(|group| group.messages.iter())
+                .collect::<Vec<_>>();
+            let originals_serialized = serde_json::to_string(&original_messages)
+                .map_err(|error| SessionContextError::Compaction(error.to_string()))?;
             // This is a generation hint, not token accounting. Full-input
             // metering below is authoritative for the selected token policy.
-            let mut max_chars = (serialized.chars().count() / 2).max(256);
+            let mut max_chars = (serialized
+                .chars()
+                .count()
+                .max(originals_serialized.chars().count())
+                / 2)
+            .max(256);
             let focus_messages = groups
                 .values()
                 .filter(|group| group.pinned && !source.contains(group.producer_seq))

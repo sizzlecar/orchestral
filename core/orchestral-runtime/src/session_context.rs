@@ -410,11 +410,21 @@ fn replay_groups(
 ) -> Result<BTreeMap<u64, MessageGroup>, SessionContextError> {
     let mut groups = BTreeMap::new();
     let mut loaded_skills = BTreeMap::new();
+    let latest_current_run_input_seq = records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.run_id == *current_run_id
+                && matches!(record.payload, AgentSessionEvent::RunInputCommitted { .. })
+        })
+        .map(|record| record.session_seq);
     for record in records {
         match &record.payload {
             AgentSessionEvent::RunInputCommitted { message } => {
                 let is_current_run = record.run_id == *current_run_id;
-                let projected_message = if is_current_run {
+                let retain_raw_inline_data =
+                    is_current_run && latest_current_run_input_seq == Some(record.session_seq);
+                let projected_message = if retain_raw_inline_data {
                     message.clone()
                 } else {
                     sanitize_historical_user_message(message)
@@ -4264,5 +4274,90 @@ mod tests {
         assert_eq!(successful + overflowed, HISTORIES * CONFIGS_PER_HISTORY);
         assert!(successful > 0);
         assert!(overflowed > 0);
+    }
+
+    #[test]
+    fn replay_groups_retains_latest_current_run_inline_data_across_tool_exchanges() {
+        let session_id = AgentSessionId::new("inline-data-session");
+        let old_run_id = RunId::new("old-run");
+        let current_run_id = RunId::new("current-run");
+        let old_image = ModelMessage {
+            role: ModelRole::User,
+            content: vec![
+                ModelContent::Text {
+                    text: "old screenshot".to_owned(),
+                },
+                ModelContent::Data {
+                    media_type: "image/png".to_owned(),
+                    value: json!("iVBORw0KGgoAAAANSUhEUg=="),
+                },
+            ],
+        };
+        let current_image = ModelMessage {
+            role: ModelRole::User,
+            content: vec![
+                ModelContent::Text {
+                    text: "current screenshot".to_owned(),
+                },
+                ModelContent::Data {
+                    media_type: "image/png".to_owned(),
+                    value: json!("iVBORw0KGgoAAAANSUhEUg=="),
+                },
+            ],
+        };
+        let mut records = Vec::new();
+        push_session_record(
+            &mut records,
+            &session_id,
+            &old_run_id,
+            1,
+            AgentSessionEvent::RunInputCommitted { message: old_image },
+        );
+        push_session_record(
+            &mut records,
+            &session_id,
+            &current_run_id,
+            2,
+            AgentSessionEvent::RunInputCommitted {
+                message: current_image.clone(),
+            },
+        );
+        for round in 1..=4_u64 {
+            let call_id = ModelToolCallId::new(format!("call-{round}"));
+            push_session_record(
+                &mut records,
+                &session_id,
+                &current_run_id,
+                2 + round,
+                AgentSessionEvent::ToolExchangeCommitted {
+                    request_id: ModelRequestId::new(format!("req-{round}")),
+                    assistant: ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![ModelContent::ToolCall {
+                            call_id: call_id.clone(),
+                            name: "inspect".to_owned(),
+                            arguments: json!({"round": round}),
+                            extensions: Default::default(),
+                        }],
+                    },
+                    tool: ModelMessage {
+                        role: ModelRole::Tool,
+                        content: vec![ModelContent::ToolResult {
+                            call_id,
+                            result: json!({"ok": true}),
+                            is_error: false,
+                        }],
+                    },
+                    retained_artifacts: Vec::new(),
+                    usage: None,
+                },
+            );
+        }
+        let groups = replay_groups(&records, &current_run_id, &BTreeMap::new()).unwrap();
+        assert!(matches!(
+            &groups[&1].messages[0].content[1],
+            ModelContent::Text { text } if text.contains("historical inline data")
+        ));
+        assert_eq!(groups[&2].messages[0], current_image);
     }
 }
