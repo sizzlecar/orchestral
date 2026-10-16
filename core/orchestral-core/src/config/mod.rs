@@ -170,9 +170,9 @@ impl Default for AgentConfig {
 pub enum SessionSummarizerStrategy {
     /// Model-assisted structured working-memory handoff with deterministic
     /// extractive fallback.
-    #[default]
     ModelAssisted,
     /// Deterministic extractive transcript compaction without model calls.
+    #[default]
     DeterministicExtractive,
 }
 

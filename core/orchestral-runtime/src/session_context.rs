@@ -197,10 +197,10 @@ impl AgentSessionContextEngine {
         }
 
         // Bound historical context (summaries and older exchanges outside the
-        // current Run) so barriers such as retained artifacts cannot cause
-        // historical summaries to accumulate linearly across a long Session.
-        // Older historical groups beyond this cap become deferred_ranges and
-        // remain accessible on demand through session_read.
+        // Bound total historical context (all non-pinned groups outside the
+        // current Run) so barriers or uncompacted historical islands cannot
+        // accumulate across a long Session. Older historical groups beyond this
+        // cap become deferred_ranges and remain accessible via session_read.
         let historical_token_allowance = input_budget
             .saturating_sub(pinned_tokens)
             .min((input_budget / 4).clamp(4_096, 24_576));
@@ -226,6 +226,7 @@ impl AgentSessionContextEngine {
                 let AgentSessionEvent::RunInputCommitted { message } = &record.payload else {
                     unreachable!()
                 };
+                let sanitized_anchor = sanitize_historical_user_message(message);
                 let mut candidate_groups = groups.clone();
                 candidate_groups
                     .entry(record.session_seq)
@@ -234,7 +235,7 @@ impl AgentSessionContextEngine {
                         producer_seq: record.session_seq,
                         source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
-                        messages: vec![message.clone()],
+                        messages: vec![sanitized_anchor],
                         pinned: false,
                         active_compactable: false,
                     });
@@ -253,6 +254,7 @@ impl AgentSessionContextEngine {
             }
         }
 
+        let mut summary_budget_exhausted = false;
         for group in groups
             .values()
             .rev()
@@ -263,20 +265,22 @@ impl AgentSessionContextEngine {
                     .saturating_sub(usize::from(retained_anchor.is_some())),
             )
         {
+            let is_summary = group
+                .messages
+                .first()
+                .is_some_and(placement::is_summary_context);
+            if is_summary && summary_budget_exhausted {
+                continue;
+            }
             let mut candidate = selected.clone();
             candidate.insert(group.key);
             let messages = assemble_messages(&request.system_message, &groups, &candidate);
-            let ceiling = if group
-                .messages
-                .first()
-                .is_some_and(placement::is_summary_context)
-            {
-                historical_budget
-            } else {
-                input_budget
-            };
-            if self.context_input_tokens(&messages, &request.tools, policy)? <= ceiling {
+            if self.context_input_tokens(&messages, &request.tools, policy)? <= historical_budget {
                 selected = candidate;
+            } else if is_summary {
+                // Stop selecting older summaries once a recent summary no longer fits,
+                // rather than skipping recent summaries to pull in ancient ones.
+                summary_budget_exhausted = true;
             }
         }
         let messages = assemble_messages(&request.system_message, &groups, &selected);
@@ -409,6 +413,12 @@ fn replay_groups(
     for record in records {
         match &record.payload {
             AgentSessionEvent::RunInputCommitted { message } => {
+                let is_current_run = record.run_id == *current_run_id;
+                let projected_message = if is_current_run {
+                    message.clone()
+                } else {
+                    sanitize_historical_user_message(message)
+                };
                 groups.insert(
                     record.session_seq,
                     MessageGroup {
@@ -416,8 +426,8 @@ fn replay_groups(
                         producer_seq: record.session_seq,
                         source_ranges: vec![single_range(record.session_seq)],
                         logical_source: single_range(record.session_seq),
-                        messages: vec![message.clone()],
-                        pinned: record.run_id == *current_run_id,
+                        messages: vec![projected_message],
+                        pinned: is_current_run,
                         active_compactable: false,
                     },
                 );
@@ -956,7 +966,11 @@ pub fn select_compaction_source(
                 _ => false,
             };
         if shadowed_record || is_barrier {
-            let historical_seal = !shadowed_record && record.run_id != *current_run_id;
+            // Any unshadowed historical segment before a shadowed range or a
+            // historical barrier is already sealed and can no longer grow;
+            // allow it to be compacted as a sealed island so out-of-order
+            // compactions never leave permanent raw islands in the journal.
+            let historical_seal = record.run_id != *current_run_id;
             close_segment(&mut segments, &mut current, historical_seal);
             continue;
         }
@@ -987,14 +1001,21 @@ pub fn select_compaction_source(
     }
     close_segment(&mut segments, &mut current, false);
 
+    let segment_count = segments.len();
     let total_non_summary_records: usize = segments.iter().map(|s| s.non_summary_records).sum();
-    segments.into_iter().find_map(|segment| {
-        let count_ready = segment.non_summary_records >= policy.minimum_source_records;
-        let volume_ready = segment.byte_volume >= COMPACTION_SOURCE_VOLUME_BYTES;
-        let sealed_island_ready = segment.sealed_by_historical_barrier
-            && total_non_summary_records >= policy.minimum_source_records;
-        (count_ready || volume_ready || sealed_island_ready).then_some(segment.range)
-    })
+    segments
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, segment)| {
+            let count_ready = segment.non_summary_records >= policy.minimum_source_records;
+            let volume_ready = segment.byte_volume >= COMPACTION_SOURCE_VOLUME_BYTES;
+            let has_later_segment = index + 1 < segment_count;
+            let sealed_island_ready = segment.sealed_by_historical_barrier
+                && (has_later_segment
+                    || total_non_summary_records >= policy.minimum_source_records
+                    || historical_unshadowed_bytes >= COMPACTION_SOURCE_VOLUME_BYTES);
+            (count_ready || volume_ready || sealed_island_ready).then_some(segment.range)
+        })
 }
 
 /// Selects a contiguous, currently materialized prefix of complete Tool
@@ -1870,6 +1891,53 @@ fn excerpt_summary_chars(value: &str, limit: usize) -> String {
         .collect()
 }
 
+const HISTORICAL_INLINE_DATA_MAX_BYTES: usize = 4_096;
+
+fn sanitize_historical_user_message(message: &ModelMessage) -> ModelMessage {
+    let mut changed = false;
+    let mut content = Vec::with_capacity(message.content.len());
+    for part in &message.content {
+        match part {
+            ModelContent::Data { media_type, value } => {
+                let encoded_len = value
+                    .as_str()
+                    .map(str::len)
+                    .unwrap_or_else(|| serde_json::to_vec(value).map_or(0, |b| b.len()));
+                if media_type.starts_with("image/")
+                    || encoded_len > HISTORICAL_INLINE_DATA_MAX_BYTES
+                {
+                    changed = true;
+                    content.push(ModelContent::Text {
+                        text: format!(
+                            "[historical inline data ({media_type}, {encoded_len} bytes) omitted from active context; use session_read if raw payload is needed]"
+                        ),
+                    });
+                } else {
+                    content.push(part.clone());
+                }
+            }
+            ModelContent::Text { text } => {
+                let sanitized = sanitize_inline_data_payloads(text);
+                if sanitized != *text {
+                    changed = true;
+                    content.push(ModelContent::Text { text: sanitized });
+                } else {
+                    content.push(part.clone());
+                }
+            }
+            _ => content.push(part.clone()),
+        }
+    }
+    if changed {
+        ModelMessage {
+            role: message.role,
+            content,
+        }
+    } else {
+        message.clone()
+    }
+}
+
 fn sanitize_inline_data_payloads(text: &str) -> String {
     const MARKER: &str = "data[";
     if !text.contains(MARKER) && !text.contains("data:image/") {
@@ -2003,6 +2071,16 @@ impl AgentSessionCompactor {
 
     pub fn summarizer_descriptor(&self) -> &SessionSummarizerDescriptor {
         &self.summarizer_descriptor
+    }
+
+    pub async fn has_compaction_candidate(
+        &self,
+        session_id: &AgentSessionId,
+        current_run_id: &RunId,
+    ) -> Result<bool, SessionContextError> {
+        let records = self.journal.load_session(session_id).await?;
+        validate_session_trace(session_id, &records)?;
+        Ok(select_compaction_source(&records, current_run_id, &self.policy).is_some())
     }
 
     pub async fn compact_if_needed(

@@ -1055,7 +1055,10 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.upsert_tool(projection);
             state.viewport.changed();
         }
-        UiMsg::ProgressReported { summary } => state.working_detail = Some(summary),
+        UiMsg::ProgressReported { summary } => {
+            let trimmed = summary.trim();
+            state.working_detail = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
         UiMsg::ProcessActivity {
             run_id,
             session_id,
