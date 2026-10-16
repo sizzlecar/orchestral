@@ -40,8 +40,8 @@ pub(super) fn context_output_cap(
     preferred.min(backend_context_limit(inner).saturating_sub(planned_input))
 }
 
-const WORKING_SET_HIGH_WATERMARK_TOKENS: u64 = 128 * 1024;
-const WORKING_SET_LOW_WATERMARK_TOKENS: u64 = 80 * 1024;
+const WORKING_SET_HIGH_WATERMARK_TOKENS: u64 = 160 * 1024;
+const WORKING_SET_LOW_WATERMARK_TOKENS: u64 = 112 * 1024;
 
 pub(super) async fn project_model_context(
     inner: &GenericInner,

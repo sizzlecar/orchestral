@@ -438,12 +438,37 @@ impl ModelTokenMeter for GeminiModelBackend {
             .saturating_add((tools.len() as u64).saturating_mul(32));
         // Planning only: subsequent requests are calibrated against observed
         // provider input usage by the runtime's verified-prefix meter. Keep the
-        // byte upper bound unchanged for hard resource/cost reservations.
+        // byte upper bound unchanged for hard resource/cost reservations, while
+        // discounting inline base64 image payloads so a single screenshot does
+        // not masquerade as hundreds of thousands of text tokens on round 1.
         let bytes = self
             .count_request_input(messages, tools)?
             .saturating_sub(framing);
+        let mut inline_image_bytes = 0_u64;
+        let mut inline_image_tokens = 0_u64;
+        for message in messages {
+            for content in &message.content {
+                if let ModelContent::Data {
+                    media_type,
+                    value: Value::String(data),
+                } = content
+                {
+                    if media_type.starts_with("image/") && !data.trim().is_empty() {
+                        let raw = data
+                            .strip_prefix(&format!("data:{media_type};base64,"))
+                            .unwrap_or(data.as_str());
+                        inline_image_bytes = inline_image_bytes.saturating_add(raw.len() as u64);
+                        inline_image_tokens = inline_image_tokens.saturating_add(1_290);
+                    }
+                }
+            }
+        }
+        let non_image_bytes = bytes.saturating_sub(inline_image_bytes);
         Ok(ModelContextEstimate {
-            tokens: bytes.div_ceil(3).saturating_add(framing),
+            tokens: non_image_bytes
+                .div_ceil(3)
+                .saturating_add(inline_image_tokens)
+                .saturating_add(framing),
             accounting: ModelTokenAccounting::Estimated,
         })
     }
