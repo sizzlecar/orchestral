@@ -165,12 +165,14 @@ pub(super) async fn project_model_context(
                     projection.input_budget_tokens,
                     inner.config.compaction_working_set_tokens,
                 );
-                // Do not summarize history merely because it has many records.
-                // Only maintain it when projection would defer evidence or the
-                // model-derived working set is actually under pressure.
+                // Deferred ranges describe history selection, not capacity
+                // pressure: history_limit and the historical token allowance
+                // can defer records even when the request fits comfortably.
+                // In particular, resuming a long Session must not synchronously
+                // summarize those records before serving its first user turn.
                 if through_session_seq.is_none()
                     && history_compactions < 8
-                    && (planned_tokens > high_watermark || !projection.deferred_ranges.is_empty())
+                    && planned_tokens > high_watermark
                 {
                     if let Some(compactor) = session_compactor {
                         if compactor
@@ -191,7 +193,9 @@ pub(super) async fn project_model_context(
                                     run_id: request.run.spec.run_id.clone(),
                                     provider_seq: None,
                                     payload: AgentTelemetry::ProgressReported {
-                                        message: "Compacting conversation history…".to_owned(),
+                                        message: format!(
+                                            "Compacting conversation history ({planned_tokens} tokens, working-set target {high_watermark})"
+                                        ),
                                         fraction: None,
                                     },
                                 },

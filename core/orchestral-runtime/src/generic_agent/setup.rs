@@ -249,7 +249,7 @@ pub(super) fn generic_config_digest(
         "system_prompt": config.system_prompt,
         "project_instructions": config.project_instructions,
         "context_projection_contract": "source-positioned-summary/v6",
-        "context_pressure_contract": "capacity-aware-preserved-tail/v3",
+        "context_pressure_contract": "capacity-aware-preserved-tail/v4",
         "observed_prefix_planning_contract": "completed-input-prefix/v2",
         "model_retry": config.model_retry,
         "context_recovery": config.context_recovery,

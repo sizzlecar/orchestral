@@ -31,11 +31,14 @@ history/token 预算内优先恢复它的原文及 User 角色；不能容纳时
 下界来提前拒绝压缩。runtime 会计量保留前缀的完整候选，只提交严格变小的结果，且不会
 拆开 Tool call/result 对。Artifact 原始生产记录仍保留在 journal 中。若预算仍不能满足，
 继续有限压缩或明确失败。
-此行为通过 `context_pressure_contract = capacity-aware-preserved-tail/v3` 绑定恢复配置。
+此行为通过 `context_pressure_contract = capacity-aware-preserved-tail/v4` 绑定恢复配置。
 
 软工作集水位默认来自模型的有效输入预算：高水位为其 90%，低水位为高水位的 80%。
 `agent.compaction.working_set_tokens` 可指定更小的软偏好，不改变硬模型容量或 Run 限额。
-仅在工作集超水位或 projection 已有延后历史时维护历史，不再仅因记录数达到门槛就主动压缩。
+仅在实际选中的工作集超水位时同步维护历史。`deferred_ranges` 表示因历史记录数或历史
+token 分配而未选中的来源，不代表容量压力，不能单独触发模型摘要。恢复长会话后的第一轮
+请求也遵守这一条件；容量充足时直接调用回复模型，不先遍历整理旧历史。维护进度展示
+本轮计量值与触发水位。
 软压缩保留 `keep_recent_records` 个最近原始交换；跨 Run 历史的保留尾部不因当前 Run
 新增记录、摘要记录或大输出而缩短。硬溢出才允许尝试缩小该尾部，并对完整候选重新计量。
 历史投影按剩余空间和输入预算的四分之一分配，不再有固定 24K 上限；不能容纳的记录仍
