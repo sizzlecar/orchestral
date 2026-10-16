@@ -155,7 +155,7 @@ jobs:
         working-directory: scripts
         run: |
           npm ci --ignore-scripts
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps chromium webkit
       - name: Build and test public website
         run: |
           node scripts/build_site.cjs
@@ -168,6 +168,9 @@ jobs:
           node scripts/pwa_local_host_smoke.cjs
           node scripts/pwa_dual_session_smoke.cjs
           node scripts/pwa_draft_smoke.cjs
+          node scripts/pwa_mobile_layout_smoke.cjs
+          PWA_SMOKE_WIDTH=320 node scripts/pwa_mobile_layout_smoke.cjs
+          PWA_SMOKE_ENGINE=webkit node scripts/pwa_mobile_layout_smoke.cjs
           PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
           PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_image_message_smoke.cjs
           PWA_SMOKE_SW=1 PWA_SMOKE_WIDTH=320 node scripts/pwa_native_input_smoke.cjs

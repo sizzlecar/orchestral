@@ -74,6 +74,7 @@ features = [
     "IdbTransaction",
     "IdbTransactionMode",
     "Location",
+    "MediaQueryList",
     "MutationObserver",
     "MutationObserverInit",
     "MutationRecord",

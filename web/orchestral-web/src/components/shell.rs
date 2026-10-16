@@ -82,6 +82,28 @@ pub fn Workspace() -> Element {
     let mut split = consume_context::<crate::app::SplitWorkspace>();
     let mut controller = split.primary;
     let source = (split.source)();
+    let active_pane = (split.active_pane)();
+    use_effect(move || {
+        let active = if (split.active_pane)() == "primary" {
+            split.primary
+        } else {
+            split.secondary
+        };
+        let other = if (split.active_pane)() == "primary" {
+            split.secondary
+        } else {
+            split.primary
+        };
+        let active_state = active.state.read();
+        if active_state.selected_session().is_none()
+            && !active_state.ui.drawer_open
+            && !active_state.ui.new_session_open
+            && active_state.ui.loading_session.is_none()
+            && other.state.read().selected_session().is_some()
+        {
+            split.active_pane.set(other.timeline_scope);
+        }
+    });
     let state = controller.state.read();
     let refreshing = state.sessions.status == LoadStatus::Loading;
     let install_available = state.ui.install_available;
@@ -93,7 +115,7 @@ pub fn Workspace() -> Element {
         || controller.has_pending_submissions();
     rsx! {
         a { class: "skip-link", href: "#main-content-primary", "跳到对话" }
-        div { class: "app-shell split-workspace", "data-state": "ready",
+        div { class: "app-shell split-workspace", "data-state": "ready", "data-active-pane": active_pane,
             header { class: "workspace-topbar",
                 a { class: "workspace-brand", href: "./", aria_label: "Orchestral 首页",
                     img { src: "/icons/favicon.svg", alt: "", width: "26", height: "26" }
@@ -120,7 +142,10 @@ pub fn Workspace() -> Element {
                         "↻"
                     }
                     button { class: "icon-button", r#type: "button", aria_label: "新建会话",
-                        onclick: move |_| controller.state.write().ui.new_session_open = true,
+                        onclick: move |_| {
+                            split.active_pane.set("primary");
+                            controller.state.write().ui.new_session_open = true;
+                        },
                         "+"
                     }
                     button { class: "icon-button", r#type: "button", aria_label: "设置",
@@ -169,7 +194,7 @@ pub fn Workspace() -> Element {
 
 #[component]
 fn SessionPane(pane: &'static str) -> Element {
-    let split = consume_context::<crate::app::SplitWorkspace>();
+    let mut split = consume_context::<crate::app::SplitWorkspace>();
     let mut controller = use_context_provider(move || {
         if pane == "primary" {
             split.primary
@@ -231,6 +256,11 @@ fn SessionPane(pane: &'static str) -> Element {
 
     let selected_key = selected.as_ref().map(SessionView::key);
     let source_label = source.label();
+    let pane_label = if pane == "primary" {
+        "上屏"
+    } else {
+        "下屏"
+    };
     let matching_connectors = state
         .connectors
         .items
@@ -268,6 +298,7 @@ fn SessionPane(pane: &'static str) -> Element {
     rsx! {
         section { class: "session-pane", "data-pane": pane, "data-timeline-scope": pane,
             aria_label: if pane == "primary" { "上方会话" } else { "下方会话" },
+            onfocusin: move |_| split.active_pane.set(pane),
             if state.ui.drawer_open {
                 button { class: "pane-drawer-backdrop", r#type: "button", aria_label: "关闭会话列表",
                     onclick: move |_| controller.state.write().ui.drawer_open = false,
@@ -277,6 +308,14 @@ fn SessionPane(pane: &'static str) -> Element {
                         strong { "{source_label} 会话" }
                         button { class: "icon-button", r#type: "button", aria_label: "关闭会话列表",
                             onclick: move |_| controller.state.write().ui.drawer_open = false, "×"
+                        }
+                    }
+                    if !session_metadata.is_empty() {
+                        dl { class: "pane-session-details", aria_label: "当前会话详情",
+                            for (label, value) in &session_metadata {
+                                dt { "{label}" }
+                                dd { "{value}" }
+                            }
                         }
                     }
                     nav { class: "thread-nav", aria_label: "最近会话",
@@ -337,10 +376,21 @@ fn SessionPane(pane: &'static str) -> Element {
                     header { class: "conversation-header",
                         div { class: "conversation-header__title",
                             p { class: "eyebrow", "{session_source} 会话" }
+                            button { class: "pane-activate", r#type: "button",
+                                aria_label: "向{pane_label}发送", aria_pressed: (split.active_pane)() == pane,
+                                onclick: move |_| {
+                                    split.active_pane.set(pane);
+                                    if platform::workspace_keyboard_open() { platform::focus_composer(pane); }
+                                },
+                                span { class: "pane-position", "{pane_label}" }
+                                h1 { "{title}" }
+                            }
                             button { class: "pane-session-select", r#type: "button",
                                 aria_label: "打开会话列表", aria_expanded: state.ui.drawer_open,
-                                onclick: move |_| controller.state.write().ui.drawer_open = true,
-                                h1 { "{title}" }
+                                onclick: move |_| {
+                                    split.active_pane.set(pane);
+                                    controller.state.write().ui.drawer_open = true;
+                                },
                                 span { aria_hidden: "true", "⌄" }
                             }
                         }
@@ -367,7 +417,8 @@ fn SessionPane(pane: &'static str) -> Element {
                                     r#type: "button",
                                     aria_label: "打开会话操作",
                                     onclick: move |_| controller.state.write().ui.session_actions_open = true,
-                                    "操作"
+                                    span { class: "pane-action-label", "操作" }
+                                    span { class: "pane-action-icon", aria_hidden: "true", "⋯" }
                                 }
                             }
                             RunStatusBadge {
@@ -401,7 +452,10 @@ fn SessionPane(pane: &'static str) -> Element {
                         h2 { "暂无更多 {source_label} 会话" }
                         p { "打开历史会话，或开始一个新任务。" }
                         button { class: "session-actions-button", r#type: "button",
-                            onclick: move |_| controller.state.write().ui.new_session_open = true,
+                            onclick: move |_| {
+                                split.active_pane.set(pane);
+                                controller.state.write().ui.new_session_open = true;
+                            },
                             "新建 {source_label} 会话"
                         }
                     }
@@ -449,9 +503,19 @@ fn RunStatusBadge(
     );
 
     rsx! {
-        output { class: "run-status", "data-state": status.1,
+        output { class: "run-status", "data-state": status.1, title: "{status.0}", aria_label: "{status.0}",
             span { class: "run-status__pulse", aria_hidden: "true" }
-            span { "{status.0}" }
+            span { class: "run-status__full", "{status.0}" }
+            span { class: "run-status__compact", aria_hidden: "true",
+                match status.1 {
+                    "working" => "运行中",
+                    "waiting" => "待处理",
+                    "complete" => "完成",
+                    "error" => "失败",
+                    "warning" => "需关注",
+                    _ => "就绪",
+                }
+            }
         }
     }
 }
@@ -549,6 +613,21 @@ fn Composer() -> Element {
             .remove(controller.timeline_scope);
     });
     let state = controller.state.read();
+    let pane_label = if controller.timeline_scope == "primary" {
+        "上屏"
+    } else {
+        "下屏"
+    };
+    let target_title = state
+        .selected_session()
+        .map(|session| session_title(&state, session))
+        .unwrap_or_default();
+    let other = if controller.timeline_scope == "primary" {
+        workspace.secondary
+    } else {
+        workspace.primary
+    };
+    let other_available = other.state.read().selected_session().is_some();
     let sending = state.ui.composer_busy;
     let confirming = controller.outbox_is_flushing();
     let has_session = state.selected_session().is_some();
@@ -592,7 +671,7 @@ fn Composer() -> Element {
     } else if active {
         "补充说明或调整方向…"
     } else {
-        "告诉 Orchestral 你想完成什么…"
+        "输入消息…"
     };
     let hint = if sending {
         "正在发送，请稍候…".to_owned()
@@ -652,6 +731,17 @@ fn Composer() -> Element {
 
     rsx! {
         div { class: "composer-dock", hidden: !has_session,
+            div { class: "composer-target",
+                span { class: "composer-target__label", "发送到 {pane_label} · {target_title}" }
+                button { r#type: "button", disabled: !other_available,
+                    aria_label: "切换发送会话",
+                    onclick: move |_| {
+                        workspace.active_pane.set(other.timeline_scope);
+                        if platform::workspace_keyboard_open() { platform::focus_composer(other.timeline_scope); }
+                    },
+                    "切换"
+                }
+            }
             if let Some(error) = draft_save_error() {
                 p { class: "composer-upload-error", role: "alert", "{error}" }
             }
@@ -773,7 +863,7 @@ fn Composer() -> Element {
                     }
                 }
             }
-            p { class: "composer-hint", "{hint}" }
+            p { class: if !online || sending || confirming || pending_count > 0 || recoverable || supervision_blocked { "composer-hint is-important" } else { "composer-hint" }, "{hint}" }
         }
     }
 }

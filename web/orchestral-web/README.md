@@ -7,8 +7,15 @@ model-provider code.
 The workspace starts on Codex. The Codex, Claude Code, and Orch tabs open the
 two most recently updated sessions in vertically stacked panes. Each pane owns
 its selection, transcript, controls, draft, and live connection. Background
-refresh preserves manually selected sessions. Open the pane's title to choose
+refresh preserves manually selected sessions. Open the arrow beside a pane's title to choose
 an older session; a session already shown in the other pane is excluded.
+
+On phones, compact single-line headers leave the conversation visible and both
+panes share one bottom composer. Tap a header to choose its sending target;
+the composer names that target and retains each session's own draft. Directory
+metadata is available in the session drawer. A software keyboard temporarily
+expands the editing pane, with a switch beside the target label; closing the
+keyboard restores both panes without restarting either live stream.
 
 Opening a conversation follows the latest message after layout commits. Built-in
 Orch sessions initially load their latest 20 Runs, newest first, while displaying
@@ -62,6 +69,8 @@ node scripts/pwa_browser_smoke.cjs
 node scripts/pwa_local_host_smoke.cjs
 node scripts/pwa_dual_session_smoke.cjs
 node scripts/pwa_draft_smoke.cjs
+node scripts/pwa_mobile_layout_smoke.cjs
+PWA_SMOKE_ENGINE=webkit node scripts/pwa_mobile_layout_smoke.cjs
 PWA_SMOKE_WIDTH=320 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_browser_smoke.cjs
 PWA_SMOKE_SW=1 node scripts/pwa_image_message_smoke.cjs
@@ -77,6 +86,9 @@ and mobile layout. Screenshots are written to `target/pwa-smoke/`.
 
 The draft smoke verifies that storage failures preserve in-memory drafts and
 that uploads completing after a session moves between panes remain visible.
+The mobile layout fixture checks measured reading space, one shared composer,
+keyboard viewport resize/scroll, sending-target transfer, and rotation in
+Chromium and WebKit. It simulates viewport events rather than a physical keyboard.
 
 The image-message smoke uploads real image bytes and reconciles the local
 preview, HTTP acknowledgement, durable input event, refreshed signed attachment

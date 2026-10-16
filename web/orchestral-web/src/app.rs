@@ -20,6 +20,7 @@ pub struct SplitWorkspace {
     pub primary: AppController,
     pub secondary: AppController,
     pub source: Signal<WorkspaceSource>,
+    pub active_pane: Signal<&'static str>,
     pub update_blockers: Signal<BTreeSet<&'static str>>,
     pub drafts: Signal<storage::ComposerDrafts>,
     pub draft_save_error: Signal<Option<String>>,
@@ -101,6 +102,7 @@ pub fn App() -> Element {
         )
     });
     let source = use_signal(WorkspaceSource::default);
+    let active_pane = use_signal(|| "primary");
     let update_blockers = use_signal(BTreeSet::new);
     let drafts = use_signal(storage::load_drafts);
     let draft_save_error = use_signal(|| None::<String>);
@@ -108,6 +110,7 @@ pub fn App() -> Element {
         primary: controller,
         secondary,
         source,
+        active_pane,
         update_blockers,
         drafts,
         draft_save_error,
@@ -177,6 +180,7 @@ pub fn App() -> Element {
             }
         }
     });
+    let _viewport = use_hook(|| Rc::new(platform::install_visual_viewport_sync().ok()));
     let _listeners = use_hook(move || Rc::new(controller.window_listeners()));
     let _secondary_listeners = use_hook(move || Rc::new(secondary.window_listeners()));
     use_drop(move || {
