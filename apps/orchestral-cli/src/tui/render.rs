@@ -1533,7 +1533,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let capacity = state
         .context_budget
         .map_or_else(|| "unknown".to_owned(), |budget| budget.to_string());
-    let stats = format!("last input: {input} · limit: {capacity}");
+    let stats = match state.goal_badge.as_deref() {
+        Some(goal) => format!("{goal} · last input: {input} · limit: {capacity}"),
+        None => format!("last input: {input} · limit: {capacity}"),
+    };
     let metadata_min_width = if area.width >= 64 {
         stats.width() + 16
     } else {

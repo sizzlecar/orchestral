@@ -66,8 +66,16 @@ pub(crate) async fn run_tui(
     let mut file_refresh_tick = tokio::time::interval(FILE_REFRESH_INTERVAL);
     file_refresh_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Some(history) = &resume.history {
-        for record in history.runs.iter().flat_map(|run| &run.records) {
-            state.input_queue.observe(record);
+        if let Some(active_run_id) = resume.run.as_ref().map(|run| run.run_id()) {
+            if let Some(run) = history
+                .runs
+                .iter()
+                .find(|run| run.registration.run_id() == active_run_id)
+            {
+                for record in &run.records {
+                    state.input_queue.observe(record);
+                }
+            }
         }
         state.session_title = history.summary.title.clone();
         state.transcript = super::history_entries(history);
@@ -184,6 +192,8 @@ pub(crate) async fn run_tui(
                     for effect in effects {
                         if let Some(queue_effects) = super::input_queue::route_effect(&effect, &mut state) {
                             execution.extend(queue_effects);
+                        } else if let Some(goal_effects) = super::goal::route_effect(&effect, &host.goals, &mut state) {
+                            execution.extend(goal_effects);
                         } else if let Some(schedule_effects) = super::schedule::route_effect(&effect, &host.schedules, &mut state) {
                             execution.extend(schedule_effects);
                         } else if matches!(&effect, UiEffect::MenuChoice { kind: super::menu::MenuKind::Commands, value } if value == "/quit") {
@@ -258,13 +268,24 @@ pub(crate) async fn run_tui(
                             next_state.images = images; next_state.next_image_id = next_image_id;
                         }
                         if let Some(history) = &history {
-                            for record in history.runs.iter().flat_map(|run| &run.records) { next_state.input_queue.observe(record); }
+                            if let Some(active_run_id) = run.as_ref().map(|run| run.run_id()) {
+                                if let Some(active_run) = history
+                                    .runs
+                                    .iter()
+                                    .find(|r| r.registration.run_id() == active_run_id)
+                                {
+                                    for record in &active_run.records {
+                                        next_state.input_queue.observe(record);
+                                    }
+                                }
+                            }
                             next_state.session_title = history.summary.title.clone();
                             next_state.transcript = super::history_entries(history);
                             for entry in &next_state.transcript { if entry.role == super::state::TranscriptRole::User { next_state.input_history.push(&entry.text); } }
                             next_state.ui_notice = Some(format!("Resumed · {:?}", history.summary.status));
                         }
                         state = next_state; client = next;
+                        super::goal::sync_badge(&host.goals, &mut state);
                         if let Some(handle) = run {
                             let last_run_seq = history.as_ref().and_then(|h| h.runs.iter().find(|r| r.registration.run_id() == handle.run_id())).map_or(0, |r| r.last_run_seq());
                             let observer = observe_run(&handle, agent_tx.clone()).await?;
@@ -409,6 +430,52 @@ pub(crate) async fn run_tui(
         if (completing_files && !file_completion_open) || (had_active_run && active.is_none()) {
             file_index.refresh();
             file_refresh_tick.reset();
+        }
+        if had_active_run && active.is_none() {
+            let completed_cleanly = state.phase == UiPhase::Completed;
+            host.goals
+                .notify_run_finished(client.session_id(), completed_cleanly);
+            super::goal::sync_badge(&host.goals, &mut state);
+            if completed_cleanly
+                && !state.exit_requested
+                && !state.host_busy
+                && state.menu.is_none()
+                && state.pending.is_none()
+                && state.phase.accepts_new_run()
+            {
+                if let Some(next_goal) = host.goals.pop_continuation(client.session_id()) {
+                    let input = next_goal.continuation_prompt();
+                    match client.start_text(input.clone()).await {
+                        Ok(handle) => {
+                            let run_id = handle.run_id().as_str().to_owned();
+                            let observer = observe_run(&handle, agent_tx.clone()).await?;
+                            update(&mut state, UiMsg::ScheduledRunStarted { run_id, input });
+                            super::goal::sync_badge(&host.goals, &mut state);
+                            active = Some(ActiveRun {
+                                handle,
+                                observer,
+                                last_run_seq: 0,
+                                delta_order: 0,
+                                auto_resolved_approvals: BTreeSet::new(),
+                            });
+                            if reconcile_active(&mut active, &mut state, &approval_broker).await? {
+                                stop_active(&mut active);
+                            }
+                        }
+                        Err(error) => {
+                            host.goals.pause(client.session_id());
+                            super::goal::sync_badge(&host.goals, &mut state);
+                            notice(
+                                &mut state,
+                                "goal-run-error",
+                                format!("Could not continue session goal: {error}"),
+                                true,
+                            );
+                        }
+                    }
+                    needs_redraw = true;
+                }
+            }
         }
         file_completion_open = completing_files;
         if state.exit_requested && active.is_some() && state.phase != UiPhase::Cancelling {

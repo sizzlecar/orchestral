@@ -17,9 +17,14 @@ pub(crate) enum MenuKind {
 pub(crate) enum LocalAction {
     EditQueuedInput(String),
     WithdrawQueuedInput(String),
+    DismissQueuedInput(String),
+    ClearUnsentInputs,
     TriggerScheduledTask(String),
     CancelScheduledTask(String),
     ClearScheduledTasks,
+    PauseGoal,
+    ResumeGoal,
+    ClearGoal,
     Keyboard,
     Appearance,
     SessionDetails,
@@ -126,6 +131,11 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
         "/queue",
         "Pending messages",
         "Inspect, edit or withdraw messages awaiting the next model call",
+    ),
+    (
+        "/goal",
+        "Session goal",
+        "Start an autonomous multi-turn objective (/goal <objective>) or inspect/pause progress",
     ),
     (
         "/loop",

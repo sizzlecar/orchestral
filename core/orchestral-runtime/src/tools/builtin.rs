@@ -1,6 +1,7 @@
 mod guarded;
 mod guarded_artifact;
 mod guarded_exec;
+mod guarded_goal;
 mod guarded_patch;
 mod guarded_pty;
 mod guarded_schedule;
@@ -23,6 +24,11 @@ pub use self::guarded_exec::{
     guarded_write_stdin_descriptor, workspace_exec_command_descriptor,
     workspace_write_stdin_descriptor, CommandEnvironmentSnapshot, GuardedExecCommandExecutor,
     GuardedWriteStdinExecutor, GUARDED_EXEC_SANDBOX_PROFILE,
+};
+pub use self::guarded_goal::{
+    guarded_goal_update_descriptor, parse_goal_command, GuardedGoalUpdateExecutor,
+    ParsedGoalCommand, SessionGoalRegistry, SessionGoalStatus, SessionGoalView,
+    DEFAULT_GOAL_MAX_TURNS, MAX_GOAL_MAX_TURNS,
 };
 pub use self::guarded_patch::{
     guarded_apply_patch_descriptor, guarded_file_edit_descriptor, guarded_file_write_descriptor,
