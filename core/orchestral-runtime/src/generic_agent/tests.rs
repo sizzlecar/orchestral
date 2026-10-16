@@ -682,8 +682,107 @@ mod context_planning_tests {
         );
     }
 
+    struct MeteredSummary;
+
+    #[async_trait]
+    impl AgentSessionSummarizer for MeteredSummary {
+        fn descriptor(&self) -> SessionSummarizerDescriptor {
+            SessionSummarizerDescriptor {
+                strategy: "metered-summary-fixture".to_owned(),
+                model: Some("test-model".to_owned()),
+                version: "1".to_owned(),
+                config_digest: Digest::sha256("metered-summary-fixture"),
+            }
+        }
+        async fn summarize(
+            &self,
+            _: crate::session_context::SessionCompactionInput,
+        ) -> Result<ModelMessage, SessionContextError> {
+            panic!("a cumulative Run ceiling must prohibit unaccounted summary inference")
+        }
+    }
+
     #[tokio::test]
-    async fn large_window_active_run_compacts_at_working_set_watermark_before_hard_limit() {
+    async fn cumulative_usage_limits_prohibit_unaccounted_summary_inference() {
+        for limits in [
+            RunLimits {
+                max_input_tokens: Some(1_000_000),
+                ..RunLimits::default()
+            },
+            RunLimits {
+                max_output_tokens: Some(1_000_000),
+                ..RunLimits::default()
+            },
+            RunLimits {
+                max_cost: Some(MoneyAmount {
+                    currency: "USD".to_owned(),
+                    microunits: 1_000_000,
+                }),
+                ..RunLimits::default()
+            },
+        ] {
+            let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+            let backend = Arc::new(PlanningModel {
+                starts: AtomicU64::new(0),
+                requests: Mutex::new(Vec::new()),
+                max_context_tokens: 8_192,
+            });
+            let mut config = GenericAgentConfig::new("test/provider", "test/agent");
+            config.max_context_tokens = 8_192;
+            config.reserved_output_tokens = 2_048;
+            config.model_cost_policy = Some(ModelCostPolicy::new("USD", 1, 1).unwrap());
+            let provider = InternalGenericAgentProvider::new_with_session_journal(
+                backend,
+                config,
+                journal.clone(),
+                Arc::new(JsonSizeTokenMeter::default()),
+            )
+            .unwrap()
+            .with_session_compaction(
+                Arc::new(MeteredSummary),
+                SessionCompactionPolicy {
+                    minimum_source_records: 1,
+                    keep_recent_records: 1,
+                },
+            )
+            .unwrap();
+            let request = request(&provider, limits);
+            initial_projection(&provider, &request).await.unwrap();
+            append_observation(
+                &journal,
+                &request,
+                serde_json::json!({"content": "source evidence".repeat(2_000)}),
+            )
+            .await;
+            let before = journal
+                .load_session(&request.run.spec.session_id)
+                .await
+                .unwrap();
+            assert!(matches!(
+                project_model_context(
+                    &provider.inner,
+                    &request,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    ModelContextBudget::default(),
+                )
+                .await,
+                Err(SessionContextError::ContextOverflow { .. })
+            ));
+            assert_eq!(
+                before,
+                journal
+                    .load_session(&request.run.spec.session_id)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn large_window_preserves_raw_results_below_model_derived_watermark() {
         let journal = Arc::new(InMemoryAgentSessionJournalStore::default());
         let backend = Arc::new(PlanningModel {
             starts: AtomicU64::new(0),
@@ -713,8 +812,8 @@ mod context_planning_tests {
         initial_projection(&provider, &request).await.unwrap();
 
         // Append 10 bulky tool exchanges (~20 KB each -> ~200k tokens on the
-        // 1-byte-per-token fixture meter), exceeding the 128k working-set high
-        // watermark while remaining far below the 983,040 hard input budget.
+        // 1-byte-per-token fixture meter). A large model must not silently get
+        // a fixed 128k/160k working set while its input capacity is 983,040.
         for index in 1..=10 {
             let call_id = ModelToolCallId::new(format!("observation-call-{index}"));
             journal
@@ -766,16 +865,17 @@ mod context_planning_tests {
         .await
         .unwrap();
         assert_eq!(projection.input_budget_tokens, 1_048_576 - 65_536);
-        assert!(projection.used_input_tokens <= 80 * 1024);
+        assert!(projection.used_input_tokens > 160 * 1024);
         let after = journal
             .load_session(&request.run.spec.session_id)
             .await
             .unwrap();
-        assert!(after.iter().any(|record| matches!(
+        assert!(!after.iter().any(|record| matches!(
             record.payload,
             AgentSessionEvent::ActiveRunCompactionCommitted { .. }
         )));
         let rendered = serde_json::to_string(&projection.messages).unwrap();
+        assert!(rendered.contains("src/module_1.rs"));
         assert!(rendered.contains("src/module_10.rs"));
     }
 }

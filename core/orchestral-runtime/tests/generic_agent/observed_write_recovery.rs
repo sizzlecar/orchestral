@@ -322,51 +322,54 @@ impl ModelBackend for ReadThenApprovedWriteModel {
     ) -> Result<ModelStream, ModelError> {
         request.validate()?;
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
-        let events =
-            match round {
-                0 => call_events("read", "file_read", json!({"path":"source.rs"})),
-                1 => {
-                    assert!(request.messages.iter().flat_map(|m| &m.content).any(
+        let events = match round {
+            0 => call_events("read", "file_read", json!({"path":"source.rs"})),
+            1 => {
+                assert!(request.messages.iter().flat_map(|m| &m.content).any(
                         |block| matches!(
                             block, ModelContent::ToolResult {call_id, result, is_error:false}
                                 if call_id.as_str() == "read" && result["content"] == SOURCE
                                     && result["path"] == "source.rs"
-                                    && result.get("revision").is_none()
+                                    && result["revision"].as_str().is_some_and(|revision| Digest::new(revision).is_sha256())
+                                    && result["start_line"] == 1 && result["end_line"] == 1
+                                    && result["next_offset"] == 2 && result["eof"] == true
                                     && result.get("content_digest").is_none()
                         )
                     ));
-                    call_events("write", "file_write", write_arguments())
-                }
-                2 => {
-                    let calls = request
-                        .messages
-                        .iter()
-                        .flat_map(|m| &m.content)
-                        .filter_map(|block| match block {
-                            ModelContent::ToolCall {
-                                call_id, arguments, ..
-                            } if call_id.as_str() == "write" => Some(arguments),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(calls, vec![&write_arguments()]);
-                    assert!(request.messages.iter().flat_map(|m| &m.content).any(
-                        |block| matches!(
-                            block, ModelContent::ToolResult {call_id, is_error:false, ..}
-                                if call_id.as_str() == "write"
-                        )
-                    ));
-                    vec![
-                        ModelEvent::TextDelta {
-                            delta: "The approved update completed.".to_owned(),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        },
-                    ]
-                }
-                _ => panic!("unexpected model replay"),
-            };
+                call_events("write", "file_write", write_arguments())
+            }
+            2 => {
+                let calls = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .filter_map(|block| match block {
+                        ModelContent::ToolCall {
+                            call_id, arguments, ..
+                        } if call_id.as_str() == "write" => Some(arguments),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(calls, vec![&write_arguments()]);
+                assert!(request
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .any(|block| matches!(
+                        block, ModelContent::ToolResult {call_id, is_error:false, ..}
+                            if call_id.as_str() == "write"
+                    )));
+                vec![
+                    ModelEvent::TextDelta {
+                        delta: "The approved update completed.".to_owned(),
+                    },
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ]
+            }
+            _ => panic!("unexpected model replay"),
+        };
         Ok(Box::pin(stream::iter(events.into_iter().enumerate().map(
             move |(index, payload)| {
                 Ok(ModelStreamEvent {

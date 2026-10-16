@@ -40,8 +40,16 @@ pub(super) fn context_output_cap(
     preferred.min(backend_context_limit(inner).saturating_sub(planned_input))
 }
 
-const WORKING_SET_HIGH_WATERMARK_TOKENS: u64 = 160 * 1024;
-const WORKING_SET_LOW_WATERMARK_TOKENS: u64 = 112 * 1024;
+fn working_set_watermarks(input_budget: u64, preferred: Option<u64>) -> (u64, u64) {
+    // Reserve ten percent of the effective input capacity for the next tool
+    // result. An explicit Host preference may trigger maintenance earlier,
+    // without turning that soft target into a smaller hard context limit.
+    let high = preferred
+        .unwrap_or_else(|| input_budget.saturating_sub(input_budget / 10))
+        .min(input_budget)
+        .max(1);
+    (high, high.saturating_sub(high / 5).max(1))
+}
 
 pub(super) async fn project_model_context(
     inner: &GenericInner,
@@ -65,48 +73,6 @@ pub(super) async fn project_model_context(
                 payload: AgentSessionEvent::RunInputCommitted { message },
             })
             .await?;
-    }
-    // A cursor is a request to reproduce an earlier durable model boundary.
-    // Replaying it must never append a new compaction fact to the Session.
-    if through_session_seq.is_none() {
-        if let Some(compactor) = &inner.session_compactor {
-            let mut reported_compaction = false;
-            for _ in 0..8 {
-                if !reported_compaction
-                    && compactor
-                        .has_compaction_candidate(
-                            &request.run.spec.session_id,
-                            &request.run.spec.run_id,
-                        )
-                        .await?
-                {
-                    reported_compaction = true;
-                    publish_telemetry(
-                        inner,
-                        &request.run.spec.run_id,
-                        AgentTelemetryEnvelope {
-                            telemetry_id: TelemetryId::new(format!(
-                                "generic-{}-session-compaction-check",
-                                request.run.spec.run_id.as_str()
-                            )),
-                            run_id: request.run.spec.run_id.clone(),
-                            provider_seq: None,
-                            payload: AgentTelemetry::ProgressReported {
-                                message: "Compacting conversation history…".to_owned(),
-                                fraction: None,
-                            },
-                        },
-                    );
-                }
-                if compactor
-                    .compact_if_needed(&request.run.spec.session_id, &request.run.spec.run_id)
-                    .await?
-                    .is_none()
-                {
-                    break;
-                }
-            }
-        }
     }
     let backend_context_limit = backend_context_limit(inner);
     let mut reserved_output_tokens = budget
@@ -160,8 +126,20 @@ pub(super) async fn project_model_context(
         budget.observed_prefix,
     );
 
+    // Summarizer model usage does not yet participate in the Run reservation
+    // ledger. Never issue an unaccounted model request under a cumulative cap;
+    // explicitly offline summarizers remain available for hard pressure.
+    let usage_limited = request.run.spec.limits.max_input_tokens.is_some()
+        || request.run.spec.limits.max_output_tokens.is_some()
+        || request.run.spec.limits.max_cost.is_some();
+    let session_compactor = inner
+        .session_compactor
+        .as_ref()
+        .filter(|compactor| !usage_limited || !compactor.may_call_model());
+
     let mut previous_overflow = None;
     let mut previous_watermark = None;
+    let mut history_compactions = 0;
     let mut tried_smaller_reserve = false;
     loop {
         let policy = if request.run.spec.limits.max_input_tokens.is_some()
@@ -183,68 +161,87 @@ pub(super) async fn project_model_context(
                     .context_estimate
                     .as_ref()
                     .map_or(projection.used_input_tokens, |estimate| estimate.tokens);
+                let (high_watermark, low_watermark) = working_set_watermarks(
+                    projection.input_budget_tokens,
+                    inner.config.compaction_working_set_tokens,
+                );
+                // Deferred ranges describe history selection, not capacity
+                // pressure: history_limit and the historical token allowance
+                // can defer records even when the request fits comfortably.
+                // In particular, resuming a long Session must not synchronously
+                // summarize those records before serving its first user turn.
                 if through_session_seq.is_none()
-                    && projection.input_budget_tokens > WORKING_SET_HIGH_WATERMARK_TOKENS
-                    && planned_tokens > WORKING_SET_HIGH_WATERMARK_TOKENS
-                    && previous_watermark.is_none_or(|previous| planned_tokens < previous)
+                    && history_compactions < 8
+                    && planned_tokens > high_watermark
                 {
-                    if let Some(compactor) = &inner.session_compactor {
-                        previous_watermark = Some(planned_tokens);
-                        let mut compacted = compactor
-                            .compact_active_run_for_context(
-                                &context_engine,
-                                make_request(
-                                    reserved_output_tokens,
-                                    Some(WORKING_SET_LOW_WATERMARK_TOKENS),
-                                ),
-                                policy,
+                    if let Some(compactor) = session_compactor {
+                        if compactor
+                            .has_working_set_candidate(
+                                &request.run.spec.session_id,
+                                &request.run.spec.run_id,
                             )
-                            .await?;
-                        if compacted.is_none()
-                            && policy == crate::session_context::ContextTokenPolicy::UpperBound
+                            .await?
                         {
-                            compacted = compactor
-                                .compact_active_run_for_context(
-                                    &context_engine,
-                                    make_request(
-                                        reserved_output_tokens,
-                                        Some(WORKING_SET_HIGH_WATERMARK_TOKENS),
-                                    ),
-                                    policy,
-                                )
-                                .await?;
-                        }
-                        if compacted.is_some() {
                             publish_telemetry(
                                 inner,
                                 &request.run.spec.run_id,
                                 AgentTelemetryEnvelope {
                                     telemetry_id: TelemetryId::new(format!(
-                                        "generic-{}-context-watermark-{planned_tokens}-{WORKING_SET_HIGH_WATERMARK_TOKENS}",
+                                        "generic-{}-history-compaction-{history_compactions}",
                                         request.run.spec.run_id.as_str()
                                     )),
                                     run_id: request.run.spec.run_id.clone(),
                                     provider_seq: None,
                                     payload: AgentTelemetry::ProgressReported {
                                         message: format!(
-                                            "Compacting context ({planned_tokens} tokens exceed the {WORKING_SET_HIGH_WATERMARK_TOKENS}-token working-set watermark)"
+                                            "Compacting conversation history ({planned_tokens} tokens, working-set target {high_watermark})"
                                         ),
                                         fraction: None,
                                     },
                                 },
                             );
+                            history_compactions += 1;
+                            if compactor
+                                .compact_history_for_working_set(
+                                    &request.run.spec.session_id,
+                                    &request.run.spec.run_id,
+                                )
+                                .await?
+                                .is_some()
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if through_session_seq.is_none()
+                    && planned_tokens > high_watermark
+                    && previous_watermark.is_none_or(|previous| planned_tokens < previous)
+                {
+                    if let Some(compactor) = session_compactor {
+                        previous_watermark = Some(planned_tokens);
+                        let compacted = compactor
+                            .compact_active_run_for_working_set(
+                                &context_engine,
+                                make_request(reserved_output_tokens, Some(low_watermark)),
+                                policy,
+                            )
+                            .await?;
+                        if compacted.is_some() {
                             publish_telemetry(
                                 inner,
                                 &request.run.spec.run_id,
                                 AgentTelemetryEnvelope {
                                     telemetry_id: TelemetryId::new(format!(
-                                        "generic-{}-context-watermark-compacted-{planned_tokens}",
+                                        "generic-{}-context-watermark-{planned_tokens}-{high_watermark}",
                                         request.run.spec.run_id.as_str()
                                     )),
                                     run_id: request.run.spec.run_id.clone(),
                                     provider_seq: None,
                                     payload: AgentTelemetry::ProgressReported {
-                                        message: "Context compacted; continuing".to_owned(),
+                                        message: format!(
+                                            "Context compacted; recent tool results preserved ({planned_tokens} tokens, working-set target {high_watermark})"
+                                        ),
                                         fraction: None,
                                     },
                                 },
@@ -286,7 +283,7 @@ pub(super) async fn project_model_context(
                         }
                     }
                 }
-                let Some(compactor) = &inner.session_compactor else {
+                let Some(compactor) = session_compactor else {
                     return Err(SessionContextError::ContextOverflow {
                         used,
                         budget: input_budget,

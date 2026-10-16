@@ -178,6 +178,9 @@ pub struct GenericAgentConfig {
     pub stream_buffer: usize,
     pub continuation: ContinuationPolicy,
     pub history_limit: usize,
+    /// Optional soft input working set. None derives it from the effective
+    /// model input capacity. Soft compaction preserves the recent tool window.
+    pub compaction_working_set_tokens: Option<u64>,
     pub max_context_tokens: u64,
     pub reserved_output_tokens: u64,
     /// Optional minimum response room before active context is compacted.
@@ -276,6 +279,7 @@ impl GenericAgentConfig {
             context_recovery: ContextRecoveryPolicy::default(),
             continuation: ContinuationPolicy::default(),
             history_limit: 128,
+            compaction_working_set_tokens: None,
             max_context_tokens: 128 * 1024,
             reserved_output_tokens: 4 * 1024,
             minimum_output_reserve_tokens: None,

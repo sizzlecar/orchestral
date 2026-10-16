@@ -248,8 +248,8 @@ pub(super) fn generic_config_digest(
         "agent_id": config.agent_id,
         "system_prompt": config.system_prompt,
         "project_instructions": config.project_instructions,
-        "context_projection_contract": "source-positioned-summary/v5",
-        "context_pressure_contract": "full-candidate-live-ranges/v2",
+        "context_projection_contract": "source-positioned-summary/v6",
+        "context_pressure_contract": "capacity-aware-preserved-tail/v4",
         "observed_prefix_planning_contract": "completed-input-prefix/v2",
         "model_retry": config.model_retry,
         "context_recovery": config.context_recovery,
@@ -261,6 +261,7 @@ pub(super) fn generic_config_digest(
             "max_tool_calls": config.continuation.max_tool_calls,
         },
         "history_limit": config.history_limit,
+        "compaction_working_set_tokens": config.compaction_working_set_tokens,
         "max_context_tokens": config.max_context_tokens,
         "reserved_output_tokens": config.reserved_output_tokens,
         "model_cost_policy": config.model_cost_policy.as_ref().map(|policy| serde_json::json!({

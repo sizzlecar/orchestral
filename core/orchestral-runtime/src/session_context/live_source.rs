@@ -28,13 +28,11 @@ pub(super) fn valid_active_source(
             .iter()
             .all(|record| {
                 record.run_id == *run
-                    && match &record.payload {
-                        AgentSessionEvent::ToolExchangeCommitted {
-                            retained_artifacts, ..
-                        } => retained_artifacts.is_empty(),
-                        AgentSessionEvent::ActiveRunCompactionCommitted { .. } => true,
-                        _ => false,
-                    }
+                    && matches!(
+                        &record.payload,
+                        AgentSessionEvent::ToolExchangeCommitted { .. }
+                            | AgentSessionEvent::ActiveRunCompactionCommitted { .. }
+                    )
             })
 }
 

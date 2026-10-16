@@ -23,6 +23,9 @@ agent:
     max_retries: 1
   compaction:
     enabled: true
+    strategy: model_assisted
+    model_timeout_secs: 120
+    # working_set_tokens: optional soft preference; omitted follows model capacity.
     minimum_source_records: 32
     keep_recent_records: 16
     summary_max_chars: 16384

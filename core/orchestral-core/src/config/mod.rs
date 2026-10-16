@@ -170,9 +170,9 @@ impl Default for AgentConfig {
 pub enum SessionSummarizerStrategy {
     /// Model-assisted structured working-memory handoff with deterministic
     /// extractive fallback.
+    #[default]
     ModelAssisted,
     /// Deterministic extractive transcript compaction without model calls.
-    #[default]
     DeterministicExtractive,
 }
 
@@ -190,6 +190,13 @@ pub struct AgentCompactionConfig {
     pub keep_recent_records: usize,
     #[serde(default = "default_compaction_summary_chars")]
     pub summary_max_chars: usize,
+    /// Optional preferred input working set. Omitted follows the model input
+    /// capacity; this preference never lowers the hard model or Run budget.
+    #[serde(default)]
+    pub working_set_tokens: Option<u64>,
+    /// Deadline for a complete model-assisted summary, including generation.
+    #[serde(default = "default_compaction_model_timeout_secs")]
+    pub model_timeout_secs: u64,
 }
 
 impl Default for AgentCompactionConfig {
@@ -200,8 +207,14 @@ impl Default for AgentCompactionConfig {
             minimum_source_records: default_compaction_minimum_source_records(),
             keep_recent_records: default_compaction_keep_recent_records(),
             summary_max_chars: default_compaction_summary_chars(),
+            working_set_tokens: None,
+            model_timeout_secs: default_compaction_model_timeout_secs(),
         }
     }
+}
+
+fn default_compaction_model_timeout_secs() -> u64 {
+    120
 }
 
 fn default_compaction_minimum_source_records() -> usize {

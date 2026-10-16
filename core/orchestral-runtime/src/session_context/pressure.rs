@@ -10,6 +10,34 @@ impl AgentSessionCompactor {
         request: SessionContextRequest,
         policy: ContextTokenPolicy,
     ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        self.compact_measured(engine, request, policy, false).await
+    }
+
+    /// Maintain a preferred working set without sacrificing the recent raw
+    /// exchanges. Failure to produce a semantic handoff leaves the input intact.
+    pub async fn compact_active_run_for_working_set(
+        &self,
+        engine: &AgentSessionContextEngine,
+        request: SessionContextRequest,
+        policy: ContextTokenPolicy,
+    ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
+        match self.compact_measured(engine, request, policy, true).await {
+            Err(SessionContextError::Compaction(reason)) => {
+                tracing::warn!(%reason,
+                    "soft active compaction unavailable; original context retained");
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
+    async fn compact_measured(
+        &self,
+        engine: &AgentSessionContextEngine,
+        request: SessionContextRequest,
+        policy: ContextTokenPolicy,
+        preserve_recent: bool,
+    ) -> Result<Option<AgentSessionRecord>, SessionContextError> {
         validate_context_request(&request)?;
         if request.through_session_seq.is_some() {
             return Err(SessionContextError::InvalidRequest(
@@ -69,35 +97,60 @@ impl AgentSessionCompactor {
                     sources.push(candidate);
                 }
             }
-            if retain <= 1 {
+            if preserve_recent || retain <= 1 {
                 break;
             }
             retain /= 2;
         }
-        // Keeping recent exchanges is a quality preference. If the preferred
-        // source cannot fit, consider each entire live segment, including its
-        // newest exchange or a summary whose budget has since become smaller.
-        for source in live_source::compactable_segments(&groups, &records, &request.current_run_id)
-        {
-            if !sources.contains(&source) {
-                sources.push(source);
+        if !preserve_recent {
+            // Keeping recent exchanges is a quality preference. If the preferred
+            // source cannot fit, consider each entire live segment, including its
+            // newest exchange or a summary whose budget has since become smaller.
+            for source in
+                live_source::compactable_segments(&groups, &records, &request.current_run_id)
+            {
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+            // A late summary producer may be adjacent to exchanges on the other
+            // side of a surviving fact. Single groups remain useful safe candidates
+            // when their combined logical extent cannot be replaced in place.
+            for group in groups
+                .values()
+                .filter(|group| is_current_compactable(group, &records, &request.current_run_id))
+            {
+                let source = single_range(group.producer_seq);
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
             }
         }
-        // A late summary producer may be adjacent to exchanges on the other
-        // side of a surviving fact. Single groups remain useful safe candidates
-        // when their combined logical extent cannot be replaced in place.
-        for group in groups
-            .values()
-            .filter(|group| is_current_compactable(group, &records, &request.current_run_id))
-        {
-            let source = single_range(group.producer_seq);
-            if !sources.contains(&source) {
-                sources.push(source);
-            }
+        if preserve_recent {
+            let recent = groups
+                .values()
+                .rev()
+                .filter(|group| {
+                    records[(group.producer_seq - 1) as usize].run_id == request.current_run_id
+                        && matches!(
+                            records[(group.producer_seq - 1) as usize].payload,
+                            AgentSessionEvent::ToolExchangeCommitted { .. }
+                        )
+                })
+                .take(self.policy.keep_recent_records)
+                .map(|group| group.producer_seq)
+                .collect::<Vec<_>>();
+            sources.retain(|source| recent.iter().all(|seq| !source.contains(*seq)));
         }
         let mut best = None;
         let mut best_tokens = before;
         'sources: for source in sources {
+            if preserve_recent {
+                let digest = session_range_digest(&records, &source)?;
+                if !self.begin_soft_attempt(&request.session_id, &request.current_run_id, &digest) {
+                    continue;
+                }
+            }
             let originals = original_compaction_groups(&records, &source)?;
             let current_messages = groups
                 .values()
@@ -127,22 +180,37 @@ impl AgentSessionCompactor {
                 .collect::<Vec<_>>();
             let mut previous_summary = None;
             loop {
-                let summary = self
-                    .summarizer
-                    .summarize_with_char_budget(
-                        SessionCompactionInput {
-                            session_id: request.session_id.clone(),
-                            source: source.clone(),
-                            groups: originals.clone(),
-                            focus_messages: focus_messages.clone(),
-                        },
-                        max_chars,
-                    )
-                    .await?;
+                let input = SessionCompactionInput {
+                    session_id: request.session_id.clone(),
+                    source: source.clone(),
+                    groups: originals.clone(),
+                    focus_messages: focus_messages.clone(),
+                };
+                let generation = if preserve_recent {
+                    self.summarizer.generate(input).await
+                } else {
+                    self.summarizer
+                        .generate_with_char_budget(input, max_chars)
+                        .await
+                };
+                let generation = match generation {
+                    Ok(generation) => generation,
+                    Err(SessionContextError::Compaction(reason)) => {
+                        tracing::warn!(%reason, "summary candidate unavailable; original context retained");
+                        continue 'sources;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if preserve_recent && generation.fallback_reason.is_some() {
+                    tracing::warn!(reason = ?generation.fallback_reason,
+                        session_id = %request.session_id, "working-set compaction deferred; original context retained");
+                    continue 'sources;
+                }
+                let summary = &generation.message;
                 summary.validate().map_err(|error| {
                     SessionContextError::Compaction(format!("invalid active-Run summary: {error}"))
                 })?;
-                if previous_summary.as_ref() == Some(&summary) {
+                if previous_summary.as_ref() == Some(summary) {
                     break;
                 }
                 if summary.role == ModelRole::Assistant
@@ -152,22 +220,22 @@ impl AgentSessionCompactor {
                 }
                 let next_seq = records.len() as u64 + 1;
                 let replacement =
-                    placement::summary_group(&groups, &source, next_seq, &summary, true, true)?;
+                    placement::summary_group(&groups, &source, next_seq, summary, true, true)?;
                 let mut candidate = groups.clone();
                 candidate.retain(|_, group| !source.contains(group.producer_seq));
                 candidate.insert(next_seq, replacement);
                 let used = measure(&candidate)?;
                 if used < best_tokens {
                     best_tokens = used;
-                    best = Some((source.clone(), summary.clone()));
+                    best = Some((source.clone(), generation.clone()));
                     if used <= budget {
                         break 'sources;
                     }
                 }
-                if max_chars == 256 {
+                if preserve_recent || max_chars == 256 {
                     break;
                 }
-                previous_summary = Some(summary);
+                previous_summary = Some(summary.clone());
                 max_chars = (max_chars / 2).max(256);
             }
         }
@@ -176,7 +244,7 @@ impl AgentSessionCompactor {
         };
         // Separate live segments can straddle protected facts. A strictly
         // smaller projection may need another pass; never persist no progress.
-        self.commit_active_run_summary(&records, &request.current_run_id, source, summary)
+        self.commit_active_run_generation(&records, &request.current_run_id, source, summary)
             .await
     }
 }

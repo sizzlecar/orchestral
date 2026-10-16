@@ -23,7 +23,7 @@ async fn projected_complete_read_preserves_canonical_evidence_and_requires_exact
         visible["content"].as_str().unwrap().as_bytes(),
         source.as_bytes()
     );
-    assert!(visible.get("revision").is_none());
+    assert_eq!(visible["revision"], canonical["revision"]);
     assert!(visible.get("content_digest").is_none());
     let key = ToolEffectKey::new(invocation.run_id.clone(), invocation.call_id.clone());
     let before = fixture.journal.load_effect(&key).await.unwrap();

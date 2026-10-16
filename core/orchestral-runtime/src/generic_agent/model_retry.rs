@@ -1,10 +1,12 @@
 use super::*;
 use orchestral_core::model_protocol::{ModelStream, ModelStreamEvent};
+use serde_json::{json, Value};
 
 pub(super) struct StartedModelStream {
     pub(super) stream: ModelStream,
     pub(super) expected_sequence: u64,
     pub(super) usage: Option<ModelUsage>,
+    pub(super) timing: ModelAttemptTiming,
 }
 
 pub(super) enum ModelStartFailure {
@@ -15,6 +17,38 @@ pub(super) enum ModelStartFailure {
 impl From<AgentFailure> for ModelStartFailure {
     fn from(failure: AgentFailure) -> Self {
         Self::Failure(failure)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ModelAttemptTiming {
+    request_started: tokio::time::Instant,
+    attempt_started: tokio::time::Instant,
+    attempt_number: u64,
+    max_attempts: u64,
+}
+
+impl ModelAttemptTiming {
+    fn attach(self, mut error: ModelError) -> ModelError {
+        let mut details = match error.details {
+            Value::Object(details) => details,
+            Value::Null => serde_json::Map::new(),
+            original => serde_json::Map::from_iter([("cause".to_owned(), original)]),
+        };
+        details.extend([
+            ("attempt_number".to_owned(), json!(self.attempt_number)),
+            ("max_attempts".to_owned(), json!(self.max_attempts)),
+            (
+                "attempt_elapsed_ms".to_owned(),
+                json!(self.attempt_started.elapsed().as_millis() as u64),
+            ),
+            (
+                "logical_request_elapsed_ms".to_owned(),
+                json!(self.request_started.elapsed().as_millis() as u64),
+            ),
+        ]);
+        error.details = Value::Object(details);
+        error
     }
 }
 
@@ -31,6 +65,9 @@ pub(super) async fn start_model_with_retry(
     total_usage: &mut ModelUsage,
 ) -> Result<StartedModelStream, ModelStartFailure> {
     let mut retry_number = 0_u32;
+    // This clock covers every attempt and backoff for the same ModelRequest.
+    // Per-read wait notices must not reset the user-visible cumulative wait.
+    let request_started = tokio::time::Instant::now();
     loop {
         if cancellation.is_cancelled() {
             return Err(model_failure(ModelError::new(
@@ -42,21 +79,22 @@ pub(super) async fn start_model_with_retry(
         let attempt_cancellation = cancellation.child_token();
         let guard = attempt_cancellation.clone().drop_guard();
         let max_retries = inner.config.model_retry.max_retries;
-        let retry_prefix = if retry_number > 0 {
-            format!("Retry {retry_number}/{max_retries} · ")
-        } else {
-            String::new()
+        let timing = ModelAttemptTiming {
+            request_started,
+            attempt_started: tokio::time::Instant::now(),
+            attempt_number: u64::from(retry_number) + 1,
+            max_attempts: u64::from(max_retries) + 1,
         };
         let result = with_wait_notice(
             inner.backend.start(request.clone(), attempt_cancellation),
-            |elapsed| report_model_wait(inner, run, &retry_prefix, "response", elapsed),
+            |elapsed| report_model_wait(inner, run, "response", elapsed, timing),
         )
         .await;
         let mut usage = None;
         let mut expected_sequence = 1;
         let error = match result {
             Ok(mut stream) => loop {
-                match next_model_event_with_prefix(inner, run, &retry_prefix, &mut stream).await {
+                match next_model_event(inner, run, &mut stream, timing).await {
                     Some(Ok(first)) => {
                         first
                             .validate_for(&request.request_id, expected_sequence)
@@ -71,11 +109,12 @@ pub(super) async fn start_model_with_retry(
                                 .chain(stream)
                                 .map(move |event| {
                                     let _ = &guard;
-                                    event
+                                    event.map_err(|error| timing.attach(error))
                                 })
                                 .boxed(),
                             expected_sequence,
                             usage,
+                            timing,
                         });
                     }
                     Some(Err(error)) => break error,
@@ -90,6 +129,7 @@ pub(super) async fn start_model_with_retry(
             },
             Err(error) => error,
         };
+        let error = timing.attach(error);
         drop(guard);
         // Only an explicit rejection before any usage/content is known safe
         // to reproject. A late error cannot certify that generation was absent.
@@ -149,13 +189,14 @@ pub(super) async fn start_model_with_retry(
                 provider_seq: None,
                 payload: AgentTelemetry::ProgressReported {
                     message: format!(
-                        "{}; retry {retry_number}/{} in {delay_ms} ms",
+                        "{}; retry {retry_number}/{} in {delay_ms} ms · total {}s",
                         if error.code == ModelErrorCode::RateLimited {
                             "Model rate limit reached"
                         } else {
                             "Model temporarily unavailable"
                         },
-                        inner.config.model_retry.max_retries
+                        inner.config.model_retry.max_retries,
+                        request_started.elapsed().as_secs()
                     ),
                     fraction: None,
                 },
@@ -171,18 +212,10 @@ pub(super) async fn next_model_event(
     inner: &GenericInner,
     run: &AgentStartRequest,
     stream: &mut ModelStream,
-) -> Option<Result<ModelStreamEvent, ModelError>> {
-    next_model_event_with_prefix(inner, run, "", stream).await
-}
-
-async fn next_model_event_with_prefix(
-    inner: &GenericInner,
-    run: &AgentStartRequest,
-    prefix: &str,
-    stream: &mut ModelStream,
+    timing: ModelAttemptTiming,
 ) -> Option<Result<ModelStreamEvent, ModelError>> {
     with_wait_notice(stream.next(), |elapsed| {
-        report_model_wait(inner, run, prefix, "output", elapsed)
+        report_model_wait(inner, run, "output", elapsed, timing)
     })
     .await
 }
@@ -210,11 +243,18 @@ async fn with_wait_notice<T>(
 fn report_model_wait(
     inner: &GenericInner,
     run: &AgentStartRequest,
-    prefix: &str,
     phase: &str,
     elapsed: Duration,
+    timing: ModelAttemptTiming,
 ) {
     let run_id = &run.run.spec.run_id;
+    let message = format!(
+        "Attempt {}/{} · total {}s · Waiting for model {phase} ({}s)",
+        timing.attempt_number,
+        timing.max_attempts,
+        timing.request_started.elapsed().as_secs(),
+        elapsed.as_secs(),
+    );
     publish_telemetry(
         inner,
         run_id,
@@ -223,7 +263,7 @@ fn report_model_wait(
             run_id: run_id.clone(),
             provider_seq: None,
             payload: AgentTelemetry::ProgressReported {
-                message: format!("{prefix}Waiting for model {phase} ({}s)", elapsed.as_secs()),
+                message,
                 fraction: None,
             },
         },

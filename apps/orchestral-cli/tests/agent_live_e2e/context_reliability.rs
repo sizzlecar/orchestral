@@ -336,7 +336,6 @@ fn repeated_pressure_compaction_and_process_restart_recall_original_outcomes_wit
     handlers.push(Box::new(|request| {
         let text = model_request_text(&request.body);
         assert!(text.contains("UNTRUSTED earlier transcript"));
-        assert!(text.contains("status=failed"));
         assert!(text.contains("Preserve stable_api"));
         openai_text_response("INSPECTION_RECORDED")
     }));
@@ -389,7 +388,52 @@ fn repeated_pressure_compaction_and_process_restart_recall_original_outcomes_wit
     assert!(second.status.success(), "{}", second.stderr_text());
     assert_planning_boundaries(&workspace);
     assert!(second.stdout_text().contains("ORIGINAL_OUTCOMES_RECALLED"));
-    assert_eq!(server.join().unwrap().len(), 16);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 16);
+    let failed_read = before
+        .iter()
+        .find(|record| {
+            let exchange = &record["payload"];
+            tool_name(exchange) == Some("file_read")
+                && tool_arguments(exchange)["path"] == "absent-input.txt"
+                && tool_result_is_error(exchange) == Some(true)
+        })
+        .expect("the original failed inspection remains in the Session journal");
+    let failed_seq = failed_read["session_seq"].as_u64().unwrap();
+    let failed_code = &tool_result_value(&failed_read["payload"])["code"];
+    let compacted_text = model_request_text(&requests[10].body);
+    let covers_failure = |ranges: &Value| {
+        ranges.as_array().is_some_and(|ranges| {
+            ranges.iter().any(|range| {
+                range.as_array().is_some_and(|range| {
+                    range.len() == 2
+                        && range[0].as_u64().is_some_and(|start| start <= failed_seq)
+                        && range[1].as_u64().is_some_and(|end| failed_seq <= end)
+                })
+            })
+        })
+    };
+    // Bounded summaries may replace an inspection receipt with an explicit
+    // source index. Do not require platform-dependent error prose to fit too;
+    // the resumed Run above must still recall the original failed result.
+    assert!(
+        compacted_text.lines().any(|line| {
+            let Ok(block) = serde_json::from_str::<Value>(line) else {
+                return false;
+            };
+            let Some(receipts) = block["file_inspections_v1"].as_array() else {
+                return false;
+            };
+            receipts.iter().any(|receipt| {
+                receipt["path"] == "absent-input.txt"
+                    && receipt["status"] == "failed"
+                    && &receipt["code"] == failed_code
+                    && covers_failure(&receipt["sources"])
+            }) || (block["omitted_receipts"].as_u64().is_some_and(|count| count > 0)
+                && covers_failure(&block["omitted_sources"]))
+        }),
+        "failed inspection at session_seq={failed_seq} must have a complete receipt or an explicit recall index: {compacted_text}"
+    );
     let after = session_records(&workspace);
     assert_eq!(
         &after[..before.len()],

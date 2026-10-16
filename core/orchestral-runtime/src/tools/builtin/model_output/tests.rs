@@ -32,10 +32,21 @@ fn builtin_model_read_preserves_content_and_canonical_evidence() {
     let output = read_output();
     let before = output.clone();
     let view = executor.project_model_output(&invocation, &output);
-    assert_eq!(
-        view,
-        json!({"path": output["path"], "content": output["content"]})
-    );
+    for field in [
+        "workspace",
+        "path",
+        "revision",
+        "content",
+        "start_line",
+        "end_line",
+        "next_offset",
+        "eof",
+        "truncated",
+        "truncation_reasons",
+        "truncated_line_numbers",
+    ] {
+        assert_eq!(view[field], output[field], "{field}");
+    }
     assert_eq!(
         view["content"].as_str().unwrap().as_bytes(),
         output["content"].as_str().unwrap().as_bytes()
@@ -69,6 +80,7 @@ fn builtin_model_read_keeps_partial_ranges_truncation_and_workspace() {
         for field in [
             "workspace",
             "path",
+            "revision",
             "content",
             "start_line",
             "end_line",
@@ -86,6 +98,31 @@ fn builtin_model_read_keeps_partial_ranges_truncation_and_workspace() {
             );
         }
     }
+}
+
+#[test]
+fn builtin_model_read_keeps_empty_file_eof_and_versions_only_read_projection() {
+    let mut output = read_output();
+    output["content"] = json!("");
+    output["content_digest"] = json!(Digest::sha256(b""));
+    output["end_line"] = json!(0);
+    output["next_offset"] = json!(1);
+    output["file_size_bytes"] = json!(0);
+    output["scanned_bytes"] = json!(0);
+    let view = file_read(&invocation("orchestral/file_read/v1"), &output);
+    assert_eq!(view["start_line"], 1);
+    assert_eq!(view["end_line"], 0);
+    assert_eq!(view["next_offset"], 1);
+    assert_eq!(view["eof"], true);
+    assert_eq!(view["revision"], output["revision"]);
+    assert_eq!(
+        contract("file-read")["contract"],
+        "orchestral.builtin-file-read-model-output/v2"
+    );
+    assert_eq!(
+        contract("exec")["contract"],
+        "orchestral.builtin-exec-model-output/v1"
+    );
 }
 
 #[test]

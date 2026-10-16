@@ -40,17 +40,15 @@ pub(super) fn can_replace_source(
     });
     // Loaded Skills may be absent from this projection because they belong to
     // another Run or its allowed digest set changed. They remain durable
-    // barriers, just like retained artifacts and unresolved effects.
+    // barriers, like unresolved effects. Artifact references remain authorized
+    // by their durable producers and can be compacted with their exchanges.
     let crosses_protected_record = records.iter().any(|record| {
         extent.contains(record.session_seq)
-            && match &record.payload {
+            && matches!(
+                &record.payload,
                 AgentSessionEvent::SkillLoaded { .. }
-                | AgentSessionEvent::EffectUncertaintyCommitted { .. } => true,
-                AgentSessionEvent::ToolExchangeCommitted {
-                    retained_artifacts, ..
-                } => !retained_artifacts.is_empty(),
-                _ => false,
-            }
+                    | AgentSessionEvent::EffectUncertaintyCommitted { .. }
+            )
     });
     !crosses_group && !crosses_protected_record
 }
