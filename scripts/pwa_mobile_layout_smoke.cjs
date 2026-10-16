@@ -24,6 +24,12 @@ async function checkMobileLayout({ page, primary, secondary, sessions, submissio
   const engine = process.env.PWA_SMOKE_ENGINE || "chromium";
   const activate = pane => pane.locator(".pane-activate").click();
   const input = pane => pane.getByRole("textbox", { name: "消息草稿" });
+  const viewportSettled = () => page.waitForFunction(() => {
+    const bounds = document.getElementById("main").getBoundingClientRect();
+    return Math.abs(bounds.width - visualViewport.width) < 1
+      && Math.abs(bounds.height - visualViewport.height) < 1
+      && Math.abs(bounds.top - visualViewport.offsetTop) < 1;
+  });
   const geometry = () => page.evaluate(() => {
     const visible = element => element && element.getClientRects().length > 0;
     const rect = element => { const r = element.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, height: r.height, left: r.left, right: r.right }; };
@@ -101,10 +107,11 @@ async function checkMobileLayout({ page, primary, secondary, sessions, submissio
 
   await page.setViewportSize({ width: 844, height: 390 });
   await page.evaluate(() => setFixtureViewport({ width: 844, height: 390, offsetTop: 0 }));
-  await page.waitForFunction(() => document.getElementById("main").getBoundingClientRect().width === 844);
+  await viewportSettled();
   await assertInputVisible();
   await page.setViewportSize({ width, height: 844 });
   await page.evaluate(w => setFixtureViewport({ width: w, height: 708, offsetTop: 0 }), width);
+  await viewportSettled();
   await assertInputVisible();
   console.log(JSON.stringify({ mobileLayout: true, engine, width, readingRatio, singleComposer: true, keyboardUpperAndLower: true, targetRouting: true, retainedDraftsAndStreams: true, rotate: true, paidModelRequests: 0 }));
 }
