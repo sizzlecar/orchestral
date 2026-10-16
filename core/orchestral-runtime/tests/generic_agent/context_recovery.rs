@@ -163,6 +163,12 @@ struct CapacitySummarizer;
 
 #[async_trait]
 impl orchestral_runtime::AgentSessionSummarizer for CapacitySummarizer {
+    fn may_call_model(&self) -> bool {
+        // This fixture produces a fixed local message; it must remain usable
+        // when recovery enforces cumulative Run token limits.
+        false
+    }
+
     fn descriptor(&self) -> SessionSummarizerDescriptor {
         SessionSummarizerDescriptor {
             strategy: "capacity-recovery-summary".to_owned(),

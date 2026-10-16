@@ -2736,6 +2736,10 @@ impl ModelBackend for RestartSessionModel {
 
 #[async_trait]
 impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
+    fn may_call_model(&self) -> bool {
+        false
+    }
+
     fn descriptor(&self) -> SessionSummarizerDescriptor {
         SessionSummarizerDescriptor {
             strategy: "recording-integration-summary".to_owned(),
@@ -2753,8 +2757,8 @@ impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
     ) -> Result<ModelMessage, SessionContextError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(input.source.first_session_seq, 1);
-        assert_eq!(input.source.last_session_seq, 2);
-        assert_eq!(input.groups.len(), 2);
+        assert_eq!(input.source.last_session_seq, 1);
+        assert_eq!(input.groups.len(), 1);
         assert_eq!(input.focus_messages.len(), 1);
         Ok(ModelMessage::text(
             ModelRole::System,
@@ -2765,6 +2769,10 @@ impl orchestral_runtime::AgentSessionSummarizer for RecordingSessionSummarizer {
 
 #[async_trait]
 impl orchestral_runtime::AgentSessionSummarizer for PressureSessionSummarizer {
+    fn may_call_model(&self) -> bool {
+        false
+    }
+
     fn descriptor(&self) -> SessionSummarizerDescriptor {
         SessionSummarizerDescriptor {
             strategy: "pressure-integration-summary".to_owned(),
@@ -2821,7 +2829,8 @@ impl ModelBackend for CompactionAwareModel {
                 // The most recent compacted user request is preserved as an
                 // original User message when the follow-up budget permits it.
                 assert!(serialized.contains("raw first question"));
-                assert!(!serialized.contains("raw first answer"));
+                // The retained historical tail remains verbatim.
+                assert!(serialized.contains("raw first answer"));
                 "second answer"
             }
             _ => panic!("unexpected model request after two terminal Runs"),
@@ -9230,16 +9239,20 @@ async fn bound_session_compaction_runs_before_a_real_model_round_and_is_durable(
         requests: AtomicUsize::new(0),
     });
     let policy = SessionCompactionPolicy {
-        minimum_source_records: 2,
+        minimum_source_records: 1,
         keep_recent_records: 1,
     };
     let expected_policy_digest = policy.digest().unwrap();
     let expected_summary_config_digest =
         orchestral_core::agent_protocol::wire::Digest::sha256("recording-integration-summary/v1");
+    let mut config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    // Explicit optional maintenance preference: record count alone must no
+    // longer trigger compaction while there is ample model capacity.
+    config.compaction_working_set_tokens = Some(1);
     let provider = Arc::new(
         InternalGenericAgentProvider::new_with_session_journal(
             model.clone(),
-            GenericAgentConfig::new("internal-provider", "generic-agent"),
+            config,
             session_journal.clone(),
             Arc::new(JsonSizeTokenMeter::default()),
         )
@@ -9270,10 +9283,13 @@ async fn bound_session_compaction_runs_before_a_real_model_round_and_is_durable(
         )
         .unwrap();
         let execution = controller.start(run).await.unwrap();
-        let terminal = controller
-            .wait_for_terminal(&execution.run_id)
-            .await
-            .unwrap();
+        let terminal = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            controller.wait_for_terminal(&execution.run_id),
+        )
+        .await
+        .expect("compaction/model fixture must finish")
+        .unwrap();
         assert_eq!(terminal.state.status(), AgentRunStatus::Delivered);
     }
 
@@ -9299,7 +9315,7 @@ async fn bound_session_compaction_runs_before_a_real_model_round_and_is_durable(
         })
         .expect("model-round compaction is a durable Session fact");
     assert_eq!(compaction.0.first_session_seq, 1);
-    assert_eq!(compaction.0.last_session_seq, 2);
+    assert_eq!(compaction.0.last_session_seq, 1);
     assert_eq!(*compaction.1, expected_policy_digest);
     assert_eq!(*compaction.2, expected_summary_config_digest);
     assert_eq!(compaction.3, "recording-integration-summary");
