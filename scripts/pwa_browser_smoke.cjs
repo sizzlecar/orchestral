@@ -687,6 +687,15 @@ const server = http.createServer(async (req, res) => {
         const registration = await navigator.serviceWorker.getRegistration();
         return registration?.active && navigator.serviceWorker.controller;
       });
+      // An active controller does not mean a reconnect/foreground update job
+      // has settled. Drain a check of revision 0 before publishing revision 1,
+      // or the app can legitimately coalesce our visibility event into an
+      // earlier in-flight check. The new revision below must still be found
+      // by the application's foreground listener, not this baseline barrier.
+      await page.evaluate(async () => {
+        const registration = await navigator.serviceWorker.ready;
+        await registration.update();
+      });
       await input.fill("升级后保留的草稿");
       workerRevision = 1;
       // Exercise the real foreground update check, including worker install,
@@ -701,6 +710,7 @@ const server = http.createServer(async (req, res) => {
         exact: true,
       });
       await update.waitFor();
+      assert.ok(workerRequests.includes(1), "the app's foreground check must request the newly published worker");
       assert.equal(await update.count(), 1, "the two-pane workspace exposes one global update action");
       assert.equal(
         await input.inputValue(),

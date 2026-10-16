@@ -217,6 +217,12 @@ const server = http.createServer(async (req, res) => {
         const registration = await navigator.serviceWorker.getRegistration();
         return registration?.active && navigator.serviceWorker.controller;
       });
+      // Finish any baseline update job before changing the served worker.
+      // Revision 1 is discovered only through the app's visibility listener.
+      await page.evaluate(async () => {
+        const registration = await navigator.serviceWorker.ready;
+        await registration.update();
+      });
       workerRevision = 1;
       await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange", { bubbles: true })));
       const update = page.getByRole("button", { name: "刷新更新", exact: true });
