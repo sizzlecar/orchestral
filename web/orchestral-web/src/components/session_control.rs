@@ -16,6 +16,8 @@ const HOST_CWD_SHORTCUTS: [(&str, &str); 4] = [
 #[component]
 pub fn NewSessionPanel() -> Element {
     let mut controller = consume_context::<AppController>();
+    let workspace = consume_context::<crate::app::SplitWorkspace>();
+    let source = (workspace.source)();
     let state = controller.state.read().clone();
     if !state.ui.new_session_open {
         return rsx! {};
@@ -29,8 +31,10 @@ pub fn NewSessionPanel() -> Element {
         .connectors
         .items
         .into_iter()
-        .filter(|connector| connector.capabilities.create)
+        .filter(|connector| connector.capabilities.create && source.matches_connector(connector))
         .collect::<Vec<_>>();
+    let unavailable =
+        create_connectors.is_empty() && source != crate::workspace::WorkspaceSource::Orchestral;
 
     rsx! {
         div {
@@ -41,7 +45,7 @@ pub fn NewSessionPanel() -> Element {
         dialog { class: "settings-dialog session-control-dialog", open: true,
             header { class: "settings-header",
                 div {
-                    p { class: "eyebrow", "选择执行者" }
+                    p { class: "eyebrow", "{source.label()}" }
                     h2 { "新建会话" }
                 }
                 button {
@@ -53,7 +57,7 @@ pub fn NewSessionPanel() -> Element {
                 }
             }
             div { class: "settings-content session-source-list",
-                button {
+                if source == crate::workspace::WorkspaceSource::Orchestral { button {
                     class: "session-source-card",
                     r#type: "button",
                     disabled,
@@ -70,7 +74,7 @@ pub fn NewSessionPanel() -> Element {
                         small { "内置通用 Agent" }
                     }
                     span { class: "session-source-card__action", "创建" }
-                }
+                } }
                 for connector in create_connectors {
                     AgentSessionCreateCard {
                         key: "{connector.connector_id}",
@@ -78,6 +82,9 @@ pub fn NewSessionPanel() -> Element {
                         default_cwd: default_cwd.clone(),
                         disabled,
                     }
+                }
+                if unavailable {
+                    p { class: "settings-error", "当前主机尚未提供 {source.label()} 会话创建功能。" }
                 }
                 if let Some(error) = state.connectors.error {
                     p { class: "settings-error", "外部 Agent 暂不可用：{error}" }

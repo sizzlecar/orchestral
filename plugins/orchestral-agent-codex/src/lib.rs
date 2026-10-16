@@ -808,6 +808,7 @@ impl AgentConnector for CodexConnector {
             connector_id: AgentConnectorId::new(CONNECTOR_ID),
             provider_binding: ProviderBindingRef::new(PROVIDER_BINDING),
             agent_family: "coding-agent".to_owned(),
+            agent_product: Some("codex".to_owned()),
             display_name: "Codex".to_owned(),
             capabilities: AgentSessionCapabilities {
                 create: true,
@@ -3398,6 +3399,8 @@ mod tests {
         });
 
         let descriptor = connector.describe();
+        assert_eq!(descriptor.agent_family, "coding-agent");
+        assert_eq!(descriptor.agent_product.as_deref(), Some("codex"));
         assert!(descriptor.capabilities.create);
         assert!(descriptor
             .action(&AgentSessionActionId::new(SESSION_FORK_ACTION))

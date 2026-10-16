@@ -42,6 +42,15 @@ Host 控制的 SDK Run 仍使用自己的 durable request 路径，不产生第�
 6. `DeliveryCommitted` 只证明 Agent 已交付，不等于 `GoalSatisfied` 或 `Verified`。
 7. ResourceBinding 只授予可见性，不授予 Tool、文件、网络或 Secret 权限。
 
+## 会话目录展示元数据
+
+目录的 `AgentConnectorDescriptor.agent_family` 表示能力族；Codex 和 Claude Code
+都使用 `coding-agent`。可选字段 `agent_product` 提供稳定的产品分组键，两个适配器
+分别声明 `codex` 和 `claude`，供客户端的来源筛选和创建入口使用。它不改变 Run
+协议、能力声明或权限，也不能代替不透明的 `connector_id` 作为请求目标。
+字段缺省时表示产品未声明；旧目录数据仍可解码，客户端不得从连接器 ID 或显示名
+猜测产品。未声明时序列化省略该字段；更新产品分组界面时须同时部署提供此元数据的 Host。
+
 ## 最小 Host 调用
 
 ```rust

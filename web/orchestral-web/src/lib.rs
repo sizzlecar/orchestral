@@ -4,11 +4,14 @@
 //! covered by ordinary Rust tests. Browser effects and components are only
 //! compiled for the `web` feature.
 
+#[cfg(any(feature = "web", test))]
+pub(crate) mod catalog;
 pub mod markdown;
 pub mod model;
 pub mod presentation;
 pub mod sse;
 pub mod state;
+pub mod workspace;
 
 #[cfg(any(feature = "web", test))]
 mod tasks;

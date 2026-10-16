@@ -15,7 +15,12 @@ use crate::state::{
 #[component]
 pub fn ConversationTimeline() -> Element {
     let controller = consume_context::<AppController>();
+    use_drop(move || platform::end_timeline_session(controller.timeline_scope));
     let state = controller.state.read();
+    let session_key = state
+        .selected_session()
+        .map(|session| session.key())
+        .unwrap_or_default();
     let loading_session = state
         .selected_session()
         .is_some_and(|session| state.ui.loading_session.as_deref() == Some(session.key().as_str()));
@@ -33,6 +38,9 @@ pub fn ConversationTimeline() -> Element {
         .unwrap_or_default();
     let empty = blocks.is_empty();
     let history_pagination = state.selected_session().and_then(|session| {
+        if let Some(loading) = state.builtin_history_pagination(session) {
+            return Some((loading, state.connection.online));
+        }
         let run_id = session.history_run_id()?;
         let run = state.runs.get(&run_id)?;
         run.history_next_cursor
@@ -45,10 +53,13 @@ pub fn ConversationTimeline() -> Element {
         div { class: "timeline-stage",
             section {
                 class: "message-list",
+                "data-timeline-session": session_key,
+                "data-timeline-scope": controller.timeline_scope,
                 role: "log",
                 aria_label: "对话内容",
                 aria_live: "polite",
                 onscroll: move |_| controller.update_timeline_scroll_state(),
+                div { class: "timeline-content", "data-timeline-content": "true",
                 if let Some((loading, online)) = history_pagination {
                     div { class: "history-pagination",
                         button {
@@ -100,6 +111,7 @@ pub fn ConversationTimeline() -> Element {
                             },
                         }
                     }
+                }
                 }
             }
             if scrolled_away {

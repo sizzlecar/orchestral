@@ -47,6 +47,7 @@ impl FixtureConnector {
                 connector_id,
                 provider_binding: ProviderBindingRef::new(provider_binding),
                 agent_family: "coding-agent".to_owned(),
+                agent_product: None,
                 display_name: "Fixture Agent".to_owned(),
                 capabilities: AgentSessionCapabilities::discoverable(),
                 creation: None,

@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 
 use crate::browser::controller::AppController;
-use crate::browser::{platform, storage};
+use crate::browser::platform;
 use crate::components::pending::PendingPanel;
 use crate::components::session_control::{NewSessionPanel, SessionActionsPanel};
 use crate::components::settings::SettingsPanel;
@@ -79,13 +79,112 @@ pub fn AuthScreen() -> Element {
 
 #[component]
 pub fn Workspace() -> Element {
-    let mut controller = consume_context::<AppController>();
-    let state = controller.state.read().clone();
-    let drawer_class = if state.ui.drawer_open {
-        "sidebar sidebar--open"
+    let mut split = consume_context::<crate::app::SplitWorkspace>();
+    let mut controller = split.primary;
+    let source = (split.source)();
+    let state = controller.state.read();
+    let refreshing = state.sessions.status == LoadStatus::Loading;
+    let install_available = state.ui.install_available;
+    let update_available = state.ui.update_available;
+    let online = state.connection.online;
+    drop(state);
+    let update_blocked = !split.update_blockers.read().is_empty()
+        || split.draft_save_error.read().is_some()
+        || controller.has_pending_submissions();
+    rsx! {
+        a { class: "skip-link", href: "#main-content-primary", "跳到对话" }
+        div { class: "app-shell split-workspace", "data-state": "ready",
+            header { class: "workspace-topbar",
+                a { class: "workspace-brand", href: "./", aria_label: "Orchestral 首页",
+                    img { src: "/icons/favicon.svg", alt: "", width: "26", height: "26" }
+                }
+                nav { class: "workspace-sources", role: "tablist", aria_label: "会话来源",
+                    for item in crate::workspace::WorkspaceSource::ALL {
+                        button { class: if source == item { "workspace-source is-active" } else { "workspace-source" },
+                            role: "tab", r#type: "button", aria_selected: source == item,
+                            onclick: move |_| {
+                                split.source.set(item);
+                                for mut pane in [split.primary, split.secondary] {
+                                    let mut state = pane.state.write();
+                                    state.ui.session_page = 0;
+                                    state.ui.drawer_open = false;
+                                }
+                            },
+                            "{item.label()}"
+                        }
+                    }
+                }
+                div { class: "workspace-actions",
+                    button { class: "icon-button", r#type: "button", aria_label: "刷新会话", disabled: refreshing,
+                        onclick: move |_| { controller.spawn(async move { controller.refresh_sessions(false).await }); },
+                        "↻"
+                    }
+                    button { class: "icon-button", r#type: "button", aria_label: "新建会话",
+                        onclick: move |_| controller.state.write().ui.new_session_open = true,
+                        "+"
+                    }
+                    button { class: "icon-button", r#type: "button", aria_label: "设置",
+                        onclick: move |_| {
+                            controller.state.write().ui.settings_open = true;
+                            controller.spawn(async move { controller.refresh_devices().await });
+                        },
+                        "⚙"
+                    }
+                    if install_available {
+                        button { class: "session-actions-button workspace-install", r#type: "button",
+                            onclick: move |_| controller.install(), "安装"
+                        }
+                    }
+                }
+                if update_available {
+                    div { class: "update-notice workspace-update", role: "status",
+                        span {
+                            if update_blocked { "请先完成发送、上传或草稿保存" }
+                            else { "新版本已就绪，两屏草稿会保留" }
+                        }
+                        button { r#type: "button", disabled: update_blocked || !online,
+                            onclick: move |_| {
+                                if !split.update_blockers.peek().is_empty()
+                                    || split.draft_save_error.peek().is_some()
+                                    || !platform::is_online()
+                                    || split.primary.state.peek().ui.composer_busy
+                                    || split.secondary.state.peek().ui.composer_busy
+                                    || controller.has_pending_submissions()
+                                { return; }
+                                if let Err(error) = platform::reload() { controller.notice(&error, "error"); }
+                            },
+                            "刷新更新"
+                        }
+                    }
+                }
+            }
+            div { class: "session-panes",
+                SessionPane { pane: "primary" }
+                SessionPane { pane: "secondary" }
+            }
+        }
+        SettingsPanel {}
+    }
+}
+
+#[component]
+fn SessionPane(pane: &'static str) -> Element {
+    let split = consume_context::<crate::app::SplitWorkspace>();
+    let mut controller = use_context_provider(move || {
+        if pane == "primary" {
+            split.primary
+        } else {
+            split.secondary
+        }
+    });
+    let other = if pane == "primary" {
+        split.secondary
     } else {
-        "sidebar"
+        split.primary
     };
+    let other_selected = other.state.read().sessions.selected_id.clone();
+    let source = (split.source)();
+    let state = controller.state.read().clone();
     let selected = state.selected_session().cloned();
     let title = selected
         .as_ref()
@@ -95,7 +194,7 @@ pub fn Workspace() -> Element {
         .as_ref()
         .and_then(|session| session.connector_id.as_deref())
         .map(|connector_id| connector_display_name(&state, connector_id))
-        .unwrap_or_else(|| "Orchestral".to_owned());
+        .unwrap_or_else(|| source.label().to_owned());
     let session_metadata = selected.as_ref().map(session_metadata).unwrap_or_default();
     let run = state.current_run().cloned();
     let issue_run_id = selected
@@ -129,267 +228,121 @@ pub fn Workspace() -> Element {
     let has_session_actions = state
         .selected_connector()
         .is_some_and(|connector| connector.actions.iter().any(|action| !action.input_channel));
-    let install_available = state.ui.install_available;
-    let session_groups = group_sessions(&state);
-    let selected_tab = selected
-        .as_ref()
-        .and_then(|session| session.connector_id.clone())
-        .unwrap_or_else(|| "orchestral".to_owned());
-    let active_tab = state
-        .ui
-        .session_tab
-        .as_ref()
-        .filter(|tab| session_groups.iter().any(|group| group.key == **tab))
-        .cloned()
-        .filter(|_| state.ui.session_tab.is_some())
-        .unwrap_or(selected_tab);
-    let active_group = session_groups
+
+    let selected_key = selected.as_ref().map(SessionView::key);
+    let source_label = source.label();
+    let matching_connectors = state
+        .connectors
+        .items
         .iter()
-        .find(|group| group.key == active_tab)
-        .cloned()
-        .or_else(|| session_groups.first().cloned());
-    let (visible_sessions, session_page, loaded_page_count) = active_group
-        .as_ref()
-        .map(|group| paginated_sessions(group, state.ui.session_page))
-        .unwrap_or_else(|| (Vec::new(), 0, 1));
-
+        .filter(|connector| source.matches_connector(connector))
+        .map(|connector| connector.connector_id.clone())
+        .collect::<Vec<_>>();
+    let groups = group_sessions(&state)
+        .into_iter()
+        .filter(|group| {
+            group.connector_id.as_ref().map_or(
+                source == crate::workspace::WorkspaceSource::Orchestral,
+                |id| matching_connectors.contains(id),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut sessions = source.sessions(&state);
+    sessions.retain(|session| Some(session.key()) != other_selected);
+    let group = SessionGroup {
+        key: source.key().to_owned(),
+        label: source_label.to_owned(),
+        connector_id: None,
+        sessions,
+        has_more: groups.iter().any(|group| group.has_more),
+        loading_more: groups.iter().any(|group| group.loading_more),
+        load_error: groups.iter().find_map(|group| group.load_error.clone()),
+    };
+    let (visible_sessions, session_page, page_count) =
+        paginated_sessions(&group, state.ui.session_page);
+    let more_connectors = groups
+        .iter()
+        .filter(|group| group.has_more || group.load_error.is_some())
+        .filter_map(|group| group.connector_id.clone())
+        .collect::<Vec<_>>();
     rsx! {
-        a { class: "skip-link", href: "#main-content", "跳到对话" }
-        div { class: "app-shell", "data-state": "ready",
-            header { class: "mobile-topbar",
-                button {
-                    class: "icon-button",
-                    r#type: "button",
-                    aria_label: "打开会话列表",
-                    aria_expanded: state.ui.drawer_open,
-                    onclick: move |_| {
-                        let open = controller.state.read().ui.drawer_open;
-                        controller.state.write().ui.drawer_open = !open;
-                    },
-                    svg { view_box: "0 0 24 24", width: "21", height: "21",
-                        path { d: "M4 7h16M4 12h16M4 17h11" }
-                    }
+        section { class: "session-pane", "data-pane": pane, "data-timeline-scope": pane,
+            aria_label: if pane == "primary" { "上方会话" } else { "下方会话" },
+            if state.ui.drawer_open {
+                button { class: "pane-drawer-backdrop", r#type: "button", aria_label: "关闭会话列表",
+                    onclick: move |_| controller.state.write().ui.drawer_open = false,
                 }
-                a { class: "mobile-brand", href: "./", aria_label: "Orchestral 首页",
-                    img { src: "/icons/favicon.svg", alt: "", width: "28", height: "28" }
-                    span { "Orchestral" }
-                }
-                button {
-                    class: "icon-button",
-                    r#type: "button",
-                    aria_label: "新建会话",
-                    onclick: move |_| {
-                        let mut state = controller.state.write();
-                        state.ui.drawer_open = false;
-                        state.ui.new_session_open = true;
-                    },
-                    svg { view_box: "0 0 24 24", width: "21", height: "21",
-                        path { d: "M12 5v14M5 12h14" }
-                    }
-                }
-            }
-
-            div { class: "app-layout",
-                if state.ui.drawer_open {
-                    button {
-                        class: "sidebar-backdrop",
-                        r#type: "button",
-                        aria_label: "关闭会话列表",
-                        onclick: move |_| controller.state.write().ui.drawer_open = false,
-                    }
-                }
-                aside { class: drawer_class, aria_label: "会话导航",
-                    div { class: "sidebar__head",
-                        a { class: "brand", href: "./",
-                            img { src: "/icons/favicon.svg", alt: "", width: "34", height: "34" }
-                            span { class: "brand__copy",
-                                strong { "Orchestral" }
-                                span { "agent workspace" }
-                            }
-                        }
-                        button {
-                            class: "new-thread-button",
-                            r#type: "button",
-                            onclick: move |_| {
-                                let mut state = controller.state.write();
-                                state.ui.drawer_open = false;
-                                state.ui.new_session_open = true;
-                            },
-                            span { "+" }
-                            span { "新建会话" }
-                            kbd { "⌘ K" }
+                aside { class: "pane-session-drawer", aria_label: "会话导航",
+                    header { class: "pane-drawer-header",
+                        strong { "{source_label} 会话" }
+                        button { class: "icon-button", r#type: "button", aria_label: "关闭会话列表",
+                            onclick: move |_| controller.state.write().ui.drawer_open = false, "×"
                         }
                     }
                     nav { class: "thread-nav", aria_label: "最近会话",
-                        div { class: "thread-tabs", role: "tablist", aria_label: "会话来源",
-                            for group in session_groups.clone() {
+                        ul { class: "thread-list",
+                            for session in visible_sessions {
                                 {
-                                    let tab_key = group.key.clone();
-                                    let tab_active = active_group
-                                        .as_ref()
-                                        .is_some_and(|active| active.key == group.key);
+                                    let key = session.key();
+                                    let active = selected_key.as_deref() == Some(key.as_str());
+                                    let title = session_title(&state, &session);
+                                    let updated = format_date(session.updated_at_unix_ms);
                                     rsx! {
-                                        button {
-                                            class: if tab_active { "thread-tab is-active" } else { "thread-tab" },
-                                            key: "{group.key}",
-                                            r#type: "button",
-                                            role: "tab",
-                                            aria_selected: tab_active,
-                                            onclick: move |_| {
-                                                let mut state = controller.state.write();
-                                                state.ui.session_tab = Some(tab_key.clone());
-                                                state.ui.session_page = 0;
-                                            },
-                                            span { "{group.label}" }
-                                            span { class: "thread-tab__count", "{group.sessions.len()}" }
+                                        li { class: "thread-item", key: "{key}",
+                                            button { class: "thread-button", r#type: "button",
+                                                aria_current: if active { "page" } else { "false" },
+                                                onclick: move |_| {
+                                                    let key = key.clone();
+                                                    controller.spawn(async move { controller.load_session(key).await });
+                                                },
+                                                span { class: "thread-button__title", "{title}" }
+                                                span { class: "thread-button__meta", "{updated}" }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                        div { class: "thread-groups",
-                            if let Some(group) = active_group.clone() {
-                                section {
-                                    class: "thread-group",
-                                    key: "{group.key}",
-                                    aria_label: "{group.label} 会话",
-                                    div { class: "thread-group__toolbar",
-                                        span { "最近会话" }
-                                        {
-                                            let refresh_connector_id = group.connector_id.clone();
-                                            rsx! {
-                                                button {
-                                                    class: "thread-group__refresh",
-                                                    r#type: "button",
-                                                    aria_label: "刷新 {group.label} 会话",
-                                                    disabled: group.loading_more || state.sessions.status == LoadStatus::Loading,
-                                                    onclick: move |_| {
-                                                        let connector_id = refresh_connector_id.clone();
-                                                        spawn(async move {
-                                                            controller.refresh_session_group(connector_id).await;
-                                                        });
-                                                    },
-                                                    if group.loading_more || state.sessions.status == LoadStatus::Loading {
-                                                        "刷新中…"
-                                                    } else {
-                                                        "刷新"
-                                                    }
-                                                }
-                                            }
-                                        }
+                        if group.sessions.is_empty() {
+                            p { class: "thread-list-empty", "没有其他可打开的会话" }
+                        }
+                        div { class: "thread-pagination", aria_label: "会话分页",
+                            button { class: "thread-pagination__button", r#type: "button", disabled: session_page == 0,
+                                onclick: move |_| controller.state.write().ui.session_page = session_page.saturating_sub(1),
+                                "上一页"
+                            }
+                            span { class: "thread-pagination__status", "{session_page + 1} / {page_count}" }
+                            button { class: "thread-pagination__button", r#type: "button",
+                                disabled: group.loading_more || (session_page + 1 >= page_count && more_connectors.is_empty()),
+                                onclick: move |_| {
+                                    if session_page + 1 < page_count {
+                                        controller.state.write().ui.session_page = session_page + 1;
+                                    } else {
+                                        let ids = more_connectors.clone();
+                                        controller.spawn(async move {
+                                            for id in ids { controller.load_more_agent_sessions(id).await; }
+                                            controller.state.write().ui.session_page = session_page + 1;
+                                        });
                                     }
-                                    ul { class: "thread-list",
-                                        for session in visible_sessions.clone() {
-                                            {
-                                                let session_key = session.key();
-                                                let selected = state.sessions.selected_id.as_deref() == Some(session_key.as_str());
-                                                let title = session_title(&state, &session);
-                                                let updated = format_date(session.updated_at_unix_ms);
-                                                rsx! {
-                                                    li { class: "thread-item", key: "{session_key}",
-                                                        button {
-                                                            class: "thread-button",
-                                                            r#type: "button",
-                                                            aria_current: if selected { "page" } else { "false" },
-                                                            onclick: move |_| {
-                                                                let selected = session_key.clone();
-                                                                spawn(async move { controller.load_session(selected).await });
-                                                            },
-                                                            span { class: "thread-button__title", "{title}" }
-                                                            span { class: "thread-button__meta", "{updated}" }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if group.sessions.is_empty() && group.load_error.is_none() {
-                                        p { class: "thread-list-empty", "这个分类还没有会话。" }
-                                    }
-                                    if !group.sessions.is_empty() || group.has_more || group.load_error.is_some() {
-                                        div { class: "thread-pagination", aria_label: "会话分页",
-                                            button {
-                                                class: "thread-pagination__button",
-                                                r#type: "button",
-                                                disabled: session_page == 0,
-                                                onclick: move |_| {
-                                                    let page = controller.state.read().ui.session_page;
-                                                    controller.state.write().ui.session_page = page.saturating_sub(1);
-                                                },
-                                                "上一页"
-                                            }
-                                            span { class: "thread-pagination__status",
-                                                if group.has_more { "{session_page + 1} / {loaded_page_count}+" }
-                                                else { "{session_page + 1} / {loaded_page_count}" }
-                                            }
-                                            button {
-                                                class: "thread-pagination__button",
-                                                r#type: "button",
-                                                disabled: group.loading_more
-                                                    || (session_page + 1 >= loaded_page_count && !group.has_more && group.load_error.is_none()),
-                                                onclick: move |_| {
-                                                    if session_page + 1 < loaded_page_count {
-                                                        controller.state.write().ui.session_page = session_page + 1;
-                                                        return;
-                                                    }
-                                                    let Some(connector_id) = group.connector_id.clone() else { return; };
-                                                    let tab_key = group.key.clone();
-                                                    let prior_count = group.sessions.len();
-                                                    spawn(async move {
-                                                        controller.load_more_agent_sessions(connector_id.clone()).await;
-                                                        let mut state = controller.state.write();
-                                                        let new_count = state.sessions.items.iter().filter(|session| {
-                                                            session.connector_id.as_deref() == Some(connector_id.as_str())
-                                                        }).count();
-                                                        if state.ui.session_tab.as_deref() == Some(tab_key.as_str())
-                                                            && new_count > prior_count
-                                                        {
-                                                            state.ui.session_page = session_page + 1;
-                                                        }
-                                                    });
-                                                },
-                                                if group.loading_more { "加载中…" }
-                                                else { "下一页" }
-                                            }
-                                        }
-                                    }
-                                    if let Some(error) = group.load_error.as_ref() {
-                                        p { class: "thread-group__error", "{error}" }
-                                    }
-                                }
+                                },
+                                if group.loading_more { "加载中…" } else { "下一页" }
                             }
                         }
-                        if state.sessions.items.is_empty() && state.sessions.status != LoadStatus::Loading {
-                            p { class: "thread-list-empty", "还没有会话。开始一个新任务吧。" }
-                        }
+                        if let Some(error) = group.load_error { p { class: "thread-group__error", "{error}" } }
                     }
-                    footer { class: "sidebar__footer",
-                        if install_available {
-                            button {
-                                class: "sidebar-action",
-                                r#type: "button",
-                                onclick: move |_| controller.install(),
-                                span { "安装到设备" }
-                            }
-                        }
-                        button {
-                            class: "sidebar-action",
-                            r#type: "button",
-                            onclick: move |_| {
-                                controller.state.write().ui.settings_open = true;
-                                spawn(async move { controller.refresh_devices().await });
-                            },
-                            span { "设置" }
-                        }
-                        ConnectionStatus {}
-                    }
+                    footer { class: "pane-drawer-footer", ConnectionStatus {} }
                 }
-
-                main { class: "conversation", id: "main-content", tabindex: "-1",
+            }
+            main { class: "conversation", id: "main-content-{pane}", tabindex: "-1",
                     header { class: "conversation-header",
                         div { class: "conversation-header__title",
                             p { class: "eyebrow", "{session_source} 会话" }
-                            h1 { "{title}" }
+                            button { class: "pane-session-select", r#type: "button",
+                                aria_label: "打开会话列表", aria_expanded: state.ui.drawer_open,
+                                onclick: move |_| controller.state.write().ui.drawer_open = true,
+                                h1 { "{title}" }
+                                span { aria_hidden: "true", "⌄" }
+                            }
                         }
                         div { class: "conversation-header__controls",
                             if let Some(run_id) = manual_run_id {
@@ -438,27 +391,32 @@ pub fn Workspace() -> Element {
                             }
                         }
                     }
+
+                if selected.is_some() {
                     ConversationTimeline {}
                     PendingPanel {}
-                    Composer {}
+                } else {
+                    div { class: "pane-empty", role: "status",
+                        span { class: "pane-empty__mark", aria_hidden: "true", "+" }
+                        h2 { "暂无更多 {source_label} 会话" }
+                        p { "打开历史会话，或开始一个新任务。" }
+                        button { class: "session-actions-button", r#type: "button",
+                            onclick: move |_| controller.state.write().ui.new_session_open = true,
+                            "新建 {source_label} 会话"
+                        }
+                    }
                 }
+                Composer {}
             }
-        }
-        SettingsPanel {}
-        NewSessionPanel {}
-        SessionActionsPanel {}
-        if let Some(notice) = state.ui.notice {
-            div { class: "toast-region", aria_live: "polite",
-                div { class: "toast toast--{notice.tone}",
-                    span { class: "toast__message", "{notice.message}" }
-                    button {
-                        class: "toast__dismiss",
-                        r#type: "button",
-                        aria_label: "关闭提示",
-                        onclick: move |_| {
-                            controller.state.write().ui.dismiss_notice(notice.id);
-                        },
-                        "×"
+            NewSessionPanel {}
+            SessionActionsPanel {}
+            if let Some(notice) = state.ui.notice {
+                div { class: "toast-region", aria_live: "polite",
+                    div { class: "toast toast--{notice.tone}",
+                        span { class: "toast__message", "{notice.message}" }
+                        button { class: "toast__dismiss", r#type: "button", aria_label: "关闭提示",
+                            onclick: move |_| { controller.state.write().ui.dismiss_notice(notice.id); }, "×"
+                        }
                     }
                 }
             }
@@ -528,22 +486,8 @@ fn ConnectionStatus() -> Element {
 #[component]
 fn Composer() -> Element {
     let controller = consume_context::<AppController>();
-    let initial_session = controller
-        .state
-        .read()
-        .sessions
-        .selected_id
-        .clone()
-        .unwrap_or_default();
-    let mut restored = use_hook(storage::load_drafts);
-    let (initial_text, initial_files) = restored.remove(&initial_session).unwrap_or_default();
-    let mut draft = use_signal(|| initial_text);
-    let mut attachments = use_signal(|| initial_files);
-    let mut uploads_in_flight = use_signal(|| 0_usize);
-    let mut upload_error = use_signal(|| None::<String>);
-    let mut saved_drafts = use_signal(|| restored);
-    let mut draft_save_error = use_signal(|| None::<String>);
-    let mut draft_session = use_signal(|| {
+    let mut workspace = consume_context::<crate::app::SplitWorkspace>();
+    let draft_session = use_memo(move || {
         controller
             .state
             .read()
@@ -552,41 +496,62 @@ fn Composer() -> Element {
             .clone()
             .unwrap_or_default()
     });
-    use_effect(move || {
-        let selected = controller
-            .state
+    let draft = use_memo(move || {
+        workspace
+            .drafts
             .read()
-            .sessions
-            .selected_id
-            .clone()
-            .unwrap_or_default();
-        let previous = draft_session.peek().clone();
-        if selected != previous {
-            saved_drafts
-                .write()
-                .insert(previous, (draft.peek().clone(), attachments.peek().clone()));
-            let (text, files) = saved_drafts.write().remove(&selected).unwrap_or_default();
-            draft.set(text);
-            attachments.set(files);
-            draft_session.set(selected);
-            upload_error.set(None);
-        }
+            .get(&draft_session())
+            .map(|draft| draft.0.clone())
+            .unwrap_or_default()
+    });
+    let attachments = use_memo(move || {
+        workspace
+            .drafts
+            .read()
+            .get(&draft_session())
+            .map(|draft| draft.1.clone())
+            .unwrap_or_default()
+    });
+    let mut uploads_in_flight = use_signal(|| 0_usize);
+    let mut upload_error = use_signal(|| None::<String>);
+    let draft_save_error = workspace.draft_save_error;
+    use_effect(move || {
+        let _ = draft_session();
+        upload_error.set(None);
     });
     use_effect(move || {
-        let mut drafts = saved_drafts.read().clone();
-        drafts.insert(draft_session(), (draft(), attachments()));
-        drafts.retain(|_, (text, files)| !text.is_empty() || !files.is_empty());
-        let error = storage::save_drafts(&drafts)
-            .err()
-            .filter(|_| !drafts.is_empty());
-        if *draft_save_error.peek() != error {
-            draft_save_error.set(error);
+        let blocked = controller.state.read().ui.composer_busy
+            || controller.outbox_is_flushing()
+            || uploads_in_flight() > 0
+            || draft_save_error().is_some();
+        let was_blocked = workspace
+            .update_blockers
+            .peek()
+            .contains(controller.timeline_scope);
+        if blocked != was_blocked {
+            if blocked {
+                workspace
+                    .update_blockers
+                    .write()
+                    .insert(controller.timeline_scope);
+            } else {
+                workspace
+                    .update_blockers
+                    .write()
+                    .remove(controller.timeline_scope);
+            }
         }
+    });
+    use_drop(move || {
+        workspace
+            .update_blockers
+            .write()
+            .remove(controller.timeline_scope);
     });
     let state = controller.state.read();
-    let update_available = state.ui.update_available;
     let sending = state.ui.composer_busy;
-    let confirming = state.ui.outbox_flushing;
+    let confirming = controller.outbox_is_flushing();
+    let has_session = state.selected_session().is_some();
     let online = state.connection.online;
     let pending_count = state.pending_requests().len();
     let active = state.active_run().is_some();
@@ -600,7 +565,8 @@ fn Composer() -> Element {
         .and_then(|run| run.supervision.as_ref())
         .cloned();
     let supervision_blocked = supervision.is_some();
-    let input_disabled = !state.connection.online
+    let input_disabled = !has_session
+        || !state.connection.online
         || state.auth.status != AuthStatus::Authenticated
         || recoverable
         || supervision_blocked;
@@ -664,45 +630,30 @@ fn Composer() -> Element {
         // Commit the composer locally before the Host resolves R2
         // content and starts the Agent. That remote acknowledgement
         // can take seconds and must not make the UI look frozen.
-        draft.set(String::new());
-        attachments.set(Vec::new());
+        workspace.update_draft(&submission_session, |draft| {
+            draft.0.clear();
+            draft.1.clear();
+        });
         spawn(async move {
             if !controller.submit(text.clone(), selected.clone()).await {
-                if draft_session() != submission_session {
-                    saved_drafts
-                        .write()
-                        .insert(submission_session, (text, selected));
-                    return;
-                }
-                // Restore a definitively rejected submission only
-                // when no newer draft would be overwritten.
-                if draft().is_empty() {
-                    draft.set(text);
-                }
-                if attachments().is_empty() {
-                    attachments.set(selected);
-                }
+                // Restore only fields without newer edits. This also updates
+                // any other pane that now displays the original session.
+                workspace.update_draft(&submission_session, |draft| {
+                    if draft.0.is_empty() {
+                        draft.0 = text;
+                    }
+                    if draft.1.is_empty() {
+                        draft.1 = selected;
+                    }
+                });
             }
         });
     };
 
     rsx! {
-        div { class: "composer-dock",
-            if update_available {
-                div { class: "update-notice", role: "status",
-                    span {
-                        if let Some(error) = draft_save_error() { "{error}" }
-                        else { "新版本已就绪，草稿会保留" }
-                    }
-                    button {
-                        r#type: "button",
-                        disabled: sending || confirming || uploads_in_flight() > 0 || !online || draft_save_error().is_some(),
-                        onclick: move |_| {
-                            if let Err(error) = platform::reload() { controller.notice(&error, "error"); }
-                        },
-                        "刷新更新"
-                    }
-                }
+        div { class: "composer-dock", hidden: !has_session,
+            if let Some(error) = draft_save_error() {
+                p { class: "composer-upload-error", role: "alert", "{error}" }
             }
             if !attachments().is_empty() || uploads_in_flight() > 0 || upload_error().is_some() {
                 div { class: "composer-attachments", aria_live: "polite",
@@ -722,9 +673,9 @@ fn Composer() -> Element {
                                 r#type: "button",
                                 aria_label: "移除附件",
                                 onclick: move |_| {
-                                    if index < attachments.read().len() {
-                                        attachments.write().remove(index);
-                                    }
+                                    workspace.update_draft(&draft_session(), |draft| {
+                                        if index < draft.1.len() { draft.1.remove(index); }
+                                    });
                                 },
                                 "×"
                             }
@@ -745,7 +696,7 @@ fn Composer() -> Element {
                     send_draft();
                 },
                 input {
-                    id: "composer-file-input",
+                    id: "composer-file-input-{controller.timeline_scope}",
                     class: "composer-file-input",
                     r#type: "file",
                     multiple: true,
@@ -763,17 +714,12 @@ fn Composer() -> Element {
                             uploads_in_flight += 1;
                             spawn(async move {
                                 match controller.upload_artifact(file).await {
-                                    Ok(artifact) if draft_session() != upload_session => {
-                                        saved_drafts.write().entry(upload_session).or_default().1.push(artifact);
-                                    }
                                     Ok(artifact) => {
-                                        if !attachments
-                                            .read()
-                                            .iter()
-                                            .any(|item| item.artifact_ref == artifact.artifact_ref)
-                                        {
-                                            attachments.write().push(artifact);
-                                        }
+                                        workspace.update_draft(&upload_session, |draft| {
+                                            if !draft.1.iter().any(|item| item.artifact_ref == artifact.artifact_ref) {
+                                                draft.1.push(artifact);
+                                            }
+                                        });
                                     }
                                     Err(error) => upload_error.set(Some(error)),
                                 }
@@ -784,7 +730,7 @@ fn Composer() -> Element {
                 }
                 label {
                     class: "attach-button",
-                    r#for: "composer-file-input",
+                    r#for: "composer-file-input-{controller.timeline_scope}",
                     title: "添加文件",
                     aria_label: "添加文件",
                     "＋"
@@ -793,7 +739,7 @@ fn Composer() -> Element {
                     class: "message-input",
                     rows: "1",
                     maxlength: "20000",
-                    value: draft,
+                    value: draft(),
                     disabled: sending,
                     aria_label: "消息草稿",
                     placeholder,
@@ -801,7 +747,7 @@ fn Composer() -> Element {
                     autocapitalize: "sentences",
                     inputmode: "text",
                     enterkeyhint: "send",
-                    oninput: move |event| draft.set(event.value()),
+                    oninput: move |event| workspace.update_draft(&draft_session(), |draft| draft.0 = event.value()),
                     onkeydown: move |event| {
                         if event.key() == Key::Enter && !event.modifiers().shift() && !event.is_composing() {
                             event.prevent_default();
@@ -1190,6 +1136,7 @@ mod tests {
             connector_id: connector_id.to_owned(),
             display_name: display_name.to_owned(),
             agent_family: "coding-agent".to_owned(),
+            agent_product: None,
             capabilities: AgentSessionCapabilitiesView {
                 list: true,
                 read: true,

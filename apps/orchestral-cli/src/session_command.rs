@@ -667,6 +667,7 @@ mod tests {
                 connector_id: AgentConnectorId::new("fixture/local"),
                 provider_binding: ProviderBindingRef::new("fixture/provider"),
                 agent_family: "coding-agent".to_owned(),
+                agent_product: None,
                 display_name: "Fixture Agent".to_owned(),
                 capabilities: AgentSessionCapabilities {
                     create: true,
