@@ -177,6 +177,9 @@ orchestral resume --last
 ```
 
 需要浏览器访问时，运行 `orchestral serve --pair`。
+PWA 默认打开 Codex，展示最近两个会话，并可切换 Claude Code 和 Orch。
+各窗格优先加载最近消息；手机上共用一个底部输入框，向选中的窗格发送消息，
+键盘弹出时展开该会话。
 PWA 可发现同一用户下正在运行的 Orchestral TUI，以及本机 Codex 和 Claude Code 会话。
 Orchestral 终端和 PWA 共用同一会话、工具审批和运行状态，两端均可发送消息、审批和取消。
 `serve` 与终端须使用同一个用户配置目录（如设置了 `ORCHESTRAL_HOME`，两端保持一致）。
