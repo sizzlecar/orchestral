@@ -58,7 +58,7 @@ h1 { font-size: clamp(43px, 5.6vw, 80px); line-height: 1.05; letter-spacing: -5p
 .principles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
 .principles article { border: 2px solid var(--line); background: var(--raised); padding: 24px; box-shadow: 5px 5px 0 var(--black); }
 .index { font-size: 12px; color: var(--green); }
-.principles h2 { font-size: 17px; margin: 13px 0 9px; letter-spacing: -.5px; }
+.principles h2, .principles h3 { font-size: 17px; margin: 13px 0 9px; letter-spacing: -.5px; }
 .principles p { color: var(--muted); font-size: 12px; line-height: 1.8; margin: 0; }
 .section { padding-top: 84px; }
 .section-heading { max-width: 780px; margin-bottom: 30px; }

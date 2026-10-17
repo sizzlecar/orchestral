@@ -20,6 +20,8 @@
   when loading older messages, and retain session drafts across pane switches.
 - On phones, compact session headers and share one bottom composer between the panes.
   Keyboard entry expands the selected session; closing the keyboard restores both panes.
+- Refresh the public website with the new session controls, Homebrew and Cargo install
+  commands, and stable-release guidance that remains useful when metadata cannot load.
 
 ### Context and model reliability
 
