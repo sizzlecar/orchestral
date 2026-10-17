@@ -185,6 +185,9 @@ orchestral resume --last
 ```
 
 Use `orchestral serve --pair` for browser access.
+The PWA opens on Codex and shows the two newest sessions, with tabs for Claude Code and
+Orch. Each pane loads recent messages first. On phones, one bottom composer targets the
+selected pane and keyboard entry expands that conversation.
 The PWA discovers running Orchestral TUIs under the same user, plus local Codex and Claude Code sessions.
 Orchestral terminals and the PWA share one session, approval broker, and running task;
 both can send messages, resolve approvals, and cancel. Use the same user configuration

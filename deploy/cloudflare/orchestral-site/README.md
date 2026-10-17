@@ -39,7 +39,8 @@ The Custom Domain configuration provisions routing and TLS. Verify the HTTPS hom
 `/install.sh`, `/install.ps1`, and a missing path after deployment. Do not change the private
 control domain or its Cloudflare Access policy when deploying this public site.
 
-Before the first public release, the page explains source installation and marks binary
-installers as pending. It checks public GitHub release metadata and switches to an available
-state only when all advertised platform archives and checksum files exist. API failure leaves
-the preparation state visible. Publish no credentials or local deployment configuration.
+The page links to the latest stable release and checks public GitHub metadata to display its
+version only when all advertised platform archives and checksum files exist. API failure
+leaves the generic installation guidance and direct downloads link available. Publish no
+credentials or local deployment configuration. Deploy release-specific feature notes only
+after that release and its installation channels are public.

@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.5.0]
+
+### Sessions and interaction
+
+- Add the Claude Code connector: discover and observe local sessions, send idempotent
+  text input to existing terminals, and control Host-owned streaming sessions. Existing
+  terminals retain native peer-message provenance; `serve --claude-approvals` enables
+  their tool approvals without treating peer messages as user authorization.
+- Discover running Orchestral terminals in the PWA under the same user configuration.
+  The terminal and browser share messages, approvals, cancellation, and one execution
+  owner. Reopen pre-upgrade terminals with `orchestral resume --last` to enable discovery.
+- Rework the TUI around terminal scrollback and an inline input viewport. Display
+  provider-supplied reasoning summaries, live process output, and asynchronous process
+  polling without blocking queued input. Add permission presets, `/loop`, scheduling
+  tools, and bounded session `/goal` continuation with pause, resume, and status controls.
+- Open the PWA on Codex with Codex, Claude Code, and Orch tabs and the two newest
+  sessions in independent panes. Load recent history first, preserve scroll position
+  when loading older messages, and retain session drafts across pane switches.
+- On phones, compact session headers and share one bottom composer between the panes.
+  Keyboard entry expands the selected session; closing the keyboard restores both panes.
+- Refresh the public website with the new session controls, Homebrew and Cargo install
+  commands, and stable-release guidance that remains useful when metadata cannot load.
+
+### Context and model reliability
+
+- Resolve context and output capacity from model metadata instead of imposing fixed
+  128K input and 4096-token output defaults. Explicit Host ceilings remain supported.
+  Refresh Gemini metadata in the background and preserve native continuation state.
+- Add model-assisted context summaries with bounded attempts and deterministic fallback.
+  Preserve inspection receipts, recent tool outcomes, corrections, and artifact recall
+  across compaction and recovery. Avoid permanently pinning retained-artifact records
+  or repeatedly compacting unchanged history after a failed soft compaction attempt.
+- Bound Gemini response-header waits separately from stream inactivity, discard failed
+  connections, and report stalled streams after partial output. Improve context-size
+  estimation for image input and keep retries bounded without repeating completed tools.
+- Scope resumed input queues to the unfinished Run and add `/queue clear` and unsent
+  message dismissal so cancelled historical input does not reappear as pending work.
+
+### SDK, configuration, and recovery compatibility
+
+- This pre-1.0 minor release changes public Rust construction APIs. `AgentConfig`
+  context/output ceilings are now `Option<u64>`; `AgentCompactionConfig` adds `strategy`,
+  `working_set_tokens`, and `model_timeout_secs`; `ToolsConfig` adds `permissions`.
+  Update direct struct literals or use defaults. Existing explicit numeric YAML ceilings
+  remain valid; omitted ceilings now follow discovered capacity. Compaction defaults to
+  `model_assisted`; use `deterministic_extractive` to avoid summary model calls.
+- Connector descriptors add optional `agent_product`; action descriptors add
+  `input_channel`; session summaries add optional `input_action`; activities add optional
+  `occurred_at_unix_ms`. Model capabilities add optional `max_output_tokens`, and model
+  backends may implement `resolve_descriptor`. Update SDK struct literals and handle
+  provider-visible reasoning summary events separately from response text.
+- Agent Protocol remains v1. Upgrade the Host and embedded PWA together. Retain journals
+  before upgrading: unfinished Runs still require compatible runtime/configuration identity;
+  the release does not promise transparent recovery of every earlier unfinished Run.
+
 ## [0.4.1]
 
 ### Fixed
