@@ -270,7 +270,7 @@ fn gemini_output_exhaustion_is_incomplete_with_usage_and_never_retried() {
 }
 
 #[test]
-fn gemini_tui_shows_the_summary_while_waiting_for_the_next_model_response() {
+fn gemini_tui_folds_the_summary_until_expanded_while_waiting_for_the_model() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("gemini-tui-summary");
     fs::write(workspace.path("note.txt"), "fixture evidence").unwrap();
@@ -313,13 +313,32 @@ fn gemini_tui_shows_the_summary_while_waiting_for_the_next_model_response() {
     );
     tui.send_paste("Read note.txt and report the result.");
     waiting_rx.recv_timeout(LOCAL_PROCESS_TIMEOUT).unwrap();
+    let collapsed = tui.wait_for_screen(
+        |screen| screen.contains("Thinking summary") && screen.contains("ctrl+o expand"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert!(
+        !collapsed.contains("Inspecting the interface before editing."),
+        "{collapsed}"
+    );
+    tui.send(b"\x0f");
     tui.wait_for_screen(
         |screen| {
             screen.contains("Thinking summary")
                 && screen.contains("Inspecting the interface before editing.")
+                && screen.contains("ctrl+o collapse")
         },
         LOCAL_PROCESS_TIMEOUT,
     );
+    tui.send(b"\x0f");
+    let collapsed = tui.wait_for_screen(
+        |screen| {
+            screen.contains("ctrl+o expand")
+                && !screen.contains("Inspecting the interface before editing.")
+        },
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert_eq!(collapsed.matches("Thinking summary").count(), 1);
     release_tx.send(()).unwrap();
     tui.wait_for_screen(
         |screen| screen.contains("replied") && screen.contains("The interface check is complete."),

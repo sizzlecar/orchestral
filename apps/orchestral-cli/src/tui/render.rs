@@ -517,25 +517,54 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
     }
     if cache.revision != state.transcript_revision {
         cache.rows.truncate(cache.committed_rows);
-        let from = state
+        let mut from = state
             .transcript_dirty_from
             .min(cache.offsets.len())
             .min(state.transcript.len());
+        // A changed or appended summary can belong to an already-rendered group.
+        // Rebuild from its first entry so the group keeps one stable heading.
+        while from > 0
+            && state
+                .transcript
+                .get(from)
+                .is_some_and(|entry| entry.role == TranscriptRole::Reasoning)
+            && state.transcript[from - 1].role == TranscriptRole::Reasoning
+        {
+            from -= 1;
+        }
         let row = cache.offsets.get(from).copied().unwrap_or(cache.rows.len());
         cache.rows.truncate(row);
         cache.offsets.truncate(from);
-        for (index, entry) in state.transcript.iter().enumerate().skip(from) {
-            cache.offsets.push(cache.rows.len());
+        let mut index = from;
+        while index < state.transcript.len() {
+            let entry = &state.transcript[index];
+            let end = if entry.role == TranscriptRole::Reasoning {
+                index
+                    + 1
+                    + state.transcript[index + 1..]
+                        .iter()
+                        .take_while(|entry| entry.role == TranscriptRole::Reasoning)
+                        .count()
+            } else {
+                index + 1
+            };
+            // Keep an active group out of native scrollback until all its
+            // summaries settle, including entries hidden by the folded view.
+            cache.offsets.resize(end, cache.rows.len());
             let mut lines = Vec::new();
             if index > 0 && should_separate(state.transcript[index - 1].role, entry.role) {
                 lines.push(Line::default());
             }
-            push_entry_lines(&mut lines, entry, width, state.tools_expanded);
+            push_entry_lines(&mut lines, entry, width, state.tools_expanded, false);
+            for summary in &state.transcript[index + 1..end] {
+                push_entry_lines(&mut lines, summary, width, state.tools_expanded, true);
+            }
             cache.rows.extend(viewport::wrap(
                 entry.id.clone().unwrap_or_else(|| format!("entry-{index}")),
                 lines,
                 width as usize,
             ));
+            index = end;
         }
         cache.committed_rows = cache.rows.len();
         let stream = state.streamed_text();
@@ -683,6 +712,7 @@ fn should_separate(previous: TranscriptRole, current: TranscriptRole) -> bool {
     !matches!(
         (previous, current),
         (TranscriptRole::Tool, TranscriptRole::Tool)
+            | (TranscriptRole::Reasoning, TranscriptRole::Reasoning)
     )
 }
 
@@ -691,6 +721,7 @@ fn push_entry_lines(
     entry: &TranscriptEntry,
     width: u16,
     expanded: bool,
+    continued_reasoning: bool,
 ) {
     match entry.role {
         TranscriptRole::User => push_plain(
@@ -703,25 +734,21 @@ fn push_entry_lines(
             push_markdown(lines, "• ", &entry.text, ASSISTANT, false, width)
         }
         TranscriptRole::Reasoning => {
-            lines.push(Line::styled(
-                if expanded {
-                    "○ Thinking summary · ctrl+o collapse"
-                } else {
-                    "○ Thinking summary · ctrl+o expand"
-                },
-                MUTED,
-            ));
-            let mut content = Vec::new();
-            push_markdown(&mut content, "  ", &entry.text, MUTED, false, width);
+            if !continued_reasoning {
+                lines.push(Line::styled(
+                    if expanded {
+                        "○ Thinking summary · ctrl+o collapse"
+                    } else {
+                        "○ Thinking summary · ctrl+o expand"
+                    },
+                    MUTED,
+                ));
+            }
             if expanded {
-                lines.extend(content);
-            } else {
-                let rows = viewport::wrap("reasoning-preview", content, width as usize);
-                lines.extend(
-                    rows.iter()
-                        .skip(rows.len().saturating_sub(3))
-                        .map(|row| row.text.clone()),
-                );
+                if continued_reasoning {
+                    lines.push(Line::default());
+                }
+                push_markdown(lines, "  ", &entry.text, MUTED, false, width);
             }
         }
         TranscriptRole::System => push_plain(lines, "○ ", &entry.text, MUTED),
@@ -1856,6 +1883,197 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_reasoning_summaries_share_one_fold_and_preserve_their_contents() {
+        let mut state = UiState::new("session", "model");
+        for (delta_id, summary_id, text) in [
+            ("a1", "a", "First summary."),
+            ("b1", "b", "Second summary."),
+            ("c1", "c", "Third summary."),
+            ("b2", "b", " More context."),
+            ("a1", "a", "First summary."),
+        ] {
+            update(
+                &mut state,
+                UiMsg::ReasoningSummaryDelta {
+                    delta_id: delta_id.into(),
+                    summary_id: summary_id.into(),
+                    text: text.into(),
+                },
+            );
+        }
+        update(
+            &mut state,
+            UiMsg::OutputCommitted {
+                output_id: "answer".into(),
+                text: "Final answer.".into(),
+            },
+        );
+        let transcript = state.transcript.clone();
+        let collapsed = render_to_string(&state, 100, 24);
+        assert_eq!(
+            collapsed.matches("Thinking summary").count(),
+            1,
+            "{collapsed}"
+        );
+        for detail in ["First summary.", "Second summary.", "Third summary."] {
+            assert!(!collapsed.contains(detail), "{collapsed}");
+        }
+        assert!(collapsed.contains("Final answer."));
+        update(&mut state, UiMsg::ToggleTools);
+        let expanded = render_to_string(&state, 100, 24);
+        assert_eq!(
+            expanded.matches("Thinking summary").count(),
+            1,
+            "{expanded}"
+        );
+        assert_eq!(expanded.matches("First summary.").count(), 1);
+        let positions = [
+            "First summary.",
+            "Second summary. More context.",
+            "Third summary.",
+            "Final answer.",
+        ]
+        .map(|text| expanded.find(text).unwrap());
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{expanded}"
+        );
+        assert_eq!(state.transcript, transcript);
+        update(&mut state, UiMsg::ToggleTools);
+        assert_eq!(render_to_string(&state, 100, 24), collapsed);
+    }
+
+    #[test]
+    fn live_reasoning_groups_keep_incremental_rendering_anchors_and_scrollback_stable() {
+        let mut state = UiState::new("session", "model");
+        update(
+            &mut state,
+            UiMsg::RemoteRunStarted {
+                run_id: "run".into(),
+                input: "Inspect source".into(),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut cache = super::RenderCache::default();
+        for summary in ["First", "Second", "Third"] {
+            update(
+                &mut state,
+                UiMsg::ReasoningSummaryDelta {
+                    delta_id: summary.into(),
+                    summary_id: summary.into(),
+                    text: (0..8)
+                        .map(|index| format!("{summary} detail {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                },
+            );
+            super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+            state.transcript_dirty_from = state.transcript.len();
+            let visible = buffer_to_string(terminal.backend().buffer());
+            assert_eq!(visible.matches("Thinking summary").count(), 1, "{visible}");
+            assert!(!visible.contains("detail"), "{visible}");
+        }
+        update(&mut state, UiMsg::ToggleTools);
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        state.transcript_dirty_from = state.transcript.len();
+        assert!(!buffer_to_string(terminal.backend().scrollback()).contains("detail"));
+        update(
+            &mut state,
+            UiMsg::ReasoningSummaryDelta {
+                delta_id: "second-late".into(),
+                summary_id: "Second".into(),
+                text: " updated".into(),
+            },
+        );
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        state.transcript_dirty_from = state.transcript.len();
+        let body = cache
+            .rows
+            .iter()
+            .map(|row| row.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(body.matches("Thinking summary").count(), 1, "{body}");
+        assert!(body.contains("Second detail 7 updated"), "{body}");
+        let anchor = cache
+            .rows
+            .iter()
+            .find(|row| row.text.to_string().contains("Second detail 7 updated"))
+            .unwrap()
+            .anchor
+            .clone();
+
+        update(&mut state, UiMsg::ToggleTools);
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        state.transcript_dirty_from = state.transcript.len();
+        let (top, _) = super::viewport::window(
+            &cache.rows,
+            1,
+            &super::viewport::Viewport {
+                anchor: Some(anchor),
+                ..Default::default()
+            },
+        );
+        assert!(cache.rows[top]
+            .text
+            .to_string()
+            .contains("Thinking summary"));
+        let combined = format!(
+            "{}{}",
+            buffer_to_string(terminal.backend().scrollback()),
+            buffer_to_string(terminal.backend().buffer())
+        );
+        assert_eq!(
+            combined.matches("Thinking summary").count(),
+            1,
+            "{combined}"
+        );
+        assert!(!combined.contains("detail"), "{combined}");
+
+        update(
+            &mut state,
+            UiMsg::ToolActivity {
+                activity_id: "read".into(),
+                tool_name: "file_read".into(),
+                state: orchestral_core::agent_protocol::wire::ToolActivityState::Succeeded,
+                evidence: Vec::new(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::ReasoningSummaryDelta {
+                delta_id: "follow-up".into(),
+                summary_id: "follow-up".into(),
+                text: "Follow-up detail".into(),
+            },
+        );
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        let body = cache
+            .rows
+            .iter()
+            .map(|row| row.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(body.matches("Thinking summary").count(), 2, "{body}");
+        let tool = body.find('✓').expect("tool activity remains visible");
+        assert!(
+            body.find("Thinking summary").unwrap() < tool
+                && tool < body.rfind("Thinking summary").unwrap(),
+            "{body}"
+        );
+        terminal.backend_mut().resize(60, 12);
+        super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+        assert_eq!(
+            cache
+                .rows
+                .iter()
+                .filter(|row| row.text.to_string().contains("Thinking summary"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn reasoning_summary_streams_deduplicates_and_expands_without_changing_the_answer() {
         let mut state = UiState::new("session", "model");
         let summary = || UiMsg::ReasoningSummaryDelta {
@@ -1884,7 +2102,7 @@ mod tests {
         assert_eq!(state.transcript.len(), 2);
         let collapsed = render_to_string(&state, 100, 24);
         assert!(collapsed.contains("Thinking summary"));
-        assert!(collapsed.contains("Latest visible detail. Ready."));
+        assert!(!collapsed.contains("Latest visible detail. Ready."));
         assert!(!collapsed.contains("Earlier summary detail."));
         state.tools_expanded = true;
         let expanded = render_to_string(&state, 100, 24);

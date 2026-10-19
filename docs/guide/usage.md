@@ -121,7 +121,8 @@ An empty TUI session opens with the Orchestral logo, the running build's version
 selected model and workspace. Sending the first task opens the conversation view.
 Restoring a conversation shows its history instead of the welcome screen.
 
-Ctrl+O expands tool records in the conversation; PgUp/PgDn reads history or the focused panel,
+Adjacent thinking summaries share one folded heading, with their contents hidden by default.
+Ctrl+O expands or collapses tool records and thinking summaries; PgUp/PgDn reads history or the focused panel,
 and End follows new output. Native terminal text selection is retained; `/copy` copies the last
 committed answer when a local clipboard utility is available. `/`, F1 and `/help` expose the
 same action menu, including keyboard shortcuts and appearance settings; `NO_COLOR` disables styling.
