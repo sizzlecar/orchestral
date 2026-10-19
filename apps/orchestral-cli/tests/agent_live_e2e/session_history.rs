@@ -614,3 +614,64 @@ fn resume_answers_a_recovered_input_request_in_the_original_run() {
         1
     );
 }
+
+#[test]
+fn resume_reconciles_interrupted_session_across_config_and_permission_changes() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("session-reconfigured-resume");
+    workspace.disable_exec();
+    workspace.rewrite_config(|config| {
+        config["agent"]["model_retry"] = serde_yaml::to_value(
+            json!({"max_retries": 3, "base_delay_ms": 30000, "max_delay_ms": 30000}),
+        )
+        .unwrap();
+        config["tools"]["permissions"] = serde_yaml::to_value("full-access").unwrap();
+    });
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(|_| FixtureHttpResponse {
+            status: "429 Too Many Requests",
+            repeat_handler: false,
+            content_type: "application/json",
+            body: br#"{"error":{"message":"temporary rate limit"}}"#.to_vec(),
+        }),
+        Box::new(|request| {
+            let text = model_request_text(&request.body);
+            assert!(text.contains("First interrupted prompt"));
+            assert!(text.contains("Continue after config change"));
+            openai_text_response("RESUMED_AFTER_CONFIG_CHANGE")
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    let mut first = PtyHarness::spawn(local_tui_command(
+        &workspace,
+        "reconfigured-session",
+        "Initial system instructions.",
+    ));
+    first.wait_for_text("\u{1b}[?2004h", LOCAL_PROCESS_TIMEOUT);
+    first.send_paste("First interrupted prompt");
+    first.wait_for_text("retry 1/3", LOCAL_PROCESS_TIMEOUT);
+    first.child.kill().unwrap();
+    first.finish(Duration::from_secs(5));
+
+    // Change the base config permissions to workspace-write and omit --system-prompt
+    // when resuming with a follow-up prompt.
+    workspace.rewrite_config(|config| {
+        config["tools"]["permissions"] = serde_yaml::to_value("workspace-write").unwrap();
+    });
+    let mut command = resume_command(
+        &workspace,
+        "reconfigured-session",
+        "Continue after config change",
+    );
+    command.args(["--input-mode", "interactive"]);
+    let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim(), "RESUMED_AFTER_CONFIG_CHANGE");
+    assert_eq!(server.join().unwrap().len(), 2);
+    assert_eq!(run_payload_count(&workspace, "run_incomplete"), 1);
+    assert_eq!(run_payload_count(&workspace, "delivery_committed"), 1);
+    assert_eq!(
+        browse(&workspace, &["list"])["sessions"][0]["status"],
+        "delivered"
+    );
+}

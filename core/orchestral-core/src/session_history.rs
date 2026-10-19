@@ -20,6 +20,18 @@ pub struct SessionOrigin {
     pub additional_workspaces: Vec<String>,
     /// Model identity for display; it does not select a backend on recovery.
     pub model: String,
+    /// Optional Host backend name recorded for local session continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Optional Host model profile name recorded for local session continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    /// Optional Host reasoning preference recorded for local session continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<crate::config::ReasoningPreference>,
+    /// Optional Host permission preset recorded for local session continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<crate::config::PermissionPreset>,
 }
 
 impl SessionOrigin {

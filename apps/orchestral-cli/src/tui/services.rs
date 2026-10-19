@@ -485,6 +485,7 @@ pub(crate) async fn choose(
                 host.clone()
             } else {
                 options.session_id = Some(id.as_str().to_owned());
+                crate::agent::apply_session_origin_defaults(&mut options, &history);
                 Arc::new(host.switch_session(&options).await?)
             };
             let client = next.client(id);

@@ -684,6 +684,10 @@ async fn build_agent_host_with_journals(
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         model: model.clone(),
+        backend: Some(backend.name.clone()),
+        model_profile: profile.as_ref().map(|profile| profile.name.clone()),
+        reasoning: Some(reasoning.clone()),
+        permissions: Some(config.tools.permissions),
     };
     let api = AgentApi::with_resources(controller.clone(), resources.clone())
         .with_default_extensions(session_origin.extensions());
@@ -724,6 +728,13 @@ pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
             .get_or_insert_with(|| unique_id("cli-session", 0))
             .clone(),
     );
+    if let Ok(catalog) = crate::local_sessions::open_history(options.config.clone()) {
+        if let Some(existing) = catalog.read(&session_id).await? {
+            let cwd = crate::local_sessions::workspace(options.cwd.as_deref())?;
+            crate::local_sessions::validate_workspace(&existing, &cwd)?;
+            apply_session_origin_defaults(&mut options, &existing);
+        }
+    }
     let stdin_is_terminal = io::stdin().is_terminal();
     let entry_mode = select_entry_mode(
         options.input.clone(),
@@ -813,6 +824,78 @@ pub async fn run(mut options: AgentRunOptions) -> anyhow::Result<()> {
     result
 }
 
+pub(crate) fn apply_session_origin_defaults(
+    options: &mut AgentRunOptions,
+    history: &SessionHistory,
+) {
+    let Some(origin) = &history.summary.origin else {
+        return;
+    };
+    if options.add_dirs.is_empty() && !origin.additional_workspaces.is_empty() {
+        let additional: Vec<PathBuf> = origin
+            .additional_workspaces
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .collect();
+        if additional.len() == origin.additional_workspaces.len() {
+            options.add_dirs = additional;
+        }
+    }
+    if options.model_overrides.permissions.is_none() {
+        options.model_overrides.permissions = origin.permissions;
+    }
+    if options.model_overrides.reasoning.is_none() {
+        options.model_overrides.reasoning = origin.reasoning.clone();
+    }
+    if options.model_overrides.backend.is_none()
+        && options.model_overrides.model_profile.is_none()
+        && options.model_overrides.model.is_none()
+        && options.model_overrides.base_url.is_none()
+    {
+        if let Ok(base_config) =
+            crate::runtime::client::resolve_runtime_config_path(options.config.clone())
+                .and_then(|path| load_config(&path).map_err(Into::into))
+        {
+            if let Some(backend) = origin.backend.as_deref() {
+                if base_config.providers.get_backend(backend).is_some() {
+                    options.model_overrides.backend = Some(backend.to_owned());
+                    if let Some(profile) = origin.model_profile.as_deref() {
+                        if base_config.providers.get_model(profile).is_some() {
+                            options.model_overrides.model_profile = Some(profile.to_owned());
+                        }
+                    }
+                    if !origin.model.trim().is_empty() {
+                        options.model_overrides.model = Some(origin.model.clone());
+                    }
+                }
+            } else if !origin.model.trim().is_empty() {
+                if let Some(profile) = base_config
+                    .providers
+                    .models
+                    .iter()
+                    .find(|p| p.model == origin.model || p.name == origin.model)
+                {
+                    if base_config
+                        .providers
+                        .get_backend(&profile.backend)
+                        .is_some()
+                    {
+                        options.model_overrides.backend = Some(profile.backend.clone());
+                        options.model_overrides.model_profile = Some(profile.name.clone());
+                        options.model_overrides.model = Some(origin.model.clone());
+                    }
+                } else if origin.model.starts_with("gemini-")
+                    && base_config.providers.get_backend("google").is_some()
+                {
+                    options.model_overrides.backend = Some("google".to_owned());
+                    options.model_overrides.model = Some(origin.model.clone());
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn resume_unfinished(
     client: &AgentClient,
     history: Option<&SessionHistory>,
@@ -820,20 +903,58 @@ pub(crate) async fn resume_unfinished(
     let Some(history) = history else {
         return Ok(None);
     };
-    if history.summary.unfinished_run_ids.len() > 1 {
-        bail!("session has multiple unfinished executions; cannot select one for continuation");
+    let Some(latest_run) = history.runs.last() else {
+        return Ok(None);
+    };
+    if orchestral_core::session_history::SessionHistoryStatus::of_run(latest_run)
+        != orchestral_core::session_history::SessionHistoryStatus::Unfinished
+    {
+        return Ok(None);
     }
-    let mut resumed = None;
-    for run_id in &history.summary.unfinished_run_ids {
-        let handle = client
-            .resume_run(run_id)
-            .await
-            .with_context(|| format!("reconcile unfinished Run {run_id}"))?;
-        if !handle.inspect().await?.state.is_terminal() {
-            resumed = Some(handle);
+    let run_id = latest_run.registration.run_id();
+    let handle = match client.resume_run(run_id).await {
+        Ok(handle) => handle,
+        Err(error) if is_unrecoverable_unfinished_run(&error) => {
+            tracing::warn!(
+                session_id = %client.session_id(),
+                %run_id,
+                %error,
+                "unfinished Run cannot be resumed under the current Host configuration; continuing Session without it"
+            );
+            return Ok(None);
         }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reconcile unfinished Run {run_id}"));
+        }
+    };
+    if !handle.inspect().await?.state.is_terminal() {
+        tokio::task::yield_now().await;
     }
-    Ok(resumed)
+    if !handle.inspect().await?.state.is_terminal() {
+        Ok(Some(handle))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_unrecoverable_unfinished_run(error: &orchestral_runtime::AgentSdkError) -> bool {
+    use orchestral_core::agent_protocol::wire::AgentProtocolErrorCode;
+    use orchestral_runtime::{AgentControlError, AgentSdkError};
+    match error {
+        AgentSdkError::Control(AgentControlError::Protocol(protocol)) => {
+            !protocol.retryable
+                && matches!(
+                    protocol.code,
+                    AgentProtocolErrorCode::RunIdConflict
+                        | AgentProtocolErrorCode::Unsupported
+                        | AgentProtocolErrorCode::InvalidDigest
+                        | AgentProtocolErrorCode::InvalidTransition
+                        | AgentProtocolErrorCode::RunNotFound
+                )
+        }
+        AgentSdkError::Control(AgentControlError::RecoveryMismatch(_)) => true,
+        _ => false,
+    }
 }
 
 /// Unknown models retain a conservative Host fallback, separately from a
@@ -2044,7 +2165,12 @@ async fn start_or_continue_turn(
                     if !matches!(
                         ack.state,
                         CommandAckState::Rejected { .. } | CommandAckState::Unsupported { .. }
-                    ) || !handle.inspect().await?.state.is_terminal()
+                    ) || !client
+                        .controller()
+                        .wait_for_terminal(handle.run_id())
+                        .await?
+                        .state
+                        .is_terminal()
                     {
                         bail!(
                             "resumed Run did not accept the follow-up input: {:?}",

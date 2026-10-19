@@ -214,11 +214,7 @@ impl JournalSessionHistory {
                 .max()
                 .unwrap_or_default(),
             run_count: runs.len(),
-            status: if unfinished_run_ids.is_empty() {
-                SessionHistoryStatus::of_run(&runs.last().expect("nonempty").1)
-            } else {
-                SessionHistoryStatus::Unfinished
-            },
+            status: SessionHistoryStatus::of_run(&runs.last().expect("nonempty").1),
             unfinished_run_ids,
         };
         Ok(Some(SessionHistory {

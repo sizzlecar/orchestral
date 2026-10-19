@@ -716,14 +716,65 @@ impl AgentController {
             return Err(error.into());
         }
 
-        let controller = Arc::clone(self);
-        let recovered_run_id = run_id.clone();
-        let recovered_slot = slot.clone();
-        tokio::spawn(async move {
-            controller
-                .drive_stream(recovered_run_id, recovered_slot, stream)
-                .await;
-        });
+        // Drain any events already staged synchronously by confirmation (such
+        // as Terminal replay or an interrupted ModelAttemptOpen -> RunIncomplete)
+        // before returning, so callers inspecting immediately after recover see
+        // the authoritative terminal state.
+        let mut reached_terminal = false;
+        while let Some(Some(Ok(AgentProviderStreamItem::Event(draft)))) =
+            futures_util::FutureExt::now_or_never(stream.next())
+        {
+            let mut entry = slot.entry.lock().await;
+            let mut next_reducer = entry.reducer.clone();
+            match next_reducer.apply_provider_draft(*draft) {
+                Ok(sequenced) => {
+                    if let Err(error) = self
+                        .commit_sequenced(&slot, &mut entry, next_reducer, sequenced)
+                        .await
+                    {
+                        drop(entry);
+                        let _ = self
+                            .mark_continuity_lost(
+                                run_id,
+                                &slot,
+                                format!("Provider event could not be journaled: {error}"),
+                            )
+                            .await;
+                        reached_terminal = true;
+                        break;
+                    }
+                    if entry.reducer.state().is_terminal()
+                        || entry.reducer.state().status() == AgentRunStatus::Unknown
+                    {
+                        reached_terminal = true;
+                        break;
+                    }
+                }
+                Err(error) => {
+                    drop(entry);
+                    let _ = self
+                        .mark_continuity_lost(
+                            run_id,
+                            &slot,
+                            format!("Provider event was rejected: {error}"),
+                        )
+                        .await;
+                    reached_terminal = true;
+                    break;
+                }
+            }
+        }
+
+        if !reached_terminal {
+            let controller = Arc::clone(self);
+            let recovered_run_id = run_id.clone();
+            let recovered_slot = slot.clone();
+            tokio::spawn(async move {
+                controller
+                    .drive_stream(recovered_run_id, recovered_slot, stream)
+                    .await;
+            });
+        }
         self.inspect(run_id).await
     }
 

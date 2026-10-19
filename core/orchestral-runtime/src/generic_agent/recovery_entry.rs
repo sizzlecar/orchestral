@@ -33,7 +33,6 @@ impl InternalGenericAgentProvider {
         let projection = stored.validate().map_err(checkpoint_recovery_error)?;
         if stored.registration.request != request.start_request
             || stored.registration.execution != request.execution
-            || stored.registration.config_digest != self.inner.config_digest
         {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::RunIdConflict,
@@ -50,17 +49,33 @@ impl InternalGenericAgentProvider {
                         .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft)))),
                 )
                 .boxed();
-                Ok(AgentRecovery::staged(replay, async { Ok(()) }))
+                return Ok(AgentRecovery::staged(replay, async { Ok(()) }));
             }
             GenericCheckpointPhase::ModelAttemptOpen {
                 round, request_id, ..
-            } => stage_interrupted_model_recovery(
-                self.inner.clone(),
-                stored,
-                round,
-                request_id,
-                recovery_events,
-            ),
+            } => {
+                return stage_interrupted_model_recovery(
+                    self.inner.clone(),
+                    stored,
+                    round,
+                    request_id,
+                    recovery_events,
+                );
+            }
+            _ => {}
+        }
+
+        if stored.registration.config_digest != self.inner.config_digest {
+            return Err(AgentProtocolError::new(
+                AgentProtocolErrorCode::RunIdConflict,
+                "recovery identity or Generic Agent configuration does not match the private WAL",
+            ));
+        }
+
+        match projection.phase {
+            GenericCheckpointPhase::Terminal | GenericCheckpointPhase::ModelAttemptOpen { .. } => {
+                unreachable!("non-continuing recovery phases returned above")
+            }
             GenericCheckpointPhase::ModelAttemptObserved {
                 boundary,
                 round,
