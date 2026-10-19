@@ -41,28 +41,17 @@ impl InternalGenericAgentProvider {
         }
         let recovery_events = checkpoint_recovery_events(&stored)?;
 
-        match projection.phase {
-            GenericCheckpointPhase::Terminal => {
-                let replay = stream::iter(
-                    recovery_events
-                        .into_iter()
-                        .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft)))),
-                )
-                .boxed();
-                return Ok(AgentRecovery::staged(replay, async { Ok(()) }));
-            }
-            GenericCheckpointPhase::ModelAttemptOpen {
-                round, request_id, ..
-            } => {
-                return stage_interrupted_model_recovery(
-                    self.inner.clone(),
-                    stored,
-                    round,
-                    request_id,
-                    recovery_events,
-                );
-            }
-            _ => {}
+        if let GenericCheckpointPhase::ModelAttemptOpen {
+            round, request_id, ..
+        } = projection.phase
+        {
+            return stage_interrupted_model_recovery(
+                self.inner.clone(),
+                stored,
+                round,
+                request_id,
+                recovery_events,
+            );
         }
 
         if stored.registration.config_digest != self.inner.config_digest {
@@ -73,8 +62,17 @@ impl InternalGenericAgentProvider {
         }
 
         match projection.phase {
-            GenericCheckpointPhase::Terminal | GenericCheckpointPhase::ModelAttemptOpen { .. } => {
-                unreachable!("non-continuing recovery phases returned above")
+            GenericCheckpointPhase::Terminal => {
+                let replay = stream::iter(
+                    recovery_events
+                        .into_iter()
+                        .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft)))),
+                )
+                .boxed();
+                Ok(AgentRecovery::staged(replay, async { Ok(()) }))
+            }
+            GenericCheckpointPhase::ModelAttemptOpen { .. } => {
+                unreachable!("open model attempts returned above")
             }
             GenericCheckpointPhase::ModelAttemptObserved {
                 boundary,
