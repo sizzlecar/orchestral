@@ -33,6 +33,7 @@ impl InternalGenericAgentProvider {
         let projection = stored.validate().map_err(checkpoint_recovery_error)?;
         if stored.registration.request != request.start_request
             || stored.registration.execution != request.execution
+            || stored.registration.config_digest != self.inner.config_digest
         {
             return Err(AgentProtocolError::new(
                 AgentProtocolErrorCode::RunIdConflict,
@@ -40,26 +41,6 @@ impl InternalGenericAgentProvider {
             ));
         }
         let recovery_events = checkpoint_recovery_events(&stored)?;
-
-        if let GenericCheckpointPhase::ModelAttemptOpen {
-            round, request_id, ..
-        } = projection.phase
-        {
-            return stage_interrupted_model_recovery(
-                self.inner.clone(),
-                stored,
-                round,
-                request_id,
-                recovery_events,
-            );
-        }
-
-        if stored.registration.config_digest != self.inner.config_digest {
-            return Err(AgentProtocolError::new(
-                AgentProtocolErrorCode::RunIdConflict,
-                "recovery identity or Generic Agent configuration does not match the private WAL",
-            ));
-        }
 
         match projection.phase {
             GenericCheckpointPhase::Terminal => {
@@ -71,9 +52,15 @@ impl InternalGenericAgentProvider {
                 .boxed();
                 Ok(AgentRecovery::staged(replay, async { Ok(()) }))
             }
-            GenericCheckpointPhase::ModelAttemptOpen { .. } => {
-                unreachable!("open model attempts returned above")
-            }
+            GenericCheckpointPhase::ModelAttemptOpen {
+                round, request_id, ..
+            } => stage_interrupted_model_recovery(
+                self.inner.clone(),
+                stored,
+                round,
+                request_id,
+                recovery_events,
+            ),
             GenericCheckpointPhase::ModelAttemptObserved {
                 boundary,
                 round,
