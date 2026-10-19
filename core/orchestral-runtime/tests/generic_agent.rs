@@ -6411,6 +6411,105 @@ async fn open_model_attempt_is_not_restarted_and_becomes_incomplete() {
     // Run; the Tokio test runtime aborts that deliberately orphaned task.
 }
 
+#[tokio::test]
+async fn open_model_attempt_becomes_incomplete_even_when_replacement_config_changes() {
+    let run_id = RunId::new("open-model-reconfigured-recovery-run");
+    let checkpoint_store = Arc::new(InMemoryGenericAgentCheckpointStore::default());
+    let session_journal = Arc::new(InMemoryAgentSessionJournalStore::default());
+    let config = GenericAgentConfig::new("internal-provider", "generic-agent");
+    let first = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(BlockingModel),
+        config.clone(),
+        session_journal.clone(),
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("first Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("private WAL binds before the Provider is shared");
+    let descriptor = first.describe();
+    let request = AgentStartRequest::new(
+        AgentRunEnvelope::new(
+            AGENT_PROTOCOL_V1,
+            AgentSessionId::new("open-model-reconfigured-recovery-session"),
+            run_id.clone(),
+            vec![Content::text(
+                "leave one model attempt open across config change",
+            )],
+        )
+        .expect("valid text Run"),
+        ProviderBindingRef::new("open-model-reconfigured-recovery-binding"),
+        &descriptor,
+    )
+    .expect("valid start request");
+    let started = first.start(request.clone()).await.expect("Run starts");
+    let execution = started.execution.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let stored = checkpoint_store
+                .load_run(&run_id)
+                .expect("private WAL remains readable")
+                .expect("private Run remains registered");
+            if matches!(
+                stored.validate().expect("private WAL replays").phase,
+                GenericCheckpointPhase::ModelAttemptOpen { .. }
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("model attempt becomes durably open");
+
+    let mut reconfigured = config;
+    reconfigured
+        .system_prompt
+        .push_str("\n\nUpdated Host configuration.");
+    let second = InternalGenericAgentProvider::new_with_session_journal(
+        Arc::new(BlockingModel),
+        reconfigured,
+        session_journal,
+        Arc::new(JsonSizeTokenMeter::default()),
+    )
+    .expect("reconfigured Generic Agent starts")
+    .with_checkpoint_store(checkpoint_store.clone())
+    .expect("same private WAL binds to the reconfigured Provider");
+    let recovery = second
+        .recover(
+            AgentRecoveryRequest::new(request, execution, &descriptor)
+                .expect("recovery identity is valid"),
+        )
+        .await
+        .expect("open model attempt closes cleanly even after config digest change");
+    let (mut recovered_stream, confirmation) = recovery.into_parts();
+    confirmation
+        .await
+        .expect("Host confirmation durably closes the interrupted attempt");
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match recovered_stream.next().await {
+                Some(Ok(AgentProviderStreamItem::Event(event)))
+                    if matches!(&event.payload, AgentEvent::RunIncomplete { .. }) =>
+                {
+                    break *event;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("interrupted recovery stream failed: {error}"),
+                None => panic!("interrupted recovery ended before its terminal event"),
+            }
+        }
+    })
+    .await
+    .expect("interrupted recovery publishes a terminal event");
+    assert!(matches!(
+        terminal.payload,
+        AgentEvent::RunIncomplete {
+            reason: IncompleteReason::Interrupted { .. },
+            partial_delivery: None,
+        }
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_private_wal_recovers_initial_input_after_confirmation() {
     let run_id = RunId::new("prepared-recovery-run");
@@ -7117,6 +7216,10 @@ async fn sdk_and_api_preserve_host_session_origin_and_reject_conflicting_run_met
         workspace: "/workspace/project".to_owned(),
         additional_workspaces: vec![],
         model: "host-model".to_owned(),
+        backend: None,
+        model_profile: None,
+        reasoning: None,
+        permissions: None,
     };
     let client = AgentClient::new(controller.clone(), AgentSessionId::new("metadata-session"))
         .with_default_extensions(origin.extensions());

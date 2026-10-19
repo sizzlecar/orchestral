@@ -1302,7 +1302,11 @@ async fn start_agent_run(
             if current.state.status()
                 == orchestral_core::agent_protocol::reference::AgentRunStatus::Unknown
             {
-                current = agent.recover(&entry.run_id).await?;
+                match agent.recover(&entry.run_id).await {
+                    Ok(recovered) => current = recovered,
+                    Err(error) if !is_retryable_agent_error(&error) => break 'steer,
+                    Err(error) => return Err(error.into()),
+                }
             }
             if !current.state.is_terminal() {
                 let command_id = CommandId::new(format!("agent-submit-{}", run_id.as_str()));

@@ -17,9 +17,40 @@ impl InternalGenericAgentProvider {
 
         let (request_id, resolution, binding) = {
             let mut state = self.state();
-            let run = state.runs.get_mut(&command.run_id).ok_or_else(|| {
-                AgentProtocolError::new(AgentProtocolErrorCode::RunNotFound, "run does not exist")
-            })?;
+            let Some(run) = state.runs.get_mut(&command.run_id) else {
+                drop(state);
+                if let Some(stored) = self
+                    .inner
+                    .checkpoint_store
+                    .load_run(&command.run_id)
+                    .map_err(checkpoint_recovery_error)?
+                {
+                    if stored.registration.execution != *execution {
+                        return Err(AgentProtocolError::new(
+                            AgentProtocolErrorCode::RunIdConflict,
+                            "command execution identity does not match the Generic Agent Run",
+                        ));
+                    }
+                    if matches!(
+                        stored.validate().map_err(checkpoint_recovery_error)?.phase,
+                        GenericCheckpointPhase::Terminal
+                    ) {
+                        return Ok(ProviderCommandDisposition {
+                            command_id: command.command_id,
+                            run_id: command.run_id,
+                            outcome: ProviderCommandOutcome::Rejected {
+                                code: AgentProtocolErrorCode::TerminalRun,
+                                message: "Run is already terminal".to_owned(),
+                            },
+                            duplicate: false,
+                        });
+                    }
+                }
+                return Err(AgentProtocolError::new(
+                    AgentProtocolErrorCode::RunNotFound,
+                    "run does not exist",
+                ));
+            };
             validate_execution_and_duplicate(run, execution, &command)?;
             if let Some(existing) = run.commands.get(&command.command_id) {
                 return Ok(ProviderCommandDisposition {
