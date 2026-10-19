@@ -3,6 +3,8 @@
 
 use std::{fmt, str::FromStr};
 
+use orchestral_core::config::ReasoningPreference;
+use orchestral_core::model_protocol::{ModelError, ModelReasoningCapabilities};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -88,6 +90,26 @@ pub enum OpenAiReasoningControl {
     Thinking(bool),
 }
 
+impl OpenAiReasoningControl {
+    /// Encode neutral preferences while preserving literal provider effort names.
+    pub fn from_preference(preference: &ReasoningPreference) -> Result<Option<Self>, ModelError> {
+        Ok(match preference {
+            ReasoningPreference::Default => None,
+            ReasoningPreference::On => Some(Self::Thinking(true)),
+            ReasoningPreference::Off => Some(Self::Thinking(false)),
+            _ => {
+                let name = match preference {
+                    ReasoningPreference::Custom(value) => value.clone(),
+                    preference => preference.to_string(),
+                };
+                Some(Self::Effort(
+                    name.parse().map_err(ModelError::invalid_request)?,
+                ))
+            }
+        })
+    }
+}
+
 /// Optional extension returned alongside an OpenAI-compatible model ID.
 /// Unknown fields remain compatible with other endpoint extensions.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -98,6 +120,37 @@ pub struct OpenAiReasoningCapabilities {
     /// Presence advertises an actual enable/disable control, not effort levels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<OpenAiThinkingCapability>,
+}
+
+impl TryFrom<OpenAiReasoningCapabilities> for ModelReasoningCapabilities {
+    type Error = ModelError;
+
+    fn try_from(capabilities: OpenAiReasoningCapabilities) -> Result<Self, ModelError> {
+        let declared = capabilities.supported_efforts.is_some() || capabilities.thinking.is_some();
+        let default_thinking_enabled = capabilities
+            .thinking
+            .as_ref()
+            .map(|value| value.default_enabled);
+        let mut values = Vec::new();
+        if let Some(efforts) = capabilities.supported_efforts {
+            for effort in efforts {
+                let preference = ReasoningPreference::from_effort(effort.as_str())
+                    .map_err(ModelError::invalid_request)?;
+                if !values.contains(&preference) {
+                    values.push(preference);
+                }
+            }
+        }
+        if capabilities.thinking.is_some() {
+            values.extend([ReasoningPreference::On, ReasoningPreference::Off]);
+        }
+        let result = Self {
+            supported_preferences: declared.then_some(values),
+            default_thinking_enabled,
+        };
+        result.validate()?;
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -104,6 +104,14 @@ usage event replaces the estimate when available. This is neither accumulated
 session usage nor live KV-cache occupancy. `limit` is the declared context capacity
 intersected with the Host budget; absent metadata remains `unknown`.
 
+`/reasoning` selects reasoning controls for the current model; `/reasoning <value>` and
+`--reasoning <value>` set an explicit preference. `default` preserves service defaults.
+Gemini menus use the adapter's model capabilities without OpenAI-compatible discovery or
+Google credential refresh. Gemini 3 and later expose their supported `minimal`, `low`,
+`medium`, and `high` levels. Gemini 2.5 offers dynamic thinking with `on`; Flash models
+also support `off`, while Pro cannot disable thinking. Unknown models list only `default`;
+the service validates explicit native controls.
+
 Google model metadata refreshes in the background. Startup uses cached or bundled
 limits without waiting for a download; updates apply when the backend is next
 constructed. Requests waiting more than ten seconds show whether the runtime is

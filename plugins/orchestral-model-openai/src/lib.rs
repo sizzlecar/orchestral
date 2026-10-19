@@ -21,11 +21,13 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{stream, StreamExt};
 use orchestral_core::agent_protocol::wire::Digest;
+use orchestral_core::config::ReasoningPreference;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelCapabilities, ModelContent, ModelContextEstimate, ModelDescriptor,
     ModelError, ModelErrorCode, ModelEvent, ModelEventId, ModelFinishReason, ModelMessage,
-    ModelRequest, ModelRequestId, ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting,
-    ModelTokenMeter, ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
+    ModelReasoningCapabilities, ModelRequest, ModelRequestId, ModelRole, ModelStream,
+    ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter, ModelTokenMeterDescriptor,
+    ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Map, Value};
@@ -112,6 +114,15 @@ impl OpenAiCompatibleBackend {
     pub fn with_reasoning_control(mut self, control: Option<OpenAiReasoningControl>) -> Self {
         self.reasoning = control;
         self
+    }
+
+    /// Apply provider-neutral reasoning through the OpenAI-compatible protocol.
+    pub fn with_reasoning_preference(
+        mut self,
+        preference: ReasoningPreference,
+    ) -> Result<Self, ModelError> {
+        self.reasoning = OpenAiReasoningControl::from_preference(&preference)?;
+        Ok(self)
     }
 
     /// Select the text encoding of complete ToolResult envelopes. Canonical
@@ -315,6 +326,38 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
 
 #[async_trait]
 impl ModelBackend for OpenAiCompatibleBackend {
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ModelError> {
+        let endpoint = OpenAiEndpoint::parse(&self.config.endpoint)?;
+        discover_models(&endpoint, &self.config.api_key)
+            .await
+            .map(Some)
+            .map_err(|error| ModelError::new(ModelErrorCode::Unavailable, error))
+    }
+
+    async fn resolve_reasoning_capabilities(
+        &self,
+    ) -> Result<ModelReasoningCapabilities, ModelError> {
+        let endpoint = OpenAiEndpoint::parse(&self.config.endpoint)?;
+        let model = discover_model_metadata(&endpoint, &self.config.api_key).await
+            .map_err(|error| ModelError::new(ModelErrorCode::Unavailable, error))?
+            .into_iter().find(|model| model.id == self.config.model)
+            .ok_or_else(|| ModelError::invalid_request("The selected model is absent from the service's model list; refresh /model first"))?;
+        let capabilities = model
+            .reasoning
+            .map(TryInto::try_into)
+            .transpose()?
+            .unwrap_or_default();
+        ModelReasoningCapabilities::validate(&capabilities)?;
+        Ok(capabilities)
+    }
+
+    fn validate_reasoning_preference(
+        &self,
+        preference: &ReasoningPreference,
+    ) -> Result<(), ModelError> {
+        OpenAiReasoningControl::from_preference(preference).map(|_| ())
+    }
+
     fn descriptor(&self) -> ModelDescriptor {
         let mut extensions = BTreeMap::from([(
             "openai-compatible/model".to_owned(),
