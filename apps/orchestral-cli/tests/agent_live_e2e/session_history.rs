@@ -653,8 +653,9 @@ fn resume_reconciles_interrupted_session_across_config_and_permission_changes() 
     first.child.kill().unwrap();
     first.finish(Duration::from_secs(5));
 
-    // Change the base config permissions to workspace-write and omit --system-prompt
-    // when resuming with a follow-up prompt.
+    // Change the base config permissions to workspace-write; SessionOrigin restores
+    // the session's recorded full-access preset so the interrupted Run reconciles to
+    // RunIncomplete, and a subsequent config change still allows continuing the session.
     workspace.rewrite_config(|config| {
         config["tools"]["permissions"] = serde_yaml::to_value("workspace-write").unwrap();
     });
@@ -663,7 +664,12 @@ fn resume_reconciles_interrupted_session_across_config_and_permission_changes() 
         "reconfigured-session",
         "Continue after config change",
     );
-    command.args(["--input-mode", "interactive"]);
+    command.args([
+        "--system-prompt",
+        "Initial system instructions.",
+        "--input-mode",
+        "interactive",
+    ]);
     let output = run_to_completion(command, LOCAL_PROCESS_TIMEOUT);
     assert!(output.status.success(), "{}", output.stderr_text());
     assert_eq!(output.stdout_text().trim(), "RESUMED_AFTER_CONFIG_CHANGE");
