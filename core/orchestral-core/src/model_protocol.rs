@@ -16,6 +16,10 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_protocol::wire::Digest;
+use crate::config::ReasoningPreference;
+
+mod reasoning;
+pub use reasoning::ModelReasoningCapabilities;
 
 pub type ModelStream = BoxStream<'static, Result<ModelStreamEvent, ModelError>>;
 
@@ -554,6 +558,48 @@ impl ModelError {
 pub trait ModelBackend: Send + Sync {
     fn descriptor(&self) -> ModelDescriptor;
 
+    /// Inspect selectable model IDs without generating output. None means the
+    /// adapter has no catalog; Some(empty) means the service returned no models.
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ModelError> {
+        Ok(None)
+    }
+
+    /// Locally available reasoning metadata. Unknown does not imply support.
+    fn reasoning_capabilities(&self) -> ModelReasoningCapabilities {
+        ModelReasoningCapabilities::default()
+    }
+
+    /// Inspect optional reasoning metadata without generating model output.
+    /// Adapters own discovery, credentials, and protocol-specific parsing.
+    /// This must not mutate the execution descriptor or token-meter identity.
+    async fn resolve_reasoning_capabilities(
+        &self,
+    ) -> Result<ModelReasoningCapabilities, ModelError> {
+        Ok(self.reasoning_capabilities())
+    }
+
+    /// Check whether this adapter can encode an explicit preference, without
+    /// network access. A service may still reject an undeclared model control.
+    /// The default accepts only omission and locally declared preferences.
+    fn validate_reasoning_preference(
+        &self,
+        preference: &ReasoningPreference,
+    ) -> Result<(), ModelError> {
+        let capabilities = self.reasoning_capabilities();
+        capabilities.validate()?;
+        if *preference == ReasoningPreference::Default
+            || capabilities
+                .supported_preferences
+                .as_ref()
+                .is_some_and(|values| values.contains(preference))
+        {
+            Ok(())
+        } else {
+            Err(ModelError::new(ModelErrorCode::Unsupported,
+                format!("reasoning preference '{preference}' is not supported or declared by this model adapter")))
+        }
+    }
+
     /// Resolve optional remote model metadata before constructing an Agent.
     /// Adapters may cache discovery, but must keep the resolved descriptor
     /// stable for the lifetime of the backend so recovery identities do not
@@ -576,6 +622,27 @@ pub trait ModelBackend: Send + Sync {
 impl ModelBackend for Arc<dyn ModelBackend> {
     fn descriptor(&self) -> ModelDescriptor {
         (**self).descriptor()
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ModelError> {
+        (**self).list_models().await
+    }
+
+    fn reasoning_capabilities(&self) -> ModelReasoningCapabilities {
+        (**self).reasoning_capabilities()
+    }
+
+    async fn resolve_reasoning_capabilities(
+        &self,
+    ) -> Result<ModelReasoningCapabilities, ModelError> {
+        (**self).resolve_reasoning_capabilities().await
+    }
+
+    fn validate_reasoning_preference(
+        &self,
+        preference: &ReasoningPreference,
+    ) -> Result<(), ModelError> {
+        (**self).validate_reasoning_preference(preference)
     }
 
     async fn resolve_descriptor(&self) -> Result<ModelDescriptor, ModelError> {

@@ -269,29 +269,36 @@ impl ProcessOutput {
 fn missing_google_credential_is_non_zero_and_actionable() {
     let workspace = TestWorkspace::new("missing-credential");
     let missing = workspace.path("does-not-exist.json");
-    let mut command = base_command(&workspace);
-    command
-        .arg("--backend")
-        .arg("google")
-        .arg("--model")
-        .arg("gemini-2.5-flash")
-        .arg("--credential-file")
-        .arg(&missing)
-        .arg("do not run");
+    for (model, reasoning) in [
+        ("gemini-2.5-flash", "default"),
+        ("gemini-3.1-pro-preview", "high"),
+    ] {
+        let mut command = base_command(&workspace);
+        command
+            .arg("--backend")
+            .arg("google")
+            .arg("--model")
+            .arg(model)
+            .arg("--reasoning")
+            .arg(reasoning)
+            .arg("--credential-file")
+            .arg(&missing)
+            .arg("do not run");
 
-    let output = run_to_completion(command, Duration::from_secs(30));
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    let stderr = output.stderr_text();
-    assert!(
-        stderr.contains("Google credential file not found"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(missing.to_string_lossy().as_ref()),
-        "{stderr}"
-    );
-    output.assert_no_ansi();
+        let output = run_to_completion(command, Duration::from_secs(30));
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = output.stderr_text();
+        assert!(
+            stderr.contains("Google credential file not found"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(missing.to_string_lossy().as_ref()),
+            "{stderr}"
+        );
+        output.assert_no_ansi();
+    }
 }
 
 #[test]

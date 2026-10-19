@@ -39,7 +39,7 @@ Tool calls, even when a provider family reports its generic stop reason.
 ## Running the shared suite
 
 Concrete adapters supply only family-specific wire fixtures and backend construction. The suite
-runs the same seven cases for descriptor validity, invalid-request fail-fast, text reconstruction,
+runs the same eight cases for descriptor validity, local reasoning controls, invalid-request fail-fast, text reconstruction,
 Tool lifecycle and JSON arguments, malformed-stream fail-closed, cancellation before start, and
 cancellation during a live stream.
 

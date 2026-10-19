@@ -53,6 +53,26 @@ Adapter 继续负责将厂商错误归一化为 `ModelError`，无需理解重�
   `max_attempts`、`attempt_elapsed_ms` 和 `logical_request_elapsed_ms`，随重试 checkpoint
   或最终失败持久化。开始输出后仍可报告等待，但不会重新执行推理。
 
+## 模型发现与推理控制能力
+
+`ReasoningPreference` 是模型无关的用户设置。`default` 表示省略原生控制字段；`on/off`
+是思考开关，其他值是推理强度。厂商字面量名称通过 `Custom` 保留，不能把名称为 `on`
+的 effort 误当作开关。
+
+`ModelBackend::reasoning_capabilities()` 返回本地可用的 `ModelReasoningCapabilities`；
+`resolve_reasoning_capabilities()` 可查询服务声明，但不得生成模型输出或改变 execution
+descriptor、token meter 和 Run 的恢复身份。`supported_preferences: None` 表示未知，
+空列表表示明确没有额外选项；`default` 始终隐含可用，不在列表中重复。
+
+`validate_reasoning_preference()` 无需联网，检查适配器能否编码显式设置。缺省实现接受
+`default` 和本地已声明选项；支持未声明设置的适配器可交给服务最终校验。能力查询、
+认证与原生参数转换均归适配器所有。CLI/TUI 只消费中立合同，不按厂商选择推理路径。
+新增适配器可以保留未知能力和默认设置，按需实现能力查询、校验和原生参数编码。
+
+`ModelBackend::list_models()` 可返回可选择的模型 ID；`None` 表示不提供发现能力，空列表
+表示服务当前没有模型。Host 可在不支持发现时展示配置中的 profiles，服务查询失败仍显式
+报错。模型发现与推理能力查询都不得触发生成请求。
+
 ## 模型容量发现与 Host 预算
 
 `ModelBackend::resolve_descriptor()` 是可选的异步启动阶段：静态适配器直接返回

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use orchestral_core::config::ReasoningPreference;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelError, ModelErrorCode, ModelEvent, ModelFinishReason, ModelMessage,
     ModelRequest, ModelRequestId, ModelRole, ModelStreamEvent, ModelToolDefinition, ModelUsage,
@@ -46,6 +47,7 @@ pub trait ModelFixtureFactory: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelConformanceCase {
     Descriptor,
+    ReasoningControls,
     InvalidRequest,
     TextStream,
     ToolStream,
@@ -55,8 +57,9 @@ pub enum ModelConformanceCase {
 }
 
 impl ModelConformanceCase {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Descriptor,
+        Self::ReasoningControls,
         Self::InvalidRequest,
         Self::TextStream,
         Self::ToolStream,
@@ -163,6 +166,7 @@ impl ModelConformanceSuite {
     ) -> Result<(), String> {
         match case {
             ModelConformanceCase::Descriptor => descriptor_case(fixture),
+            ModelConformanceCase::ReasoningControls => reasoning_controls_case(fixture),
             ModelConformanceCase::InvalidRequest => invalid_request_case(fixture).await,
             ModelConformanceCase::TextStream => text_stream_case(fixture).await,
             ModelConformanceCase::ToolStream => tool_stream_case(fixture).await,
@@ -179,6 +183,27 @@ fn descriptor_case(fixture: &dyn ModelFixtureFactory) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let descriptor = backend.descriptor();
     descriptor.validate().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn reasoning_controls_case(fixture: &dyn ModelFixtureFactory) -> Result<(), String> {
+    let backend = fixture
+        .backend(ModelFixtureScenario::Text, "http://127.0.0.1:1")
+        .map_err(|error| error.to_string())?;
+    let descriptor = backend.descriptor();
+    let capabilities = backend.reasoning_capabilities();
+    capabilities.validate().map_err(|error| error.to_string())?;
+    backend
+        .validate_reasoning_preference(&ReasoningPreference::Default)
+        .map_err(|error| format!("service default must be accepted without metadata: {error}"))?;
+    for preference in capabilities.choices() {
+        backend
+            .validate_reasoning_preference(&preference)
+            .map_err(|error| format!("declared reasoning preference was rejected: {error}"))?;
+    }
+    if backend.descriptor() != descriptor {
+        return Err("reasoning inspection changed the execution descriptor".into());
+    }
     Ok(())
 }
 

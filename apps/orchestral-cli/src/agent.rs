@@ -231,6 +231,7 @@ pub(crate) struct HostMetadata {
     pub context_budget: Option<u64>,
     pub models: Vec<ModelProfile>,
     pub model_backend: BackendSpec,
+    pub model_controls: Arc<dyn ModelBackend>,
     pub reasoning: orchestral_core::config::ReasoningPreference,
     pub permissions: orchestral_core::config::PermissionPreset,
 }
@@ -461,6 +462,7 @@ async fn build_agent_host_with_journals(
             agent_config.project_instructions.iter().map(|doc| format!("{}\n  Scope: {}", doc.source, doc.scope)).collect::<Vec<_>>().join("\n")),
         models: config.providers.models.clone(),
         model_backend: backend.clone(),
+        model_controls: model_backend.clone(),
         reasoning: reasoning.clone(),
         permissions: config.tools.permissions,
     };
@@ -1995,7 +1997,6 @@ pub(crate) fn build_model_backend(
     credential_file: Option<&std::path::Path>,
     reasoning: orchestral_core::config::ReasoningPreference,
 ) -> anyhow::Result<(Arc<dyn ModelBackend>, Arc<dyn ModelTokenMeter>)> {
-    let reasoning_control = crate::model_controls::openai_reasoning(backend, reasoning)?;
     let max_output_tokens = profile
         .and_then(|profile| profile.max_tokens)
         .unwrap_or(8_192) as u64;
@@ -2070,6 +2071,8 @@ pub(crate) fn build_model_backend(
                 max_buffered_events,
             })
             .context("build Gemini ModelBackend")?
+            .with_reasoning_preference(reasoning)
+            .context("configure Gemini reasoning")?
             .with_response_header_timeout(Duration::from_secs(
                 backend
                     .get_config("response_header_timeout_secs")
@@ -2121,7 +2124,8 @@ pub(crate) fn build_model_backend(
                 .with_sampling(sampling)
                 .context("configure OpenAI-compatible sampling")?
                 .with_tool_result_format(tool_result_format)
-                .with_reasoning_control(reasoning_control),
+                .with_reasoning_preference(reasoning)
+                .context("configure model reasoning")?,
             );
             Ok((backend.clone(), backend))
         }

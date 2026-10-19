@@ -22,6 +22,92 @@ fn backend(format: OpenAiToolResultFormat) -> OpenAiCompatibleBackend {
 }
 
 #[test]
+fn neutral_capabilities_keep_unknown_support_and_separate_toggles_from_literal_efforts() {
+    let unknown =
+        ModelReasoningCapabilities::try_from(OpenAiReasoningCapabilities::default()).unwrap();
+    assert_eq!(unknown.supported_preferences, None);
+    let known_empty = ModelReasoningCapabilities::try_from(OpenAiReasoningCapabilities {
+        supported_efforts: Some(Vec::new()),
+        thinking: None,
+    })
+    .unwrap();
+    assert_eq!(known_empty.supported_preferences, Some(Vec::new()));
+    let capabilities = ModelReasoningCapabilities::try_from(OpenAiReasoningCapabilities {
+        supported_efforts: Some(
+            ["on", "default", "future-next"]
+                .into_iter()
+                .map(|v| v.parse().unwrap())
+                .collect(),
+        ),
+        thinking: Some(OpenAiThinkingCapability {
+            default_enabled: true,
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        capabilities.choices(),
+        [
+            ReasoningPreference::Default,
+            ReasoningPreference::Custom("on".into()),
+            ReasoningPreference::Custom("default".into()),
+            ReasoningPreference::Custom("future-next".into()),
+            ReasoningPreference::On,
+            ReasoningPreference::Off,
+        ]
+    );
+    assert_eq!(capabilities.default_thinking_enabled, Some(true));
+    assert!(
+        ModelReasoningCapabilities::try_from(OpenAiReasoningCapabilities {
+            supported_efforts: Some(vec![OpenAiReasoningEffort::Custom(" ".into())]),
+            thinking: None,
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn neutral_reasoning_preserves_native_wire_controls_and_recovery_identity() {
+    for preference in [
+        ReasoningPreference::Default,
+        ReasoningPreference::None,
+        ReasoningPreference::On,
+        ReasoningPreference::Off,
+        ReasoningPreference::Low,
+        ReasoningPreference::High,
+        ReasoningPreference::Custom("on".into()),
+        ReasoningPreference::Custom("future-next".into()),
+    ] {
+        let control = OpenAiReasoningControl::from_preference(&preference).unwrap();
+        let native = backend(OpenAiToolResultFormat::Json).with_reasoning_control(control);
+        let neutral = backend(OpenAiToolResultFormat::Json)
+            .with_reasoning_preference(preference.clone())
+            .unwrap();
+        let request = crate::tests::request();
+        assert_eq!(
+            neutral.build_request_body(&request).unwrap(),
+            native.build_request_body(&request).unwrap()
+        );
+        assert_eq!(neutral.descriptor(), native.descriptor());
+        assert_eq!(neutral.meter_descriptor(), native.meter_descriptor());
+        neutral.validate_reasoning_preference(&preference).unwrap();
+    }
+    assert_eq!(
+        OpenAiReasoningControl::from_preference(&ReasoningPreference::None).unwrap(),
+        Some(OpenAiReasoningControl::Effort(OpenAiReasoningEffort::None))
+    );
+    assert_eq!(
+        OpenAiReasoningControl::from_preference(&ReasoningPreference::Off).unwrap(),
+        Some(OpenAiReasoningControl::Thinking(false))
+    );
+    assert_eq!(
+        OpenAiReasoningControl::from_preference(&ReasoningPreference::Custom("on".into())).unwrap(),
+        Some(OpenAiReasoningControl::Effort(
+            OpenAiReasoningEffort::Custom("on".into())
+        ))
+    );
+}
+
+#[test]
 fn reasoning_effort_vocabulary_is_typed_and_none_is_an_explicit_value() {
     for effort in OpenAiReasoningEffort::ALL.into_iter().chain(
         [

@@ -2,10 +2,10 @@
 
 use super::menu::{Choice, Menu, MenuKind};
 use crate::agent::HostMetadata;
-use crate::model_controls::DiscoveredModel;
 use crate::runtime::ModelOverrides;
 use anyhow::{bail, Context, Result};
 use orchestral_core::config::{PermissionPreset, ReasoningPreference};
+use orchestral_core::model_protocol::ModelReasoningCapabilities;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,21 +69,17 @@ pub(super) fn profiles(metadata: &HostMetadata, current: &str) -> Menu {
 }
 
 pub(super) async fn discover(metadata: &HostMetadata, current: &str) -> Result<Menu> {
-    if !crate::openai_connection::supports_discovery(&metadata.model_backend) {
+    let models = metadata.model_controls.list_models().await
+        .context("Could not refresh the current service's models; retry /model or use /model profiles explicitly")?;
+    let Some(models) = models else {
         let mut menu = profiles(metadata, current);
         menu.title = "Models · configured profiles · protocol has no discovery".to_owned();
         return Ok(menu);
-    }
-    let models = crate::openai_connection::discover_backend_models(&metadata.model_backend).await
-        .context("Could not refresh the current service's models; retry /model or use /model profiles explicitly")?;
+    };
     discovered_menu(metadata, current, models)
 }
 
-fn discovered_menu(
-    metadata: &HostMetadata,
-    current: &str,
-    models: Vec<DiscoveredModel>,
-) -> Result<Menu> {
+fn discovered_menu(metadata: &HostMetadata, current: &str, models: Vec<String>) -> Result<Menu> {
     if models.is_empty() {
         bail!("The current service returned no models; load a model and retry /model, or use /model profiles explicitly");
     }
@@ -91,12 +87,12 @@ fn discovered_menu(
         .into_iter()
         .map(|model| {
             choice(
-                &model.id,
+                &model,
                 Selection::ApiModel {
                     backend: metadata.model_backend.name.clone(),
-                    id: model.id.clone(),
+                    id: model.clone(),
                 },
-                if model.id == current {
+                if model == current {
                     "Service model · current"
                 } else {
                     "Service model · keep current endpoint and credentials"
@@ -122,22 +118,10 @@ fn discovered_menu(
 }
 
 pub(super) async fn reasoning(metadata: &HostMetadata, current: &str) -> Result<Menu> {
-    let models = crate::openai_connection::discover_backend_models(&metadata.model_backend).await
+    let capabilities = metadata.model_controls.resolve_reasoning_capabilities().await
         .context("Could not inspect reasoning capabilities; retry /reasoning, or set --reasoning explicitly for the service to validate")?;
-    let model = models
-        .into_iter()
-        .find(|model| model.id == current)
-        .context(
-            "The selected model is absent from the service's model list; refresh /model first",
-        )?;
-    Ok(reasoning_menu(metadata, &model))
-}
-
-fn reasoning_choices(model: &DiscoveredModel) -> Vec<ReasoningPreference> {
-    model
-        .reasoning
-        .clone()
-        .unwrap_or_else(|| vec![ReasoningPreference::Default])
+    capabilities.validate()?;
+    Ok(reasoning_menu(metadata, current, &capabilities))
 }
 
 pub(super) fn reasoning_argument(command: &str) -> Option<&str> {
@@ -192,7 +176,9 @@ pub(super) fn explicit_reasoning(
         .parse::<ReasoningPreference>()
         .map_err(anyhow::Error::msg)?;
     // Validate protocol support without requiring optional model discovery.
-    crate::model_controls::openai_reasoning(&metadata.model_backend, value.clone())?;
+    metadata
+        .model_controls
+        .validate_reasoning_preference(&value)?;
     Ok(Selection::Reasoning {
         backend: metadata.model_backend.name.clone(),
         model: current.to_owned(),
@@ -200,22 +186,26 @@ pub(super) fn explicit_reasoning(
     })
 }
 
-fn reasoning_menu(metadata: &HostMetadata, model: &DiscoveredModel) -> Menu {
-    let declared = model.reasoning.is_some();
+fn reasoning_menu(
+    metadata: &HostMetadata,
+    model: &str,
+    capabilities: &ModelReasoningCapabilities,
+) -> Menu {
+    let declared = capabilities.supported_preferences.is_some();
     Menu::new(
         MenuKind::Models,
-        format!("Reasoning · current: {} · {}", metadata.reasoning, model.id),
-        reasoning_choices(model)
+        format!("Reasoning · current: {} · {}", metadata.reasoning, model),
+        capabilities.choices()
             .into_iter()
             .map(|value| {
                 let description = match &value {
                     ReasoningPreference::Default
-                        if model.thinking_default_enabled == Some(true) =>
+                        if capabilities.default_thinking_enabled == Some(true) =>
                     {
                         "Use service default (thinking on); omit controls"
                     }
                     ReasoningPreference::Default
-                        if model.thinking_default_enabled == Some(false) =>
+                        if capabilities.default_thinking_enabled == Some(false) =>
                     {
                         "Use service default (thinking off); omit controls"
                     }
@@ -227,7 +217,7 @@ fn reasoning_menu(metadata: &HostMetadata, model: &DiscoveredModel) -> Menu {
                         "Enable thinking; this is a toggle, not an effort level"
                     }
                     ReasoningPreference::Off => "Disable thinking explicitly",
-                    _ if declared => "Effort declared by the current service",
+                    _ if declared => "Control supported by the current model",
                     _ => {
                         "Capability not declared; explicit request will be validated by the service"
                     }
@@ -236,7 +226,7 @@ fn reasoning_menu(metadata: &HostMetadata, model: &DiscoveredModel) -> Menu {
                     &value.to_string(),
                     Selection::Reasoning {
                         backend: metadata.model_backend.name.clone(),
-                        model: model.id.clone(),
+                        model: model.to_owned(),
                         value,
                     },
                     description,

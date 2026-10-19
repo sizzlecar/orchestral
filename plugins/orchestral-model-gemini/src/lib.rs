@@ -18,14 +18,18 @@ use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelCapabilities, ModelContent, ModelContextEstimate, ModelDescriptor,
     ModelError, ModelErrorCode, ModelEvent, ModelEventId, ModelFinishReason, ModelMessage,
-    ModelRequest, ModelRequestId, ModelRole, ModelStream, ModelStreamEvent, ModelTokenAccounting,
-    ModelTokenMeter, ModelTokenMeterDescriptor, ModelToolCallId, ModelToolDefinition, ModelUsage,
+    ModelReasoningCapabilities, ModelRequest, ModelRequestId, ModelRole, ModelStream,
+    ModelStreamEvent, ModelTokenAccounting, ModelTokenMeter, ModelTokenMeterDescriptor,
+    ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
 mod metadata;
+mod reasoning;
+
+pub use reasoning::{GeminiReasoningCapabilities, GeminiThinkingControl};
 
 const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const GEMINI_THOUGHT_SIGNATURE_EXTENSION: &str = "google.gemini/thought_signature";
@@ -146,7 +150,7 @@ fn google_authentication_error(context: &str, error: impl std::fmt::Display) -> 
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeminiThinkingLevel {
     Minimal,
     Low,
@@ -220,6 +224,7 @@ pub struct GeminiModelBackend {
     metadata_discovery: bool,
     background_metadata_refresh: bool,
     include_thoughts: bool,
+    thinking_control: Option<GeminiThinkingControl>,
     response_header_timeout: Duration,
     catalog_url: Option<String>,
 }
@@ -334,6 +339,7 @@ impl GeminiModelBackend {
                 generation: 0,
             })),
             response_header_timeout: config.timeout,
+            thinking_control: config.thinking_level.map(GeminiThinkingControl::Level),
             config,
             metadata: tokio::sync::OnceCell::new(),
             metadata_cache: None,
@@ -401,6 +407,17 @@ impl GeminiModelBackend {
         self
     }
 
+    /// Apply a provider-neutral preference through native Gemini thinking controls.
+    /// `Default` clears explicit controls while preserving thought-summary settings.
+    pub fn with_reasoning_preference(
+        mut self,
+        preference: orchestral_core::config::ReasoningPreference,
+    ) -> Result<Self, ModelError> {
+        self.thinking_control =
+            GeminiThinkingControl::from_preference(&self.config.model, &preference)?;
+        Ok(self)
+    }
+
     /// Bound the HTTP send through response headers, including connection and
     /// upload, independently of streamed body reads. This is not a total
     /// generation deadline; the SDK defaults to the
@@ -430,11 +447,14 @@ impl GeminiModelBackend {
         if self.include_thoughts {
             thinking.insert("includeThoughts".to_owned(), json!(true));
         }
-        if let Some(thinking_level) = self.config.thinking_level {
-            thinking.insert(
-                "thinkingLevel".to_owned(),
-                json!(thinking_level.as_wire_value()),
-            );
+        match self.thinking_control {
+            Some(GeminiThinkingControl::Level(level)) => {
+                thinking.insert("thinkingLevel".to_owned(), json!(level.as_wire_value()));
+            }
+            Some(GeminiThinkingControl::Budget(budget)) => {
+                thinking.insert("thinkingBudget".to_owned(), json!(budget));
+            }
+            None => {}
         }
         if !thinking.is_empty() {
             generation.insert("thinkingConfig".to_owned(), Value::Object(thinking));
@@ -481,9 +501,11 @@ impl ModelTokenMeter for GeminiModelBackend {
         let config = serde_json::to_vec(&(
             &self.config.model,
             self.config.temperature.to_bits(),
-            self.config
-                .thinking_level
-                .map(GeminiThinkingLevel::as_wire_value),
+            match self.thinking_control {
+                Some(GeminiThinkingControl::Level(level)) => json!(level.as_wire_value()),
+                Some(GeminiThinkingControl::Budget(budget)) => json!({"thinkingBudget": budget}),
+                None => Value::Null,
+            },
             self.config.default_max_output_tokens,
             self.include_thoughts,
             "request-scoped-gemini-call-identity/v1",
@@ -570,6 +592,30 @@ impl ModelTokenMeter for GeminiModelBackend {
 
 #[async_trait]
 impl ModelBackend for GeminiModelBackend {
+    fn reasoning_capabilities(&self) -> ModelReasoningCapabilities {
+        GeminiReasoningCapabilities::for_model(&self.config.model)
+            .map(|capabilities| ModelReasoningCapabilities {
+                supported_preferences: Some(
+                    capabilities
+                        .preferences
+                        .into_iter()
+                        .filter(|value| {
+                            *value != orchestral_core::config::ReasoningPreference::Default
+                        })
+                        .collect(),
+                ),
+                default_thinking_enabled: Some(capabilities.default_enabled),
+            })
+            .unwrap_or_default()
+    }
+
+    fn validate_reasoning_preference(
+        &self,
+        preference: &orchestral_core::config::ReasoningPreference,
+    ) -> Result<(), ModelError> {
+        GeminiThinkingControl::from_preference(&self.config.model, preference).map(|_| ())
+    }
+
     fn descriptor(&self) -> ModelDescriptor {
         let metadata = self.metadata.get().and_then(Option::as_ref);
         let mut extensions = BTreeMap::from([(
@@ -2243,6 +2289,73 @@ mod tests {
             ids(&second)[0],
             "new model requests own distinct executions"
         );
+    }
+
+    #[test]
+    fn reasoning_preferences_encode_one_native_control_and_bind_recovery_identity() {
+        use orchestral_core::config::ReasoningPreference as Preference;
+        for (model, preference, expected) in [
+            (
+                "gemini-3.1-pro-preview",
+                Preference::High,
+                json!({"thinkingLevel":"HIGH"}),
+            ),
+            (
+                "gemini-3-flash-preview",
+                Preference::Minimal,
+                json!({"thinkingLevel":"MINIMAL"}),
+            ),
+            (
+                "models/gemini-2.5-flash",
+                Preference::Off,
+                json!({"thinkingBudget":0}),
+            ),
+            (
+                "gemini-2.5-pro",
+                Preference::On,
+                json!({"thinkingBudget":-1}),
+            ),
+        ] {
+            for authentication in [
+                GeminiAuthentication::ApiKey("fixture".into()),
+                GeminiAuthentication::BearerToken("fixture".into()),
+            ] {
+                let backend = GeminiModelBackend::new(GeminiModelConfig {
+                    backend_id: "reasoning-fixture".into(),
+                    endpoint: "http://localhost".into(),
+                    authentication,
+                    model: model.into(),
+                    temperature: 0.0,
+                    thinking_level: None,
+                    default_max_output_tokens: 128,
+                    max_context_tokens: None,
+                    timeout: Duration::from_secs(1),
+                    max_buffered_events: 16,
+                })
+                .unwrap()
+                .with_thought_summaries(true);
+                let default_digest = backend.meter_descriptor().config_digest;
+                let backend = backend
+                    .with_reasoning_preference(preference.clone())
+                    .unwrap();
+                let body = backend.build_request_body(&request()).unwrap();
+                let mut expected = expected.clone();
+                expected["includeThoughts"] = json!(true);
+                assert_eq!(body["generationConfig"]["thinkingConfig"], expected);
+                assert_ne!(backend.meter_descriptor().config_digest, default_digest);
+                let backend = backend
+                    .with_reasoning_preference(Preference::Default)
+                    .unwrap();
+                assert_eq!(backend.meter_descriptor().config_digest, default_digest);
+                assert_eq!(
+                    backend.build_request_body(&request()).unwrap()["generationConfig"]
+                        ["thinkingConfig"],
+                    json!({"includeThoughts":true})
+                );
+            }
+        }
+        assert!(GeminiReasoningCapabilities::for_model("gemini-future-flash").is_none());
+        assert!(GeminiReasoningCapabilities::for_model("gemini-flash-latest").is_none());
     }
 
     #[test]

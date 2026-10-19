@@ -29,26 +29,6 @@ pub(crate) fn endpoint(backend: &BackendSpec) -> anyhow::Result<OpenAiEndpoint> 
     OpenAiEndpoint::parse(endpoint).map_err(anyhow::Error::msg)
 }
 
-pub(crate) async fn discover_backend_models(
-    backend: &BackendSpec,
-) -> anyhow::Result<Vec<crate::model_controls::DiscoveredModel>> {
-    if !supports_discovery(backend) {
-        bail!(
-            "backend protocol '{}' does not expose OpenAI-compatible model discovery",
-            backend.kind
-        );
-    }
-    orchestral_model_openai::discover_model_metadata(&endpoint(backend)?, &api_key(backend)?)
-        .await
-        .map_err(anyhow::Error::msg)
-        .map(|models| {
-            models
-                .into_iter()
-                .map(crate::model_controls::discovered_model)
-                .collect()
-        })
-}
-
 pub(crate) fn api_key(backend: &BackendSpec) -> anyhow::Result<String> {
     match backend
         .get_config::<String>("auth")
