@@ -270,6 +270,73 @@ fn gemini_output_exhaustion_is_incomplete_with_usage_and_never_retried() {
 }
 
 #[test]
+fn gemini_tui_renders_math_nested_lists_and_rules_without_changing_saved_output() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("gemini-tui-markdown");
+    let answer = "## Report\n\n- **Call `inspect()`**\n  - value $x_2^2$\n\n---\n\nRate $\\frac{a}{b}$, delta $t_{\\text{end}} - t_{\\text{start}}$.\n\n```tex\n$x_2$\n---\n```\n\nComplete.";
+    let response = answer.to_owned();
+    let (endpoint, server) = spawn_fixture_http_server(vec![Box::new(move |_| {
+        gemini_response(json!({"text":response}))
+    })]);
+    configure_gemini_fixture(&workspace, &endpoint);
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_orchestral"));
+    command.cwd(&workspace.root);
+    command.env("ORCHESTRAL_HOME", workspace.path("user-config"));
+    command.env("GOOGLE_API_KEY", "fixture-key");
+    command.args([
+        "--config",
+        workspace.path("orchestral.yaml").to_str().unwrap(),
+        "--backend",
+        "google",
+        "--model",
+        "fixture-model",
+        "--session-id",
+        "markdown-tui",
+        "--no-mcp",
+        "--no-skills",
+    ]);
+    let mut tui = PtyHarness::spawn_with_size(command, 100, 34);
+    tui.wait_for_screen(
+        |screen| screen.contains("fixture-model"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    tui.send_paste("Show the report.");
+    let screen = tui.wait_for_screen(
+        |screen| screen.contains("replied") && screen.contains("Complete."),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    for expected in [
+        "• Call inspect()",
+        "• value x₂²",
+        "Rate a/b",
+        "t_(end) − tₛₜₐᵣₜ",
+        "────",
+        "│ $x_2$",
+        "│ ---",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+    }
+    for raw in ["**", "`inspect()`", "\\frac", "\\text"] {
+        assert!(!screen.contains(raw), "{screen}");
+    }
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success(), "{}", output.text());
+    output.assert_terminal_restored();
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let stored = session_records(&workspace);
+    let output = stored
+        .iter()
+        .find(|record| record["payload"]["type"] == "run_output_committed")
+        .unwrap();
+    assert_eq!(
+        output["payload"]["message"]["content"][0]["text"].as_str(),
+        Some(answer)
+    );
+}
+
+#[test]
 fn gemini_tui_folds_the_summary_until_expanded_while_waiting_for_the_model() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("gemini-tui-summary");
