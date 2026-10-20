@@ -122,6 +122,11 @@ selected model and workspace. Sending the first task opens the conversation view
 Restoring a conversation shows its history instead of the welcome screen.
 
 Adjacent thinking summaries share one folded heading, with their contents hidden by default.
+Assistant output and expanded summaries use CommonMark formatting, including nested lists,
+task checkboxes, headings, quotes, code, tables, and terminal-width horizontal rules. Math in
+`$…$`, `$$…$$`, `\(…\)`, or `\[…\]` is shown as readable Unicode text with scripts, Greek
+letters, fractions, and roots. Code stays literal; unsupported, incomplete, or overly complex
+formulas remain visible as source. Transcript storage and `/copy` retain the original Markdown.
 Ctrl+O expands or collapses tool records and thinking summaries; PgUp/PgDn reads history or the focused panel,
 and End follows new output. Native terminal text selection is retained; `/copy` copies the last
 committed answer when a local clipboard utility is available. `/`, F1 and `/help` expose the

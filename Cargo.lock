@@ -2688,6 +2688,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
+name = "latex-to-unicode"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd4163985a58a9b834744e3bb6bd6407ac193ac63617b9b1ce9f63ef3bede696"
+
+[[package]]
 name = "lazy-js-bundle"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3202,6 +3208,7 @@ dependencies = [
  "include_dir",
  "insta",
  "jsonwebtoken",
+ "latex-to-unicode",
  "orchestral-agent-claude",
  "orchestral-agent-codex",
  "orchestral-agent-journal-fs",
@@ -3215,6 +3222,7 @@ dependencies = [
  "orchestral-project-instructions-fs",
  "orchestral-runtime",
  "portable-pty",
+ "pulldown-cmark",
  "qrcode",
  "ratatui",
  "reqwest 0.12.28",

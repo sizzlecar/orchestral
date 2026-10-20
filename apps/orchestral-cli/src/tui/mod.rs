@@ -13,6 +13,8 @@ mod history;
 mod input_queue;
 mod insights;
 mod interaction;
+mod markdown;
+mod math;
 mod menu;
 mod models;
 #[cfg(test)]
