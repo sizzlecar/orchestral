@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error as _;
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -10,10 +9,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{stream, StreamExt};
-use google_cloud_auth::credentials::service_account::{
-    AccessSpecifier, Builder as ServiceAccountBuilder,
-};
-use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as GoogleCredentialsBuilder};
 use orchestral_core::agent_protocol::wire::Digest;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelCapabilities, ModelContent, ModelContextEstimate, ModelDescriptor,
@@ -26,129 +21,18 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
+mod auth;
 mod metadata;
 mod reasoning;
 
+#[cfg(test)]
+mod auth_recovery_tests;
+
+pub use auth::{GeminiAccessTokenProvider, GeminiAuthentication, GoogleCloudAccessTokenProvider};
 pub use reasoning::{GeminiReasoningCapabilities, GeminiThinkingControl};
 
-const GOOGLE_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const GEMINI_THOUGHT_SIGNATURE_EXTENSION: &str = "google.gemini/thought_signature";
 const GEMINI_FUNCTION_CALL_ID_EXTENSION: &str = "google.gemini/function_call_id";
-
-#[async_trait]
-pub trait GeminiAccessTokenProvider: Send + Sync {
-    async fn access_token(&self) -> Result<String, ModelError>;
-}
-
-#[derive(Clone)]
-pub enum GeminiAuthentication {
-    ApiKey(String),
-    BearerToken(String),
-    AccessTokenProvider(Arc<dyn GeminiAccessTokenProvider>),
-}
-
-impl GeminiAuthentication {
-    fn is_valid(&self) -> bool {
-        match self {
-            Self::ApiKey(value) | Self::BearerToken(value) => !value.trim().is_empty(),
-            Self::AccessTokenProvider(_) => true,
-        }
-    }
-
-    async fn apply(
-        &self,
-        request: RequestBuilder,
-        cancellation: &CancellationToken,
-    ) -> Result<RequestBuilder, ModelError> {
-        match self {
-            Self::ApiKey(value) => Ok(request.header("x-goog-api-key", value)),
-            Self::BearerToken(value) => Ok(request.bearer_auth(value)),
-            Self::AccessTokenProvider(provider) => {
-                let token = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return Err(cancelled_error()),
-                    token = provider.access_token() => token?,
-                };
-                if token.trim().is_empty() {
-                    return Err(ModelError::new(
-                        ModelErrorCode::Authentication,
-                        "Google access-token provider returned an empty token",
-                    ));
-                }
-                Ok(request.bearer_auth(token))
-            }
-        }
-    }
-}
-
-/// Google ADC/service-account bridge for Gemini's dynamic bearer-token mode.
-///
-/// The Google SDK owns token caching and refresh. The Gemini adapter asks for a
-/// token for every model request, so long-running Agent sessions do not retain an
-/// expired access token.
-#[derive(Clone, Debug)]
-pub struct GoogleCloudAccessTokenProvider {
-    credentials: AccessTokenCredentials,
-}
-
-impl GoogleCloudAccessTokenProvider {
-    /// Resolve Google's standard Application Default Credentials chain.
-    pub fn application_default() -> Result<Self, ModelError> {
-        let credentials = GoogleCredentialsBuilder::default()
-            .with_scopes([GOOGLE_CLOUD_PLATFORM_SCOPE])
-            .build_access_token_credentials()
-            .map_err(|error| {
-                google_authentication_error("resolve Application Default Credentials", error)
-            })?;
-        Ok(Self { credentials })
-    }
-
-    /// Load an explicitly supplied service-account key without changing process
-    /// environment variables or exposing the key outside this provider.
-    pub fn from_service_account_file(path: impl AsRef<Path>) -> Result<Self, ModelError> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|error| {
-            google_authentication_error(
-                &format!("read Google credential file '{}'", path.display()),
-                error,
-            )
-        })?;
-        let value = serde_json::from_slice(&bytes).map_err(|error| {
-            google_authentication_error(
-                &format!("parse Google credential file '{}'", path.display()),
-                error,
-            )
-        })?;
-        let credentials = ServiceAccountBuilder::new(value)
-            .with_access_specifier(AccessSpecifier::from_scopes([GOOGLE_CLOUD_PLATFORM_SCOPE]))
-            .build_access_token_credentials()
-            .map_err(|error| {
-                google_authentication_error(
-                    &format!("load service-account credential '{}'", path.display()),
-                    error,
-                )
-            })?;
-        Ok(Self { credentials })
-    }
-}
-
-#[async_trait]
-impl GeminiAccessTokenProvider for GoogleCloudAccessTokenProvider {
-    async fn access_token(&self) -> Result<String, ModelError> {
-        self.credentials
-            .access_token()
-            .await
-            .map(|token| token.token)
-            .map_err(|error| google_authentication_error("acquire Google access token", error))
-    }
-}
-
-fn google_authentication_error(context: &str, error: impl std::fmt::Display) -> ModelError {
-    ModelError::new(
-        ModelErrorCode::Authentication,
-        format!("{context}: {error}"),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeminiThinkingLevel {
@@ -265,6 +149,7 @@ impl RequestDiagnostics {
                 ("message_count".to_owned(), json!(request.messages.len())),
                 ("tool_count".to_owned(), json!(request.tools.len())),
                 ("client_generation".to_owned(), json!(generation)),
+                ("auth_refresh_attempts".to_owned(), json!(0)),
             ]),
             started: Instant::now(),
             auth_elapsed: Duration::ZERO,
@@ -675,63 +560,114 @@ impl ModelBackend for GeminiModelBackend {
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
         // Serialize once so diagnostics measure exactly the bytes sent.
-        let encoded = serde_json::to_vec(&body)
-            .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?;
+        let encoded = Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|error| ModelError::new(ModelErrorCode::Internal, error.to_string()))?,
+        );
         let (client, generation) = self.http_client_snapshot();
         let mut diagnostics = RequestDiagnostics::new(&request, &body, encoded.len(), generation);
         let authenticated = self
             .config
             .authentication
-            .apply(client.post(self.config.stream_url()), &cancellation)
+            .prepare(client.post(self.config.stream_url()), &cancellation)
             .await;
         diagnostics.auth_elapsed = diagnostics.started.elapsed();
-        let http_request = authenticated
-            .map_err(|error| diagnostics.error(error, "authentication"))?
+        let (authenticated, dynamic_token) =
+            authenticated.map_err(|error| diagnostics.error(error, "authentication"))?;
+        let mut http_request = authenticated
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(encoded);
-        tracing::debug!(
-            request_id = %request.request_id,
-            request_bytes = %diagnostics.metadata["request_bytes"],
-            inline_image_base64_bytes = %diagnostics.metadata["inline_image_base64_bytes"],
-            message_count = request.messages.len(),
-            tool_count = request.tools.len(),
-            client_generation = generation,
-            auth_elapsed_ms = diagnostics.auth_elapsed.as_millis(),
-            "Gemini authentication complete; starting HTTP send"
-        );
-        diagnostics.send_started = Some(Instant::now());
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(diagnostics.error(cancelled_error(), "response_headers")),
-            response = tokio::time::timeout(self.response_header_timeout, http_request.send()) => response,
+            .body(encoded.clone());
+        let mut refreshed = false;
+        let response = loop {
+            tracing::debug!(
+                request_id = %request.request_id,
+                request_bytes = %diagnostics.metadata["request_bytes"],
+                inline_image_base64_bytes = %diagnostics.metadata["inline_image_base64_bytes"],
+                message_count = request.messages.len(),
+                tool_count = request.tools.len(),
+                client_generation = generation,
+                auth_elapsed_ms = diagnostics.auth_elapsed.as_millis(),
+                "Gemini authentication complete; starting HTTP send"
+            );
+            diagnostics.send_started = Some(Instant::now());
+            diagnostics.send_elapsed = None;
+            let response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(diagnostics.error(cancelled_error(), "response_headers")),
+                response = tokio::time::timeout(self.response_header_timeout, http_request.send()) => response,
+            };
+            diagnostics.send_elapsed = diagnostics.send_started.map(|started| started.elapsed());
+            let response = match response {
+                Err(_) => {
+                    self.reset_http_client();
+                    let error = ModelError::new(ModelErrorCode::Unavailable, format!(
+                        "Gemini HTTP send did not reach response headers within {:?} (includes connection, upload, and header wait)",
+                        self.response_header_timeout,
+                    )).with_retryable(true).with_details(json!({
+                        "kind": "timeout", "timeout": true,
+                        "response_header_timeout_ms": self.response_header_timeout.as_millis() as u64,
+                    }));
+                    return Err(diagnostics.error(error, "response_headers"));
+                }
+                Ok(Err(error)) => {
+                    self.reset_http_client();
+                    return Err(diagnostics.error(map_transport_error(error), "response_headers"));
+                }
+                Ok(Ok(response)) => response,
+            };
+            let status = response.status();
+            tracing::debug!(
+                request_id = %request.request_id,
+                elapsed_ms = diagnostics.started.elapsed().as_millis(),
+                send_elapsed_ms = diagnostics.send_elapsed.map(|elapsed| elapsed.as_millis()),
+                client_generation = generation,
+                %status,
+                "Gemini response headers received"
+            );
+            // A rejected bearer token authorizes one credential refresh and resend.
+            // No model output has been accepted, and successful streams are never
+            // replayed. Static keys/tokens and permission failures have no refresh.
+            if status == StatusCode::UNAUTHORIZED && !refreshed {
+                if let (GeminiAuthentication::AccessTokenProvider(provider), Some(token)) =
+                    (&self.config.authentication, dynamic_token.as_deref())
+                {
+                    diagnostics
+                        .metadata
+                        .insert("auth_refresh_attempts".to_owned(), json!(1));
+                    let refresh_started = Instant::now();
+                    let refresh = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err(cancelled_error()),
+                        result = tokio::time::timeout(
+                            self.response_header_timeout,
+                            provider.refresh_after_rejection(token),
+                        ) => result.unwrap_or_else(|_| Err(
+                            ModelError::new(ModelErrorCode::Authentication,
+                                "Google credential refresh after HTTP 401 timed out")
+                            .with_details(json!({"timeout": true}))
+                        )),
+                    };
+                    diagnostics.auth_elapsed += refresh_started.elapsed();
+                    if let Some(token) = refresh
+                        .map_err(|error| diagnostics.error(error, "authentication_refresh"))?
+                    {
+                        auth::validate_access_token(&token)
+                            .map_err(|error| diagnostics.error(error, "authentication_refresh"))?;
+                        tracing::debug!(request_id = %request.request_id,
+                        "Gemini bearer token refreshed after HTTP 401; retrying once");
+                        http_request = client
+                            .post(self.config.stream_url())
+                            .bearer_auth(token)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(encoded.clone());
+                        refreshed = true;
+                        continue;
+                    }
+                }
+            }
+            break response;
         };
-        diagnostics.send_elapsed = diagnostics.send_started.map(|started| started.elapsed());
-        let response = response
-        .map_err(|_| {
-            self.reset_http_client();
-            diagnostics.error(
-                ModelError::new(ModelErrorCode::Unavailable, format!(
-                    "Gemini HTTP send did not reach response headers within {:?} (includes connection, upload, and header wait)", self.response_header_timeout
-                )).with_retryable(true).with_details(json!({
-                    "kind":"timeout", "timeout":true,
-                    "response_header_timeout_ms":self.response_header_timeout.as_millis() as u64,
-                })),
-                "response_headers",
-            )
-        })?
-        .map_err(|error| {
-            self.reset_http_client();
-            diagnostics.error(map_transport_error(error), "response_headers")
-        })?;
         let status = response.status();
-        tracing::debug!(
-            request_id = %request.request_id,
-            elapsed_ms = diagnostics.started.elapsed().as_millis(),
-            send_elapsed_ms = diagnostics.send_elapsed.map(|elapsed| elapsed.as_millis()),
-            client_generation = generation,
-            %status,
-            "Gemini response headers received"
-        );
         if !status.is_success() {
             let bytes = tokio::select! {
                 biased;

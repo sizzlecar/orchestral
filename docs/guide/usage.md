@@ -159,6 +159,12 @@ on Unix), or an attached Google Cloud service account. `--credential-file PATH` 
 override for a service-account JSON key; a Vertex project must resolve from the credential or
 `GOOGLE_CLOUD_PROJECT`.
 
+For dynamic Google credentials, an HTTP 401 triggers a credential-cache reset and one retry
+with a newly acquired token. This lets long-running sessions recover from rejected cached
+tokens, including after system suspend. Refresh is cancellable and uses the response-header
+timeout. A second 401, a 403, or a static API key/bearer token remains an authentication error;
+an accepted response stream is never replayed by this recovery path.
+
 `--session-id` gives multiple turns a stable durable Session identity; `--no-mcp` and
 `--no-skills` disable those planes.
 
