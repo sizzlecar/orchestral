@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn inline_display_and_alternate_math_delimiters_share_the_renderer() {
         let rendered = text("指标 $t_{\\text{end}} - t_{\\text{start}}$，以及 \\(x_1^2\\)。\n\n$$\n\\frac{a+b}{n-1}\n$$\n\n\\[\\sqrt{x} \\leq \\alpha\\]\n\n完成。");
-        for expected in ["t_(end) − tₛₜₐᵣₜ", "x₁²", "(a+b)/(n−1)", "√x ≤ α", "完成。"]
+        for expected in ["t_end − t_start", "x₁²", "(a+b)/(n−1)", "√x ≤ α", "完成。"]
         {
             assert!(rendered.contains(expected), "{rendered}");
         }

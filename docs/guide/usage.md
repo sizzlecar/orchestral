@@ -126,7 +126,9 @@ Assistant output and expanded summaries use CommonMark formatting, including nes
 task checkboxes, headings, quotes, code, tables, and terminal-width horizontal rules. Math in
 `$…$`, `$$…$$`, `\(…\)`, or `\[…\]` is shown as readable Unicode text with scripts, Greek
 letters, fractions, and roots. Code stays literal; unsupported, incomplete, or overly complex
-formulas remain visible as source. Transcript storage and `/copy` retain the original Markdown.
+formulas remain visible as source. Numeric scripts use Unicode (`x₂`, `x²`); symbolic/text
+scripts keep labels at the normal text size (`t_first`, `x^n`), and compound scripts retain parentheses
+(`x_(i+1)`). Transcript storage and `/copy` retain the original Markdown.
 Ctrl+O expands or collapses tool records and thinking summaries; PgUp/PgDn reads history or the focused panel,
 and End follows new output. Native terminal text selection is retained; `/copy` copies the last
 committed answer when a local clipboard utility is available. `/`, F1 and `/help` expose the

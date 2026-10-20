@@ -309,7 +309,7 @@ fn gemini_tui_renders_math_nested_lists_and_rules_without_changing_saved_output(
         "• Call inspect()",
         "• value x₂²",
         "Rate a/b",
-        "t_(end) − tₛₜₐᵣₜ",
+        "t_end − t_start",
         "────",
         "│ $x_2$",
         "│ ---",
