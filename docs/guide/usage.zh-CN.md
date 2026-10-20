@@ -132,6 +132,11 @@ OpenAI-compatible 厂商读取配置中对应的密钥环境变量。Google 可�
 挂载的服务账号。`--credential-file PATH` 是 service-account JSON key 的便捷覆盖；Vertex
 project 必须能从凭据或 `GOOGLE_CLOUD_PROJECT` 解析。
 
+使用 Google 动态凭据时，HTTP 401 会触发凭据缓存重建，并用新获取的 token 重试一次，
+让长时间运行的会话能够从缓存 token 被拒绝的情况恢复（包括系统休眠后）。刷新支持取消，
+并受响应头超时限制。再次 401、403 或静态 API Key / bearer token 仍按认证错误处理；
+这条恢复路径不会重放已接受的响应流。
+
 `--session-id` 为多轮对话提供稳定、持久的 Session 身份；`--no-mcp` 和 `--no-skills`
 可分别关闭两套扩展面。
 
