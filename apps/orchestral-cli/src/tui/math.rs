@@ -82,18 +82,39 @@ fn project_nodes(nodes: &[MathNode]) -> Option<MathText> {
 }
 
 fn script(source: &str, superscript: bool) -> String {
-    let mapped = source
-        .chars()
-        .map(|c| {
-            let c = if c == '−' { '-' } else { c };
-            if superscript {
-                symbols::to_superscript(c)
-            } else {
-                symbols::to_subscript(c)
-            }
-        })
-        .collect::<Option<String>>();
-    mapped.unwrap_or_else(|| format!("{}({source})", if superscript { '^' } else { '_' }))
+    // Unicode has complete numeric scripts, but only a partial alphabet.
+    // Keep all symbolic/text labels at the normal text size rather than making
+    // their appearance depend on which letters happen to have script glyphs.
+    let numeric = source.chars().any(|c| c.is_ascii_digit())
+        && source
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '−' | '=' | '(' | ')'));
+    if numeric {
+        let mapped = source
+            .chars()
+            .map(|c| {
+                let c = if c == '−' { '-' } else { c };
+                if superscript {
+                    symbols::to_superscript(c)
+                } else {
+                    symbols::to_subscript(c)
+                }
+            })
+            .collect::<Option<String>>();
+        if let Some(mapped) = mapped {
+            return mapped;
+        }
+    }
+    let marker = if superscript { '^' } else { '_' };
+    let identifier = source.starts_with(char::is_alphabetic)
+        && source
+            .chars()
+            .all(|c| c.is_alphabetic() || c.is_ascii_digit());
+    if identifier {
+        format!("{marker}{source}")
+    } else {
+        format!("{marker}({source})")
+    }
 }
 
 fn project(node: &MathNode) -> Option<MathText> {
@@ -305,13 +326,30 @@ mod tests {
     fn renders_structured_math_with_text_indices_symbols_and_nested_fractions() {
         assert_eq!(
             render(r"t_{\text{last}} - t_{\text{first}}"),
-            Some("tₗₐₛₜ − t_(first)".into())
+            Some("t_last − t_first".into())
         );
         assert_eq!(
             render(r"\frac{a + \frac{1}{b}}{\sqrt{x_2}} \leq \alpha^2"),
             Some("((a + (1/b))/√x₂) ≤ α²".into())
         );
         assert_eq!(render(r"E = mc^2"), Some("E = mc²".into()));
+    }
+
+    #[test]
+    fn symbolic_scripts_use_consistent_normal_size_labels() {
+        for (source, expected) in [
+            (r"t_{\text{last}} - t_{\text{first}}", "t_last − t_first"),
+            (r"x_{start} + x_{end}", "x_start + x_end"),
+            (r"x_i + x_j + x_f", "x_i + x_j + x_f"),
+            (r"t_{\text{末尾}} - t_{\text{开头}}", "t_末尾 − t_开头"),
+            (r"x_{sample2}^n", "x_sample2^n"),
+            (r"x_{i+1}^{n-1}", "x_(i+1)^(n−1)"),
+            (r"x_{i_j}^{n^2}", "x_(i_j)^(n²)"),
+            (r"e^{-x^2}", "e^(−x²)"),
+            (r"x_{12}^{-2}", "x₁₂⁻²"),
+        ] {
+            assert_eq!(render(source).as_deref(), Some(expected), "{source}");
+        }
     }
 
     #[test]
