@@ -249,6 +249,7 @@ fn narrow_header_preserves_complete_mark_and_phase() {
         (UiPhase::WaitingInput, "input"),
         (UiPhase::WaitingApproval, "approval"),
         (UiPhase::Cancelling, "stopping"),
+        (UiPhase::Unknown, "unknown"),
         (UiPhase::Completed, "replied"),
         (UiPhase::Incomplete, "incomplete"),
         (UiPhase::Failed, "failed"),
@@ -260,6 +261,35 @@ fn narrow_header_preserves_complete_mark_and_phase() {
         let header = text.lines().rev().nth(1).unwrap();
         assert!(header.contains("_>."), "{header}");
         assert!(header.contains(label), "{header}");
+    }
+}
+
+#[test]
+fn unknown_run_shows_recovery_controls_without_a_working_or_stopping_spinner() {
+    let mut state = UiState::new("session", "model");
+    update(
+        &mut state,
+        UiMsg::RunStarted {
+            run_id: "run".into(),
+        },
+    );
+    update(&mut state, UiMsg::InsertText("progress?".into()));
+    update(&mut state, UiMsg::Stopping);
+    update(
+        &mut state,
+        UiMsg::ContinuityUnknown {
+            reason: "storage failed".into(),
+        },
+    );
+    for width in [40, 100] {
+        let text = render_to_string(&state, width, 16);
+        assert!(text.contains("unknown"), "{text}");
+        assert!(text.contains("/resume"), "{text}");
+        assert!(text.contains("progress?"), "{text}");
+        assert!(
+            !text.contains("Working") && !text.contains("Stopping"),
+            "{text}"
+        );
     }
 }
 

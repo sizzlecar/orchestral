@@ -25,6 +25,9 @@ use orchestral_core::agent_protocol::{
 use orchestral_runtime::{AgentClient, AgentController};
 use tokio::sync::Notify;
 
+#[path = "agent_controller/stream_failure.rs"]
+mod stream_failure;
+
 struct RecoveryOrderProvider {
     inner: Arc<dyn AgentProvider>,
     journal: Arc<InMemoryAgentJournalStore>,

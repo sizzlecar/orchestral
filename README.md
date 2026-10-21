@@ -184,6 +184,10 @@ orchestral "Find the bug, fix it, and run the relevant tests."
 orchestral resume --last
 ```
 
+If the TUI shows `unknown`, Run continuity needs reconciliation. Your draft is
+preserved; use `/resume` to reattach, or Ctrl+C / `/quit` to exit. A lost connection
+or journal write failure is not treated as successful completion.
+
 Use `orchestral serve --pair` for browser access.
 The PWA opens on Codex and shows the two newest sessions, with tabs for Claude Code and
 Orch. Each pane loads recent messages first. On phones, one bottom composer targets the

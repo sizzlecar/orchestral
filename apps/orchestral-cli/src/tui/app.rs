@@ -1090,12 +1090,15 @@ async fn reconcile_active(
         AgentRunState::Stopping => {
             update(state, UiMsg::Stopping);
         }
-        AgentRunState::Unknown { reason, .. } => notice(
-            state,
-            "continuity-unknown",
-            format!("Run continuity is unknown: {reason}"),
-            true,
-        ),
+        AgentRunState::Unknown { reason, .. } => {
+            update(
+                state,
+                UiMsg::ContinuityUnknown {
+                    reason: reason.clone(),
+                },
+            );
+            return Ok(true);
+        }
         AgentRunState::Terminal { terminal } => {
             project_terminal_view(
                 state,

@@ -371,6 +371,7 @@ pub(super) fn poison_run_after_checkpoint_failure(
     failure: AgentFailure,
 ) -> AgentProtocolError {
     let error = checkpoint_stream_error(failure);
+    run.checkpoint_error = Some(error.clone());
     run.terminal = true;
     run.cancellation.cancel();
     let _ = run.sender.send(Err(error.clone()));

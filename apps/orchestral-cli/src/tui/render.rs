@@ -1194,6 +1194,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 "enter · ^C stop",
             ),
             UiPhase::Cancelling => ("stopping…", "stopping…"),
+            UiPhase::Unknown => ("/resume to reconcile · ctrl+c exit", "/resume · ^C exit"),
             _ => ("enter send · / commands · f1 help", "enter · / · F1"),
         }
     };
@@ -1456,7 +1457,7 @@ fn phase_style(phase: UiPhase) -> Style {
         UiPhase::Running => ACCENT,
         UiPhase::WaitingInput => USER,
         UiPhase::WaitingApproval => Style::new().fg(Color::Yellow),
-        UiPhase::Cancelling | UiPhase::Cancelled | UiPhase::Incomplete => {
+        UiPhase::Cancelling | UiPhase::Cancelled | UiPhase::Incomplete | UiPhase::Unknown => {
             Style::new().fg(Color::Yellow)
         }
         UiPhase::Failed => ERROR,
@@ -1470,6 +1471,7 @@ fn phase_badge(phase: UiPhase) -> (&'static str, &'static str) {
         UiPhase::WaitingInput => ("?", "input"),
         UiPhase::WaitingApproval => ("!", "approval"),
         UiPhase::Cancelling => ("◌", "stopping"),
+        UiPhase::Unknown => ("?", "unknown"),
         UiPhase::Completed => ("○", "replied"),
         UiPhase::Incomplete => ("○", "incomplete"),
         UiPhase::Failed => ("×", "failed"),

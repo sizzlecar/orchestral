@@ -334,6 +334,7 @@ struct GenericRun {
     durable_events: Vec<AgentEventDraft>,
     sender: broadcast::Sender<Result<AgentProviderStreamItem, AgentProtocolError>>,
     terminal: bool,
+    checkpoint_error: Option<AgentProtocolError>,
     cancellation: CancellationToken,
     stop_cause: Arc<AtomicU8>,
     cancel_command: Option<(CommandId, String)>,

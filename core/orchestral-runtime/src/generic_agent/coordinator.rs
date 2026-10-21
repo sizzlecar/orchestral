@@ -110,6 +110,7 @@ impl InternalGenericAgentProvider {
                 durable_events: Vec::new(),
                 sender,
                 terminal: false,
+                checkpoint_error: None,
                 cancellation: cancellation.clone(),
                 stop_cause,
                 cancel_command: None,
