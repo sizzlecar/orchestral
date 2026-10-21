@@ -66,6 +66,7 @@ struct RunEntry {
     execution: AgentExecutionRef,
     reducer: AgentRunReducer,
     journal: Vec<AgentJournalRecord>,
+    pending_continuity_loss: Option<String>,
 }
 
 struct RunSlot {
@@ -277,6 +278,7 @@ impl AgentController {
                 execution: start.execution.clone(),
                 reducer,
                 journal: journal.clone(),
+                pending_continuity_loss: None,
             }),
             recovery_gate: Mutex::new(()),
             events,
@@ -297,7 +299,9 @@ impl AgentController {
     /// Returns the bounded Host projection for a Run.
     pub async fn inspect(&self, run_id: &RunId) -> Result<AgentRunView, AgentControlError> {
         let slot = self.run_slot(run_id).await?;
-        let view = slot.entry.lock().await.reducer.view();
+        let mut entry = slot.entry.lock().await;
+        self.flush_continuity_loss(&slot, &mut entry).await?;
+        let view = entry.reducer.view();
         Ok(view)
     }
 
@@ -364,7 +368,9 @@ impl AgentController {
         run_id: &RunId,
         after_run_seq: u64,
     ) -> Result<Vec<AgentJournalRecord>, AgentControlError> {
-        self.run_slot(run_id).await?;
+        let slot = self.run_slot(run_id).await?;
+        self.flush_continuity_loss(&slot, &mut *slot.entry.lock().await)
+            .await?;
         Ok(self.journal_store.records(run_id, after_run_seq).await?)
     }
 
@@ -398,6 +404,7 @@ impl AgentController {
         }
         let slot = self.run_slot(&command.run_id).await?;
         let mut entry = slot.entry.lock().await;
+        self.flush_continuity_loss(&slot, &mut entry).await?;
         if entry
             .reducer
             .recorded_command(&command.command_id)
@@ -525,7 +532,8 @@ impl AgentController {
             last_confirmed_seq,
             loss_event_digest,
         ) = {
-            let entry = slot.entry.lock().await;
+            let mut entry = slot.entry.lock().await;
+            self.flush_continuity_loss(&slot, &mut entry).await?;
             let AgentRunState::Unknown {
                 last_confirmed_seq, ..
             } = entry.reducer.state()
@@ -721,44 +729,29 @@ impl AgentController {
         // before returning, so callers inspecting immediately after recover see
         // the authoritative terminal state.
         let mut reached_terminal = false;
-        while let Some(Some(Ok(AgentProviderStreamItem::Event(draft)))) =
-            futures_util::FutureExt::now_or_never(stream.next())
-        {
-            let mut entry = slot.entry.lock().await;
-            let mut next_reducer = entry.reducer.clone();
-            match next_reducer.apply_provider_draft(*draft) {
-                Ok(sequenced) => {
-                    if let Err(error) = self
-                        .commit_sequenced(&slot, &mut entry, next_reducer, sequenced)
-                        .await
-                    {
-                        drop(entry);
-                        let _ = self
-                            .mark_continuity_lost(
-                                run_id,
-                                &slot,
-                                format!("Provider event could not be journaled: {error}"),
-                            )
-                            .await;
-                        reached_terminal = true;
-                        break;
-                    }
-                    if entry.reducer.state().is_terminal()
-                        || entry.reducer.state().status() == AgentRunStatus::Unknown
-                    {
-                        reached_terminal = true;
-                        break;
-                    }
+        loop {
+            let item = match futures_util::FutureExt::now_or_never(stream.next()) {
+                None => break,
+                Some(None) => {
+                    self.mark_continuity_lost(
+                        run_id,
+                        &slot,
+                        "Provider stream ended before an authoritative terminal".to_owned(),
+                    )
+                    .await?;
+                    reached_terminal = true;
+                    break;
                 }
-                Err(error) => {
-                    drop(entry);
-                    let _ = self
-                        .mark_continuity_lost(
-                            run_id,
-                            &slot,
-                            format!("Provider event was rejected: {error}"),
-                        )
-                        .await;
+                Some(Some(item)) => item,
+            };
+            match self.apply_stream_item(run_id, &slot, item).await {
+                Ok(true) => {
+                    reached_terminal = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(reason) => {
+                    self.mark_continuity_lost(run_id, &slot, reason).await?;
                     reached_terminal = true;
                     break;
                 }
@@ -787,7 +780,10 @@ impl AgentController {
         let slot = self.run_slot(run_id).await?;
         loop {
             let changed = slot.changed.notified();
-            let view = slot.entry.lock().await.reducer.view();
+            let mut entry = slot.entry.lock().await;
+            self.flush_continuity_loss(&slot, &mut entry).await?;
+            let view = entry.reducer.view();
+            drop(entry);
             if view.state.is_terminal() {
                 return Ok(view);
             }
@@ -859,6 +855,7 @@ impl AgentController {
                 execution: registration.execution.clone(),
                 reducer,
                 journal: stored.records,
+                pending_continuity_loss: None,
             }),
             recovery_gate: Mutex::new(()),
             events,
@@ -885,55 +882,51 @@ impl AgentController {
     ) {
         let mut end_reason = "Provider stream ended before an authoritative terminal".to_owned();
         while let Some(item) = stream.next().await {
-            match item {
-                Ok(AgentProviderStreamItem::Event(draft)) => {
-                    let mut entry = slot.entry.lock().await;
-                    let mut next_reducer = entry.reducer.clone();
-                    match next_reducer.apply_provider_draft(*draft) {
-                        Ok(sequenced) => {
-                            if let Err(error) = self
-                                .commit_sequenced(&slot, &mut entry, next_reducer, sequenced)
-                                .await
-                            {
-                                end_reason =
-                                    format!("Provider event could not be journaled: {error}");
-                                break;
-                            }
-                            if entry.reducer.state().is_terminal()
-                                || entry.reducer.state().status() == AgentRunStatus::Unknown
-                            {
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            end_reason = format!("Provider event was rejected: {error}");
-                            break;
-                        }
-                    }
-                }
-                Ok(AgentProviderStreamItem::Telemetry(telemetry)) => {
-                    if let Err(error) = telemetry.validate_integrity() {
-                        end_reason = format!("Provider telemetry was invalid: {error}");
-                        break;
-                    }
-                    if telemetry.run_id != run_id {
-                        end_reason = "Provider telemetry crossed a Run boundary".to_owned();
-                        break;
-                    }
-                    slot.publish(AgentControlEvent::Telemetry(telemetry));
-                }
-                Ok(_) => {
-                    end_reason = "Provider emitted an unsupported stream item".to_owned();
-                    break;
-                }
-                Err(error) => {
-                    end_reason = format!("Provider stream failed: {error}");
+            match self.apply_stream_item(&run_id, &slot, item).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(reason) => {
+                    end_reason = reason;
                     break;
                 }
             }
         }
         if let Err(error) = self.mark_continuity_lost(&run_id, &slot, end_reason).await {
             tracing::error!(run_id = %run_id, error = %error, "failed to journal continuity loss");
+        }
+    }
+
+    async fn apply_stream_item(
+        &self,
+        run_id: &RunId,
+        slot: &RunSlot,
+        item: Result<AgentProviderStreamItem, AgentProtocolError>,
+    ) -> Result<bool, String> {
+        match item {
+            Ok(AgentProviderStreamItem::Event(draft)) => {
+                let mut entry = slot.entry.lock().await;
+                let mut next_reducer = entry.reducer.clone();
+                let sequenced = next_reducer
+                    .apply_provider_draft(*draft)
+                    .map_err(|error| format!("Provider event was rejected: {error}"))?;
+                self.commit_sequenced(slot, &mut entry, next_reducer, sequenced)
+                    .await
+                    .map_err(|error| format!("Provider event could not be journaled: {error}"))?;
+                Ok(entry.reducer.state().is_terminal()
+                    || entry.reducer.state().status() == AgentRunStatus::Unknown)
+            }
+            Ok(AgentProviderStreamItem::Telemetry(telemetry)) => {
+                telemetry
+                    .validate_integrity()
+                    .map_err(|error| format!("Provider telemetry was invalid: {error}"))?;
+                if telemetry.run_id != *run_id {
+                    return Err("Provider telemetry crossed a Run boundary".to_owned());
+                }
+                slot.publish(AgentControlEvent::Telemetry(telemetry));
+                Ok(false)
+            }
+            Ok(_) => Err("Provider emitted an unsupported stream item".to_owned()),
+            Err(error) => Err(format!("Provider stream failed: {error}")),
         }
     }
 
@@ -968,10 +961,42 @@ impl AgentController {
         reason: String,
     ) -> Result<(), AgentControlError> {
         let mut entry = slot.entry.lock().await;
+        debug_assert_eq!(&entry.execution.run_id, run_id);
+        // Retain the first failure if journaling it also fails. Inspection
+        // retries it rather than reporting Running after the driver stopped.
+        entry.pending_continuity_loss.get_or_insert(reason);
+        slot.changed.notify_waiters();
+        self.flush_continuity_loss(slot, &mut entry).await
+    }
+
+    async fn flush_continuity_loss(
+        &self,
+        slot: &RunSlot,
+        entry: &mut RunEntry,
+    ) -> Result<(), AgentControlError> {
+        let Some(reason) = entry.pending_continuity_loss.clone() else {
+            return Ok(());
+        };
+        // A failed append can have committed before reporting an I/O error.
+        // Replay that durable suffix before deciding continuity was lost.
+        let after = entry.reducer.view().last_run_seq.unwrap_or(0);
+        for record in self
+            .journal_store
+            .records(&entry.execution.run_id, after)
+            .await?
+        {
+            let mut next_reducer = entry.reducer.clone();
+            next_reducer.replay_journal_record(record.clone())?;
+            entry.reducer = next_reducer;
+            entry.journal.push(record.clone());
+            slot.publish(AgentControlEvent::Durable(Arc::new(record)));
+        }
         let view = entry.reducer.view();
         if view.state.is_terminal() || view.state.status() == AgentRunStatus::Unknown {
+            entry.pending_continuity_loss = None;
             return Ok(());
         }
+        let run_id = &entry.execution.run_id;
         let last_confirmed_seq = view.last_run_seq.unwrap_or(0);
         let draft = AgentEventDraft {
             event_id: AgentEventId::new(format!(
@@ -989,8 +1014,9 @@ impl AgentController {
         };
         let mut next_reducer = entry.reducer.clone();
         let sequenced = next_reducer.apply_host_draft(draft)?;
-        self.commit_sequenced(slot, &mut entry, next_reducer, sequenced)
+        self.commit_sequenced(slot, entry, next_reducer, sequenced)
             .await?;
+        entry.pending_continuity_loss = None;
         Ok(())
     }
 }

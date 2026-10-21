@@ -60,6 +60,9 @@ impl InternalGenericAgentProvider {
                     duplicate: true,
                 });
             }
+            if let Some(error) = &run.checkpoint_error {
+                return Err(error.clone());
+            }
             if !run.terminal && run.stop_cause.load(Ordering::SeqCst) != RUN_STOP_RUNNING {
                 return record_command(
                     &self.inner,

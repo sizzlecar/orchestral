@@ -6968,7 +6968,7 @@ async fn provider_event_wal_failure_is_not_published_and_host_becomes_unknown() 
     );
     let controller = Arc::new(
         AgentController::new(
-            provider,
+            provider.clone(),
             ProviderBindingRef::new("provider-wal-failure-binding"),
         )
         .expect("controller binds the Generic Agent"),
@@ -6981,6 +6981,12 @@ async fn provider_event_wal_failure_is_not_published_and_host_becomes_unknown() 
     )
     .expect("valid text Run");
 
+    let request = AgentStartRequest::new(
+        run.clone(),
+        ProviderBindingRef::new("provider-wal-failure-binding"),
+        &provider.describe(),
+    )
+    .unwrap();
     let execution = controller.start(run).await.expect("Run admission succeeds");
     let wait_error = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -7026,6 +7032,22 @@ async fn provider_event_wal_failure_is_not_published_and_host_becomes_unknown() 
         projection.phase,
         GenericCheckpointPhase::Stable(_)
     ));
+    let command = AgentCommandEnvelope::new(
+        CommandId::new("after-checkpoint-failure"),
+        run_id.clone(),
+        None,
+        AgentCommand::Cancel {
+            reason: "stop".into(),
+        },
+    )
+    .unwrap();
+    let error = provider.command(&execution, command).await.unwrap_err();
+    assert_eq!(error.code, AgentProtocolErrorCode::ProviderUnavailable);
+    assert!(!error.message.contains("already terminal"));
+    let mut replay = provider.start(request).await.unwrap().stream;
+    let error = replay.next().await.unwrap().unwrap_err();
+    assert_eq!(error.code, AgentProtocolErrorCode::ProviderUnavailable);
+    assert_eq!(checkpoint_store.load_run(&run_id).unwrap().unwrap(), stored);
 }
 
 #[tokio::test]

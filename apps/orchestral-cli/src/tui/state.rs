@@ -15,6 +15,7 @@ pub(crate) enum UiPhase {
     WaitingInput,
     WaitingApproval,
     Cancelling,
+    Unknown,
     Completed,
     Incomplete,
     Failed,
@@ -294,6 +295,9 @@ pub(crate) enum UiMsg {
         request_id: String,
     },
     Stopping,
+    ContinuityUnknown {
+        reason: String,
+    },
     Notice {
         id: String,
         message: String,
@@ -931,6 +935,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::ScrollApproval(_) => {}
         UiMsg::Approval(choice) => return resolve_approval(state, choice),
+        UiMsg::Cancel if state.phase == UiPhase::Unknown => return vec![UiEffect::Quit],
         UiMsg::Cancel if state.phase.accepts_new_run() => {
             if state.composer.is_empty() {
                 state.ui_notice = Some("Ctrl+D or /quit to exit".to_owned());
@@ -941,7 +946,9 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::Cancel => return cancel(state),
         UiMsg::Quit => {
-            if state.phase.accepts_new_run() && !state.host_busy {
+            if (state.phase.accepts_new_run() || state.phase == UiPhase::Unknown)
+                && !state.host_busy
+            {
                 return vec![UiEffect::Quit];
             }
             state.exit_requested = true;
@@ -960,7 +967,7 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                 .saturating_add(rows.min(isize::MAX as usize) as isize)
         }
         UiMsg::Tick { now } => {
-            if state.run_id.is_some() {
+            if state.run_id.is_some() && state.phase != UiPhase::Unknown {
                 if matches!(state.phase, UiPhase::Running | UiPhase::Cancelling) {
                     if let Some(last_tick) = state.last_tick {
                         state.working_elapsed += now.saturating_duration_since(last_tick);
@@ -1207,6 +1214,20 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
                 state.transcript.push(entry);
             }
         }
+        UiMsg::ContinuityUnknown { reason } => {
+            state.restore_question_draft();
+            state.pending = None;
+            state.request_submission = None;
+            state.working_detail = None;
+            state.last_tick = None;
+            state.phase = UiPhase::Unknown;
+            super::input_queue::detach_edit(state);
+            update(state, UiMsg::Notice {
+                id: "continuity-unknown".to_owned(),
+                message: format!("Run state unknown: {reason}. Use /resume to reconcile before sending more input; your draft is preserved."),
+                is_error: true,
+            });
+        }
         UiMsg::Completed { final_text } => {
             state.request_submission = None;
             state.restore_question_draft();
@@ -1336,6 +1357,12 @@ fn submit(state: &mut UiState, immediately: bool) -> Vec<UiEffect> {
         }
         return vec![UiEffect::HostCommand { command }];
     }
+    if state.phase == UiPhase::Unknown {
+        state.ui_notice = Some(
+            "Use /resume to reconcile the interrupted Run; your draft is preserved".to_owned(),
+        );
+        return Vec::new();
+    }
     if state.phase != UiPhase::WaitingInput && state.composer.starts_with("//") {
         state.composer.remove(0);
         state.composer_cursor = state.composer_cursor.saturating_sub(1);
@@ -1451,6 +1478,40 @@ mod tests {
     fn type_and_submit(state: &mut UiState, text: &str) -> Vec<UiEffect> {
         update(state, UiMsg::InsertText(text.to_owned()));
         update(state, UiMsg::Submit)
+    }
+
+    #[test]
+    fn unknown_continuity_preserves_draft_stops_clock_and_allows_quit() {
+        let mut state = UiState::new("session", "model");
+        update(
+            &mut state,
+            UiMsg::RunStarted {
+                run_id: "run".into(),
+            },
+        );
+        update(&mut state, UiMsg::InsertText("progress?".into()));
+        update(
+            &mut state,
+            UiMsg::ContinuityUnknown {
+                reason: "journal unavailable".into(),
+            },
+        );
+        update(
+            &mut state,
+            UiMsg::Tick {
+                now: Instant::now(),
+            },
+        );
+        assert_eq!(state.phase, UiPhase::Unknown);
+        assert_eq!(state.run_id.as_deref(), Some("run"));
+        assert_eq!(state.composer, "progress?");
+        assert!(state.last_tick.is_none());
+        assert!(!state.phase.accepts_new_run());
+        assert!(update(&mut state, UiMsg::Submit).is_empty());
+        assert!(update(&mut state, UiMsg::SubmitImmediately).is_empty());
+        assert_eq!(state.composer, "progress?");
+        assert_eq!(update(&mut state, UiMsg::Cancel), vec![UiEffect::Quit]);
+        assert_eq!(update(&mut state, UiMsg::Quit), vec![UiEffect::Quit]);
     }
 
     #[test]

@@ -176,6 +176,10 @@ orchestral "定位并修复这个问题，运行相关测试。"
 orchestral resume --last
 ```
 
+如果 TUI 显示 `unknown`，表示运行状态需要重新确认。输入草稿会保留；
+可以用 `/resume` 恢复，或 Ctrl+C / `/quit` 退出。
+连接中断或日志写入失败不会被当作任务成功完成。
+
 需要浏览器访问时，运行 `orchestral serve --pair`。
 PWA 默认打开 Codex，展示最近两个会话，并可切换 Claude Code 和 Orch。
 各窗格优先加载最近消息；手机上共用一个底部输入框，向选中的窗格发送消息，

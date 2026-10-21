@@ -340,6 +340,7 @@ pub(super) fn stage_loop_recovery(
     );
     let (steer_signal, steer_updates) = watch::channel(0_u64);
     let run = GenericRun {
+        checkpoint_error: None,
         request: request.clone(),
         execution: execution.clone(),
         admission: admission.clone(),

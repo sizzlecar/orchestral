@@ -397,6 +397,11 @@ impl InternalGenericAgentProvider {
             .into_iter()
             .map(|draft| Ok(AgentProviderStreamItem::Event(Box::new(draft))));
         let replay_stream = stream::iter(replay);
+        if let Some(error) = &run.checkpoint_error {
+            return replay_stream
+                .chain(stream::iter([Err(error.clone())]))
+                .boxed();
+        }
         if run.terminal {
             return replay_stream.boxed();
         }
