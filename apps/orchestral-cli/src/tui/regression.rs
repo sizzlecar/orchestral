@@ -1,6 +1,77 @@
 use super::{update, UiEffect, UiMsg, UiPhase, UiState};
 
 #[test]
+fn interleaved_outputs_keep_their_position_around_follow_up_input() {
+    let mut state = UiState::new("session", "model");
+    update(
+        &mut state,
+        UiMsg::RemoteRunStarted {
+            run_id: "run".into(),
+            input: "Initial request".into(),
+        },
+    );
+    let delta = |id: &str, output: &str, order, text: &str| UiMsg::StreamDelta {
+        delta_id: id.into(),
+        output_id: output.into(),
+        order,
+        text: text.into(),
+    };
+    update(&mut state, delta("old-2", "old", 2, "tail"));
+    update(&mut state, UiMsg::InsertText("Follow-up request".into()));
+    assert!(matches!(
+        update(&mut state, UiMsg::SubmitImmediately).as_slice(),
+        [UiEffect::Steer { .. }]
+    ));
+    update(&mut state, delta("new-1", "new", 1, "New partial"));
+    update(&mut state, delta("old-1", "old", 1, "Old "));
+    assert!(state.committed_assistant_text().is_none());
+    assert_eq!(
+        state.streaming_text(&state.transcript[1]).as_deref(),
+        Some("Old tail")
+    );
+    assert_eq!(
+        state.streaming_text(&state.transcript[3]).as_deref(),
+        Some("New partial")
+    );
+    update(
+        &mut state,
+        UiMsg::OutputCommitted {
+            output_id: "old".into(),
+            text: "Canonical old response".into(),
+        },
+    );
+    update(&mut state, delta("old-late", "old", 3, "must not reappear"));
+    assert_eq!(
+        state.committed_assistant_text(),
+        Some("Canonical old response")
+    );
+    assert_eq!(
+        state.streaming_text(&state.transcript[3]).as_deref(),
+        Some("New partial")
+    );
+    update(
+        &mut state,
+        UiMsg::Completed {
+            final_text: Some("Canonical new response".into()),
+        },
+    );
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Initial request",
+            "Canonical old response",
+            "Follow-up request",
+            "Canonical new response"
+        ]
+    );
+    assert_eq!(state.phase, UiPhase::Completed);
+}
+
+#[test]
 fn pending_question_preserves_draft_and_treats_slash_as_answer() {
     let mut state = UiState::new("session", "model");
     update(

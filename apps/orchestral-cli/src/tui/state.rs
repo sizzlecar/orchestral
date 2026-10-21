@@ -365,8 +365,8 @@ pub(crate) struct UiState {
     request_submission: Option<RequestSubmission>,
     resolved_requests: BTreeSet<String>,
     composer_origin: ComposerOrigin,
-    stream_output_id: Option<String>,
-    stream_chunks: BTreeMap<u64, String>,
+    stream_outputs: BTreeMap<String, BTreeMap<u64, String>>,
+    committed_output_ids: BTreeSet<String>,
     seen_delta_ids: BTreeSet<String>,
     seen_summary_delta_ids: BTreeSet<String>,
     activity_reducer: ActivityReducer,
@@ -424,8 +424,8 @@ impl UiState {
             request_submission: None,
             resolved_requests: BTreeSet::new(),
             composer_origin: ComposerOrigin::Edited,
-            stream_output_id: None,
-            stream_chunks: BTreeMap::new(),
+            stream_outputs: BTreeMap::new(),
+            committed_output_ids: BTreeSet::new(),
             seen_delta_ids: BTreeSet::new(),
             seen_summary_delta_ids: BTreeSet::new(),
             activity_reducer: ActivityReducer::default(),
@@ -435,14 +435,28 @@ impl UiState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn streamed_text(&self) -> String {
-        self.stream_chunks.values().cloned().collect()
+        self.stream_outputs
+            .values()
+            .flat_map(|chunks| chunks.values())
+            .cloned()
+            .collect()
     }
 
-    pub(crate) fn stream_key(&self) -> String {
-        self.stream_output_id
+    pub(crate) fn streaming_text(&self, entry: &TranscriptEntry) -> Option<String> {
+        entry
+            .id
             .as_ref()
-            .map_or_else(|| "stream".to_owned(), |id| format!("output:{id}"))
+            .and_then(|id| self.stream_outputs.get(id))
+            .map(|chunks| chunks.values().cloned().collect())
+    }
+
+    pub(crate) fn is_streaming_entry(&self, entry: &TranscriptEntry) -> bool {
+        entry
+            .id
+            .as_ref()
+            .is_some_and(|id| self.stream_outputs.contains_key(id))
     }
 
     fn restore_question_draft(&mut self) {
@@ -505,12 +519,15 @@ impl UiState {
         self.active_processes.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn committed_assistant_text(&self) -> Option<&str> {
         self.transcript
             .iter()
             .rev()
-            .find(|entry| entry.role == TranscriptRole::Assistant)
+            .find(|entry| {
+                entry.role == TranscriptRole::Assistant
+                    && !self.is_streaming_entry(entry)
+                    && !entry.text.is_empty()
+            })
             .map(|entry| entry.text.as_str())
     }
 
@@ -577,8 +594,19 @@ impl UiState {
     }
 
     fn clear_stream(&mut self) {
-        self.stream_output_id = None;
-        self.stream_chunks.clear();
+        // Keep observed partial output at its original transcript position.
+        // Only OutputCommitted replaces it with authoritative content.
+        for (index, entry) in self.transcript.iter_mut().enumerate() {
+            if let Some(chunks) = entry
+                .id
+                .as_ref()
+                .and_then(|id| self.stream_outputs.remove(id))
+            {
+                entry.text = chunks.into_values().collect();
+                self.transcript_dirty_from = self.transcript_dirty_from.min(index);
+            }
+        }
+        self.stream_outputs.clear();
         self.seen_delta_ids.clear();
     }
 
@@ -729,6 +757,8 @@ impl UiState {
 
     fn commit_output(&mut self, output_id: String, text: String) {
         let id = format!("output:{output_id}");
+        self.committed_output_ids.insert(output_id);
+        self.stream_outputs.remove(&id);
         if let Some((index, entry)) = self
             .transcript
             .iter_mut()
@@ -740,7 +770,6 @@ impl UiState {
         } else {
             self.transcript.push(TranscriptEntry::assistant(id, text));
         }
-        self.clear_stream();
         self.viewport.changed();
     }
 
@@ -990,6 +1019,8 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
         }
         UiMsg::RunStarted { run_id } => {
             if state.run_id.as_deref() != Some(run_id.as_str()) {
+                state.clear_stream();
+                state.committed_output_ids.clear();
                 state.seen_summary_delta_ids.clear();
                 state.context_input_tokens = None;
                 state.working_detail = None;
@@ -1012,12 +1043,29 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             text,
         } => {
             state.working_detail = None;
-            if state.stream_output_id.as_deref() != Some(output_id.as_str()) {
-                state.clear_stream();
-                state.stream_output_id = Some(output_id);
+            if text.is_empty() || state.committed_output_ids.contains(&output_id) {
+                return Vec::new();
             }
             if state.seen_delta_ids.insert(delta_id) {
-                state.stream_chunks.entry(order).or_insert(text);
+                let id = format!("output:{output_id}");
+                state
+                    .stream_outputs
+                    .entry(id.clone())
+                    .or_default()
+                    .entry(order)
+                    .or_insert(text);
+                let index = state
+                    .transcript
+                    .iter()
+                    .position(|entry| entry.id.as_deref() == Some(&id))
+                    .unwrap_or_else(|| {
+                        let index = state.transcript.len();
+                        state
+                            .transcript
+                            .push(TranscriptEntry::assistant(id, String::new()));
+                        index
+                    });
+                state.transcript_dirty_from = state.transcript_dirty_from.min(index);
                 state.viewport.changed();
             }
         }
@@ -1232,10 +1280,10 @@ pub(crate) fn update(state: &mut UiState, msg: UiMsg) -> Vec<UiEffect> {
             state.request_submission = None;
             state.restore_question_draft();
             state.settle_tools(ToolActivityState::Succeeded);
+            state.clear_stream();
             if let Some(final_text) = final_text {
                 state.reconcile_delivery(final_text);
             }
-            state.clear_stream();
             state.pending = None;
             state.working_detail = None;
             state.active_processes.clear();
@@ -1312,6 +1360,7 @@ fn begin_run(state: &mut UiState, input: String) {
     state.request_submission = None;
     state.resolved_requests.clear();
     state.clear_stream();
+    state.committed_output_ids.clear();
     state.pending = None;
     state.working_detail = None;
     state.working_elapsed = Duration::ZERO;

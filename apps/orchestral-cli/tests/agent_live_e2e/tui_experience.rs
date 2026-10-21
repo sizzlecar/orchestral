@@ -74,6 +74,11 @@ fn tui_welcome_and_editable_queue_follow_real_runtime_consumption() {
                 && screen.contains("Queued requirement received")
                 && screen.contains("last input: 123")
                 && !screen.contains("Queued 1")
+                && screen
+                    .find("Original response completed")
+                    .zip(screen.find("Revised queued requirement"))
+                    .zip(screen.find("Queued requirement received"))
+                    .is_some_and(|((old, input), new)| old < input && input < new)
         },
         LOCAL_PROCESS_TIMEOUT,
     );

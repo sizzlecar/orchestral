@@ -265,6 +265,109 @@ fn narrow_header_preserves_complete_mark_and_phase() {
 }
 
 #[test]
+fn streamed_responses_stay_before_later_user_input_through_commit_and_resize() {
+    let mut state = UiState::new("session", "model");
+    update(
+        &mut state,
+        UiMsg::RemoteRunStarted {
+            run_id: "run".into(),
+            input: "Initial request".into(),
+        },
+    );
+    let original = (0..24)
+        .map(|i| format!("Earlier response paragraph {i:02}."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    update(
+        &mut state,
+        UiMsg::StreamDelta {
+            delta_id: "old".into(),
+            output_id: "old-response".into(),
+            order: 1,
+            text: original.clone(),
+        },
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    let mut cache = super::RenderCache::default();
+    super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+    state.transcript_dirty_from = state.transcript.len();
+    update(&mut state, UiMsg::InsertText("Later follow-up".into()));
+    update(&mut state, UiMsg::SubmitImmediately);
+    update(
+        &mut state,
+        UiMsg::StreamDelta {
+            delta_id: "new".into(),
+            output_id: "new-response".into(),
+            order: 2,
+            text: "New response to the follow-up.".into(),
+        },
+    );
+    super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+    let body = cache
+        .rows
+        .iter()
+        .map(|row| row.text.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ordered = |text: &str| {
+        let positions = [
+            "Earlier response paragraph 23.",
+            "Later follow-up",
+            "New response to the follow-up.",
+        ]
+        .map(|needle| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {text}"))
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+    };
+    ordered(&body);
+    assert!(
+        !super::tests::buffer_to_string(terminal.backend().scrollback())
+            .contains("Earlier response paragraph")
+    );
+    state.transcript_dirty_from = state.transcript.len();
+    update(
+        &mut state,
+        UiMsg::OutputCommitted {
+            output_id: "old-response".into(),
+            text: original,
+        },
+    );
+    super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+    state.transcript_dirty_from = state.transcript.len();
+    let combined = format!(
+        "{}{}",
+        super::tests::buffer_to_string(terminal.backend().scrollback()),
+        super::tests::buffer_to_string(terminal.backend().buffer())
+    );
+    ordered(&combined);
+    for needle in [
+        "Earlier response paragraph 00.",
+        "Later follow-up",
+        "New response to the follow-up.",
+    ] {
+        assert_eq!(combined.matches(needle).count(), 1, "{combined}");
+    }
+    terminal.backend_mut().resize(60, 16);
+    super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+    let mut fresh = super::RenderCache::default();
+    super::update_transcript_cache(&state, &mut fresh, 60 - 2 * super::CONTENT_PADDING);
+    assert_eq!(
+        cache
+            .rows
+            .iter()
+            .map(|row| (&row.anchor, row.text.to_string()))
+            .collect::<Vec<_>>(),
+        fresh
+            .rows
+            .iter()
+            .map(|row| (&row.anchor, row.text.to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unknown_run_shows_recovery_controls_without_a_working_or_stopping_spinner() {
     let mut state = UiState::new("session", "model");
     update(
