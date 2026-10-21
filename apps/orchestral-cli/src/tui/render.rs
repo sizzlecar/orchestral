@@ -557,7 +557,11 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
             if index > 0 && should_separate(state.transcript[index - 1].role, entry.role) {
                 lines.push(Line::default());
             }
-            push_entry_lines(&mut lines, entry, width, state.tools_expanded, false);
+            if let Some(stream) = state.streaming_text(entry) {
+                push_markdown(&mut lines, "• ", &stream, ASSISTANT, true, width);
+            } else {
+                push_entry_lines(&mut lines, entry, width, state.tools_expanded, false);
+            }
             for summary in &state.transcript[index + 1..end] {
                 push_entry_lines(&mut lines, summary, width, state.tools_expanded, true);
             }
@@ -569,18 +573,22 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
             index = end;
         }
         cache.committed_rows = cache.rows.len();
-        let stream = state.streamed_text();
+        let has_stream = state
+            .transcript
+            .iter()
+            .any(|entry| state.is_streaming_entry(entry));
         let first_unsettled = state
             .transcript
             .iter()
             .enumerate()
             .position(|(idx, entry)| {
-                (entry.role == TranscriptRole::Tool
-                    && entry.tool_status == Some(ActivityStatus::Running))
+                state.is_streaming_entry(entry)
+                    || (entry.role == TranscriptRole::Tool
+                        && entry.tool_status == Some(ActivityStatus::Running))
                     || (entry.role == TranscriptRole::Reasoning
                         && idx + 1 == state.transcript.len()
                         && matches!(state.phase, UiPhase::Running)
-                        && stream.is_empty())
+                        && !has_stream)
             });
         cache.settled_rows = first_unsettled
             .and_then(|idx| cache.offsets.get(idx).copied())
@@ -593,16 +601,7 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
             settled_entries,
             &cache.scrollback_cursor,
         );
-        if !stream.is_empty() {
-            let mut lines = Vec::new();
-            if !cache.rows.is_empty() {
-                lines.push(Line::default());
-            }
-            push_markdown(&mut lines, "• ", &stream, ASSISTANT, true, width);
-            cache
-                .rows
-                .extend(viewport::wrap(state.stream_key(), lines, width as usize));
-        } else if cache.rows.is_empty() {
+        if cache.rows.is_empty() {
             cache.rows.extend(viewport::wrap(
                 "welcome",
                 vec![
@@ -2343,7 +2342,7 @@ mod tests {
         );
     }
 
-    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+    pub(super) fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
         let width = buffer.area.width;
         let height = buffer.area.height;
         let mut output = String::new();

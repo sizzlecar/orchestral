@@ -9,23 +9,28 @@ pub(super) enum DeliveryCommit {
     AlreadyTerminal,
 }
 
+pub(super) fn model_output_id(run_id: &RunId, round: u64) -> OutputId {
+    OutputId::new(format!("generic-{}-response-{round}", run_id.as_str()))
+}
+
 pub(super) fn try_emit_delivery(
     inner: &GenericInner,
     request: &AgentStartRequest,
+    round: u64,
     response: String,
     usage: Option<ModelUsage>,
     tool_calls: u64,
     mut supporting_event_ids: Vec<AgentEventId>,
 ) -> DeliveryCommit {
     let run_id = &request.run.spec.run_id;
-    let output_event_id = AgentEventId::new(format!("generic-{}-output", run_id.as_str()));
+    let output_event_id = AgentEventId::new(format!("generic-{}-output-{round}", run_id.as_str()));
     let output = AgentEventDraft {
         event_id: output_event_id.clone(),
         run_id: run_id.clone(),
         causation_id: None,
         source_fingerprint: None,
         payload: AgentEvent::OutputCommitted {
-            output_id: OutputId::new(format!("generic-{}-response", run_id.as_str())),
+            output_id: model_output_id(run_id, round),
             content: vec![Content::text(response.clone())],
         },
     };
@@ -64,6 +69,18 @@ pub(super) fn try_emit_delivery(
         return DeliveryCommit::TerminationPending;
     }
     if !run.queued_steers.is_empty() {
+        // This response precedes the pending input even though the Run must
+        // continue. Commit it before InputCommitted can advance the turn.
+        if let Err(failure) =
+            checkpoint_provider_events(inner, run, run_id, std::slice::from_ref(&output))
+        {
+            poison_run_after_checkpoint_failure(run, failure);
+            return DeliveryCommit::CheckpointFailed;
+        }
+        run.durable_events.push(output.clone());
+        let _ = run
+            .sender
+            .send(Ok(AgentProviderStreamItem::Event(Box::new(output))));
         return DeliveryCommit::SteerPending;
     }
     if !run.pending_inputs.is_empty() || !run.pending_approvals.is_empty() {

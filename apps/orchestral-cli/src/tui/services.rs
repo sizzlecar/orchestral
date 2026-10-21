@@ -168,12 +168,7 @@ impl Tasks {
         let tx = self.sender.clone();
         let session = state.session_id.clone();
         let current_run = state.run_id.clone();
-        let copy = state
-            .transcript
-            .iter()
-            .rev()
-            .find(|entry| entry.role == super::state::TranscriptRole::Assistant)
-            .map(|entry| entry.text.clone());
+        let copy = state.committed_assistant_text().map(str::to_owned);
         self.task = Some(tokio::spawn(async move {
             let response = match action {
                 Some(action) => local_action(&host, &session, action)

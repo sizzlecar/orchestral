@@ -438,10 +438,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                             run_id: run_id.clone(),
                             provider_seq: Some(event.sequence),
                             payload: AgentTelemetry::OutputDelta {
-                                output_id: OutputId::new(format!(
-                                    "generic-{}-response",
-                                    run_id.as_str()
-                                )),
+                                output_id: model_output_id(&run_id, round),
                                 delta: Content::text(delta),
                             },
                         },
@@ -606,6 +603,7 @@ pub(super) async fn execute_model_run(execution: ModelRunExecution) {
                             match try_emit_delivery(
                                 &inner,
                                 &request,
+                                round,
                                 response.clone(),
                                 has_usage.then_some(total_usage.clone()),
                                 tool_call_count,
