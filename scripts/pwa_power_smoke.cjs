@@ -34,6 +34,7 @@ async function checkPower({ page, primary, secondary, sessions, requests, publis
   await page.evaluate(() => setFixtureHidden(true));
   await wait(() => !sessions.get("codex-1").streams.size && !sessions.get("codex-2").streams.size);
   const backgroundReads = requests.length;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
   for (let index = 1; index <= 12; index++) {
     publish(sessions.get("codex-1"), `上屏后台进度 ${index}`);
     publish(sessions.get("codex-2"), `下屏后台进度 ${index}`);

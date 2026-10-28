@@ -3299,7 +3299,9 @@ impl AppController {
             let mut controller = self;
             controller.state.write().connection.online = true;
             let refresh = controller;
-            self.spawn(async move { refresh.load_workspace().await });
+            if platform::is_document_visible() {
+                self.spawn(async move { refresh.load_workspace().await });
+            }
         }) {
             listeners.push(listener);
         }
