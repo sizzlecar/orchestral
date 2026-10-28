@@ -155,6 +155,7 @@ pub struct AppController {
     pub agent_session_stream_abort: Signal<Option<web_sys::AbortController>>,
     pub agent_session_stream_generation: Signal<u64>,
     agent_session_reconcile: Signal<AgentSessionReconcileCoordinator>,
+    session_snapshot_etag: Signal<Option<(String, String)>>,
     pub install_event: Signal<Option<JsValue>>,
     api: ApiClient,
 }
@@ -184,6 +185,7 @@ impl AppController {
             agent_session_stream_abort: streams.agent_session_abort,
             agent_session_stream_generation: streams.agent_session_generation,
             agent_session_reconcile: streams.agent_session_reconcile,
+            session_snapshot_etag: Signal::new(None),
             install_event,
             api: ApiClient,
         }
@@ -205,6 +207,7 @@ impl AppController {
             agent_session_stream_abort: streams.agent_session_abort,
             agent_session_stream_generation: streams.agent_session_generation,
             agent_session_reconcile: streams.agent_session_reconcile,
+            session_snapshot_etag: Signal::new(None),
             ..self
         }
     }
@@ -2319,6 +2322,10 @@ impl AppController {
     }
 
     fn resume_live_transport_for_selection(self, initial_observer_errors: u32) {
+        if !platform::is_document_visible() {
+            self.stop_stream();
+            return;
+        }
         let plan = live_transport_plan(&self.state.read());
         if plan.agent_session.is_some() {
             self.start_selected_agent_observer(initial_observer_errors);
@@ -2343,6 +2350,9 @@ impl AppController {
     // a later terminal turn is discovered without a page reload.
     fn start_builtin_session_observer(mut self, session_id: String) {
         self.stop_agent_session_observer();
+        if !platform::is_document_visible() {
+            return;
+        }
         let Ok(controller) = web_sys::AbortController::new() else {
             self.notice("浏览器无法启动会话自动刷新", "error");
             return;
@@ -2468,7 +2478,9 @@ impl AppController {
         initial_errors: u32,
     ) {
         self.stop_agent_session_observer();
-        if !agent_observation_is_current(&self.state.read(), &target) {
+        if !platform::is_document_visible()
+            || !agent_observation_is_current(&self.state.read(), &target)
+        {
             return;
         }
         let Ok(controller) = web_sys::AbortController::new() else {
@@ -2678,17 +2690,25 @@ impl AppController {
             self.schedule_agent_session_reconciliation(target, generation, signal);
             return Ok(());
         }
-
-        let current = self.state.read().clone();
-        let follow_timeline = !current.ui.timeline_scrolled_away;
-        let mut next = current.clone();
-        let timeline_before = next.selected_timeline_content();
-        next.apply_agent_session_change(change, platform::now() as i64);
-        mark_observation_healthy(&mut next, "live");
-        let timeline_changed = timeline_before != next.selected_timeline_content();
-        if next != current {
-            self.state.set(next);
+        if change.sequence > 0
+            && self
+                .state
+                .peek()
+                .sessions
+                .stream_cursors
+                .get(&target.session_key)
+                .is_some_and(|cursor| change.sequence <= *cursor)
+        {
+            return Ok(());
         }
+
+        let (follow_timeline, timeline_changed) = {
+            let mut state = self.state.write();
+            let follow = !state.ui.timeline_scrolled_away;
+            let changed = state.apply_agent_session_change(change, platform::now() as i64);
+            mark_observation_healthy(&mut state, "live");
+            (follow, changed)
+        };
         if timeline_changed && follow_timeline {
             self.follow_timeline_after_render();
         }
@@ -2759,14 +2779,21 @@ impl AppController {
         let Some(token) = self.token.read().clone() else {
             return Ok(());
         };
-        let detail = self
+        let etag = self
+            .session_snapshot_etag
+            .peek()
+            .as_ref()
+            .filter(|(key, _)| key == &target.session_key)
+            .map(|(_, etag)| etag.clone());
+        let observation = self
             .api
-            .agent_session(
+            .observe_agent_session(
                 &token,
                 &target.connector_id,
                 &target.session_id,
-                None,
                 AGENT_HISTORY_PAGE_LIMIT,
+                &signal,
+                etag.as_deref(),
             )
             .await?;
         if signal.aborted()
@@ -2775,16 +2802,30 @@ impl AppController {
         {
             return Ok(());
         }
-        let current = self.state.read().clone();
-        let follow_timeline = !current.ui.timeline_scrolled_away;
-        let mut next = current.clone();
-        let timeline_before = next.selected_timeline_content();
-        next.project_agent_session(detail);
-        mark_observation_healthy(&mut next, "live");
-        let timeline_changed = timeline_before != next.selected_timeline_content();
-        if next != current {
-            self.state.set(next);
-        }
+        let (detail, etag) = match observation {
+            AgentSessionObservation::NotModified { etag } => (None, etag),
+            AgentSessionObservation::Modified { detail, etag } => (Some(detail), etag),
+        };
+        self.session_snapshot_etag
+            .set(etag.map(|etag| (target.session_key, etag)));
+        let Some(detail) = detail else {
+            let state = self.state.peek();
+            let needs_update = state.connection.stream != "live"
+                || state.connection.attempt != 0
+                || state.connection.error.is_some();
+            drop(state);
+            if needs_update {
+                mark_observation_healthy(&mut self.state.write(), "live");
+            }
+            return Ok(());
+        };
+        let (follow_timeline, timeline_changed) = {
+            let mut state = self.state.write();
+            let follow = !state.ui.timeline_scrolled_away;
+            let changed = state.project_agent_session(*detail);
+            mark_observation_healthy(&mut state, "live");
+            (follow, changed)
+        };
         if timeline_changed && follow_timeline {
             self.follow_timeline_after_render();
         }
@@ -2867,19 +2908,16 @@ impl AppController {
                 }) => {
                     etag = next_etag;
                     let next_session_state = detail.summary.state.clone();
-                    let current = self.state.read().clone();
-                    if !agent_observation_is_current(&current, &target) {
+                    if !agent_observation_is_current(&self.state.read(), &target) {
                         return;
                     }
-                    let follow_timeline = !current.ui.timeline_scrolled_away;
-                    let mut next = current.clone();
-                    let timeline_before = next.selected_timeline_content();
-                    next.project_agent_session(*detail);
-                    mark_observation_healthy(&mut next, "observing");
-                    let timeline_changed = timeline_before != next.selected_timeline_content();
-                    if next != current {
-                        self.state.set(next);
-                    }
+                    let (follow_timeline, timeline_changed) = {
+                        let mut state = self.state.write();
+                        let follow = !state.ui.timeline_scrolled_away;
+                        let changed = state.project_agent_session(*detail);
+                        mark_observation_healthy(&mut state, "observing");
+                        (follow, changed)
+                    };
                     if timeline_changed && follow_timeline {
                         self.follow_timeline_after_render();
                     }
@@ -2924,6 +2962,9 @@ impl AppController {
 
     pub fn start_stream(mut self, run_id: String) {
         self.stop_run_stream();
+        if !platform::is_document_visible() {
+            return;
+        }
         let Ok(controller) = web_sys::AbortController::new() else {
             self.notice("浏览器无法建立可取消的实时连接", "error");
             return;
@@ -3266,13 +3307,29 @@ impl AppController {
             if let Ok(listener) = platform::add_window_listener(event_name, move |_| {
                 if platform::is_document_visible() && platform::is_online() {
                     self.resume_live_transport_for_selection(0);
+                    let target = selected_agent_observation_target(&self.state.read());
+                    let controller = self.agent_session_stream_abort.read().clone();
+                    if let (Some(target), Some(controller)) = (target, controller) {
+                        self.schedule_agent_session_reconciliation(
+                            target,
+                            *self.agent_session_stream_generation.read(),
+                            controller.signal(),
+                        );
+                    }
                     self.spawn(async move {
                         self.flush_outbox().await;
                     });
+                } else if !platform::is_document_visible() {
+                    self.stop_stream();
                 }
             }) {
                 listeners.push(listener);
             }
+        }
+        if let Ok(listener) = platform::add_window_listener("pagehide", move |_| {
+            self.stop_stream();
+        }) {
+            listeners.push(listener);
         }
         if let Ok(listener) = platform::add_window_listener("offline", move |_| {
             let mut controller = self;
@@ -3315,9 +3372,8 @@ impl AppController {
 
     pub fn update_timeline_scroll_state(mut self) {
         let scrolled_away = !platform::timeline_should_follow(self.timeline_scope);
-        let mut state = self.state.write();
-        if state.ui.timeline_scrolled_away != scrolled_away {
-            state.ui.timeline_scrolled_away = scrolled_away;
+        if self.state.peek().ui.timeline_scrolled_away != scrolled_away {
+            self.state.write().ui.timeline_scrolled_away = scrolled_away;
         }
     }
 
