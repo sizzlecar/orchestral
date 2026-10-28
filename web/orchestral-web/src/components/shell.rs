@@ -490,7 +490,9 @@ fn RunStatusBadge(
     use_future(move || async move {
         loop {
             TimeoutFuture::new(1_000).await;
-            now.set(js_sys::Date::now());
+            if platform::is_document_visible() {
+                now.set(js_sys::Date::now());
+            }
         }
     });
     let status = session_run_label(

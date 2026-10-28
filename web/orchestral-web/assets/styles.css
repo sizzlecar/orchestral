@@ -960,7 +960,7 @@ svg {
 .run-status[data-state="running"] .run-status__pulse,
 .run-status[data-state="working"] .run-status__pulse {
   background: var(--accent);
-  animation: status-pulse 1.4s ease-in-out infinite;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 .run-status[data-state="waiting"],
@@ -990,13 +990,6 @@ svg {
 
 .run-status[data-state="error"] .run-status__pulse {
   background: var(--danger);
-}
-
-@keyframes status-pulse {
-  50% {
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 15%, transparent);
-    opacity: 0.72;
-  }
 }
 
 .timeline-stage {

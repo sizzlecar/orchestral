@@ -6,6 +6,7 @@ const assert = require("node:assert/strict");
 const { chromium, webkit } = require("playwright");
 const dist = process.env.PWA_SMOKE_DIST || path.join(process.cwd(), "web/orchestral-web/dist");
 const mobileLayout = process.env.PWA_SMOKE_MOBILE_LAYOUT === "1";
+const powerSmoke = process.env.PWA_SMOKE_POWER === "1";
 const width = Number(process.env.PWA_SMOKE_WIDTH || 390);
 const now = Date.now();
 const connectorId = product => product === "codex" ? "fixture/editor-a" : "fixture/editor-b";
@@ -60,14 +61,25 @@ const server = http.createServer(async (req, res) => {
       if (!session) return json(res, { code: "missing_session" }, 404);
       assert.equal(url.searchParams.get("connector_id"), connectorId(session.product));
       requests.push({ route, session: session.id });
-      if (route === "/agent-session") return json(res, detail(session));
+      if (route === "/agent-session") {
+        if (powerSmoke) {
+          const etag = `"${session.id}-${session.changes.length}"`;
+          res.setHeader("ETag", etag);
+          if (req.headers["if-none-match"] === etag) {
+            requests.at(-1).notModified = true;
+            res.writeHead(304); return res.end();
+          }
+        }
+        return json(res, detail(session));
+      }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
       res.write(": ready\n\n");
       for (const event of session.changes.filter(event => event.sequence > Number(url.searchParams.get("after") || 0))) {
         res.write(`id: ${event.sequence}\nevent: session_changed\ndata: ${JSON.stringify(event)}\n\n`);
       }
       session.streams.add(res);
-      res.on("close", () => session.streams.delete(res));
+      const heartbeat = powerSmoke ? setInterval(() => res.write(": keep-alive\n\n"), 1000) : null;
+      res.on("close", () => { session.streams.delete(res); clearInterval(heartbeat); });
       return;
     }
     if (route === "/agent-session/actions" && req.method === "POST") {
@@ -105,6 +117,7 @@ const server = http.createServer(async (req, res) => {
   const context = await browser.newContext({ viewport: { width, height: 844 }, isMobile: width < 600, hasTouch: true, serviceWorkers: "block", colorScheme: mobileLayout ? "dark" : "light" });
   const page = await context.newPage(), errors = [];
   if (mobileLayout) await require("./pwa_mobile_layout_smoke.cjs").installViewportFixture(page);
+  if (powerSmoke) await require("./pwa_power_smoke.cjs").installPowerFixture(page);
   page.on("pageerror", error => errors.push(error.message));
   page.on("console", message => {
     if (message.type() === "error" && message.text().includes("Orchestral browser error:")) errors.push(message.text());
@@ -128,6 +141,12 @@ const server = http.createServer(async (req, res) => {
     const primaryBox = await primary.boundingBox(), secondaryBox = await secondary.boundingBox();
     assert.ok(primaryBox.y + primaryBox.height <= secondaryBox.y + 2, "sessions occupy independent top and bottom panes");
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+
+    if (powerSmoke) {
+      await require("./pwa_power_smoke.cjs").checkPower({ page, primary, secondary, sessions, requests, publish, wait });
+      assert.deepEqual(errors, []);
+      return;
+    }
 
     if (mobileLayout) {
       await require("./pwa_mobile_layout_smoke.cjs").checkMobileLayout({ page, primary, secondary, sessions, submissions, publish, wait, width });

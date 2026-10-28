@@ -22,6 +22,11 @@ Orch sessions initially load their latest 20 Runs, newest first, while displayin
 them chronologically. Earlier Runs are loaded on demand with the reading position
 preserved. Run event streams remain complete for correct protocol reduction.
 
+When the page is hidden or leaves the foreground, browser session and Run
+streams pause. Host-owned execution continues. Returning to the page refreshes
+native history and resumes observation without clearing drafts or loaded history.
+Idle status badges are static, and unchanged heartbeat snapshots use HTTP ETags.
+
 ## Boundaries
 
 - `state.rs` is the deterministic reducer and timeline projection.
@@ -69,6 +74,7 @@ node scripts/pwa_browser_smoke.cjs
 node scripts/pwa_local_host_smoke.cjs
 node scripts/pwa_dual_session_smoke.cjs
 node scripts/pwa_history_sync_smoke.cjs
+node scripts/pwa_power_smoke.cjs
 node scripts/pwa_draft_smoke.cjs
 node scripts/pwa_mobile_layout_smoke.cjs
 PWA_SMOKE_ENGINE=webkit node scripts/pwa_mobile_layout_smoke.cjs
@@ -95,6 +101,10 @@ The history-sync smoke advances the native transcript without sending a session
 event, while the SSE connection continues receiving heartbeats. It checks that
 bounded snapshot reconciliation restores intermediate and final replies, retries
 a failed read, preserves loaded older pages, and backfills after reconnection.
+
+The power smoke checks that an idle mobile layout stops continuous style
+recalculation, unchanged snapshots return 304, hidden panes detach their streams
+and stop polling, and foreground restoration preserves history and drafts.
 
 The image-message smoke uploads real image bytes and reconciles the local
 preview, HTTP acknowledgement, durable input event, refreshed signed attachment
