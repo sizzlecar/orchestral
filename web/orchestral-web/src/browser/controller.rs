@@ -2540,6 +2540,16 @@ impl AppController {
             let refresh_controller = self;
             let refresh_target = target.clone();
             let refresh_signal = controller.signal();
+            if consecutive_errors > 0 {
+                // Event replay repairs known sequence gaps. Also refresh the
+                // transcript after reconnecting: a native writer can persist
+                // items while no notification reaches the Host subscription.
+                self.schedule_agent_session_reconciliation(
+                    target.clone(),
+                    generation,
+                    controller.signal(),
+                );
+            }
             let after = self
                 .state
                 .read()

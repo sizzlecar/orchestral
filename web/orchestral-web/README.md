@@ -68,6 +68,7 @@ Run from the repository root:
 node scripts/pwa_browser_smoke.cjs
 node scripts/pwa_local_host_smoke.cjs
 node scripts/pwa_dual_session_smoke.cjs
+node scripts/pwa_history_sync_smoke.cjs
 node scripts/pwa_draft_smoke.cjs
 node scripts/pwa_mobile_layout_smoke.cjs
 PWA_SMOKE_ENGINE=webkit node scripts/pwa_mobile_layout_smoke.cjs
@@ -89,6 +90,11 @@ that uploads completing after a session moves between panes remain visible.
 The mobile layout fixture checks measured reading space, one shared composer,
 keyboard viewport resize/scroll, sending-target transfer, and rotation in
 Chromium and WebKit. It simulates viewport events rather than a physical keyboard.
+
+The history-sync smoke advances the native transcript without sending a session
+event, while the SSE connection continues receiving heartbeats. It checks that
+bounded snapshot reconciliation restores intermediate and final replies, retries
+a failed read, preserves loaded older pages, and backfills after reconnection.
 
 The image-message smoke uploads real image bytes and reconciles the local
 preview, HTTP acknowledgement, durable input event, refreshed signed attachment
