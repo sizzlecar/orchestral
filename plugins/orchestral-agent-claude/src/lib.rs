@@ -683,6 +683,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_history_pages_cross_compaction_boundaries_without_gaps() {
+        use orchestral_core::agent_connector::AgentSessionReadQuery;
+
+        let root = tempfile::tempdir().unwrap();
+        let connector = connector(root.path());
+        let project = connector.config.config_dir.join("projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = AgentSessionId::new(uuid::Uuid::new_v4().to_string());
+        let records = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"message":{"content":"first question"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"first answer"}],"stop_reason":"end_turn"}}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"a1"}),
+            json!({"type":"user","uuid":"u2","parentUuid":"compact","message":{"content":"second question"}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","message":{"content":[{"type":"text","text":"second answer"}],"stop_reason":"end_turn"}}),
+        ];
+        std::fs::write(
+            project.join(format!("{id}.jsonl")),
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let mut cursor = None;
+        let mut pages = Vec::new();
+        loop {
+            let page = connector
+                .read_session_page(&id, AgentSessionReadQuery { cursor, limit: 2 })
+                .await
+                .unwrap();
+            cursor = page.next_cursor;
+            pages.push(
+                page.turns
+                    .into_iter()
+                    .flat_map(|turn| turn.activities)
+                    .map(|activity| activity.activity_id.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+            );
+            assert!(pages.len() <= 3, "pagination must terminate");
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(pages.len(), 3);
+        assert_eq!(
+            pages.into_iter().rev().flatten().collect::<Vec<_>>(),
+            [
+                "claude:u1",
+                "claude:a1:0",
+                "claude:compact",
+                "claude:u2",
+                "claude:a2:0"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn discovers_native_transcripts_filters_pages_and_preserves_created_sessions() {
         let root = tempfile::tempdir().unwrap();
         let connector = connector(root.path());
