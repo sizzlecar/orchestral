@@ -82,21 +82,21 @@ fn conversation(records: &[Value]) -> Vec<&Value> {
         .collect();
     let by_id: HashMap<_, _> = messages
         .iter()
-        .filter_map(|record| {
+        .enumerate()
+        .filter_map(|(position, record)| {
             record
                 .get("uuid")
                 .and_then(Value::as_str)
-                .map(|id| (id, *record))
+                .map(|id| (id, (position, *record)))
         })
         .collect();
     let Some(last) = messages.last() else {
         return Vec::new();
     };
     // Older exports have no ancestry. Preserve their append order.
-    if !last
-        .get("parentUuid")
-        .is_some_and(|value| value.is_string())
-    {
+    if messages.iter().all(|record| {
+        record.get("parentUuid").is_none() && record.get("logicalParentUuid").is_none()
+    }) {
         return messages;
     }
     let mut ids = HashSet::new();
@@ -105,10 +105,36 @@ fn conversation(records: &[Value]) -> Vec<&Value> {
         if !ids.insert(id) {
             break;
         }
-        next = by_id
-            .get(id)
-            .and_then(|record| record.get("parentUuid"))
-            .and_then(Value::as_str);
+        next = by_id.get(id).and_then(|(position, record)| {
+            record
+                .get("parentUuid")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    if record.get("type").and_then(Value::as_str) != Some("system")
+                        || record.get("subtype").and_then(Value::as_str) != Some("compact_boundary")
+                    {
+                        return None;
+                    }
+                    // Compaction resets the model-context ancestry, while
+                    // logicalParentUuid retains the transcript ancestry.
+                    // Preserved messages can be rewritten after the boundary
+                    // with new parents, so only follow pre-boundary records.
+                    // Their retained segment head still links to older history
+                    // when the logical tail was moved into the summary chain.
+                    [
+                        record.get("logicalParentUuid"),
+                        record.pointer("/compactMetadata/preservedSegment/headUuid"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .find(|candidate| {
+                        by_id
+                            .get(candidate)
+                            .is_some_and(|(parent_position, _)| parent_position < position)
+                    })
+                })
+        });
     }
     messages
         .into_iter()
@@ -392,6 +418,85 @@ mod tests {
             vec![Content::text("selected")]
         );
         assert_eq!(turns[0].status, AgentSessionTurnStatus::Completed);
+    }
+
+    fn conversation_ids(records: &[Value]) -> Vec<&str> {
+        conversation(records)
+            .into_iter()
+            .map(|record| record["uuid"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn compaction_keeps_transcript_ancestry_across_multiple_context_resets() {
+        let records = vec![
+            json!({"type":"user","uuid":"u1","parentUuid":null,"message":{"content":"first question"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"first answer"}]}}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":null,"logicalParentUuid":"a1"}),
+            json!({"type":"user","uuid":"u2","parentUuid":"c1","message":{"content":"second question"}}),
+            json!({"type":"assistant","uuid":"discarded","parentUuid":"u2"}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","message":{"content":[{"type":"text","text":"second answer"}]}}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"c2","parentUuid":null,"logicalParentUuid":"a2"}),
+            json!({"type":"user","uuid":"u3","parentUuid":"c2","message":{"content":"third question"}}),
+        ];
+        assert_eq!(
+            conversation_ids(&records),
+            ["u1", "a1", "c1", "u2", "a2", "c2", "u3"]
+        );
+        assert_eq!(turns(&records).len(), 3);
+    }
+
+    #[test]
+    fn compaction_follows_retained_head_when_logical_tail_was_reparented() {
+        let records = vec![
+            json!({"type":"user","uuid":"u1","parentUuid":null}),
+            json!({"type":"assistant","uuid":"discarded","parentUuid":"u1"}),
+            json!({"type":"assistant","uuid":"head","parentUuid":"u1"}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"tail","compactMetadata":{"preservedSegment":{"headUuid":"head","tailUuid":"tail","anchorUuid":"summary"}}}),
+            json!({"type":"user","uuid":"summary","parentUuid":"compact","isCompactSummary":true}),
+            json!({"type":"attachment","uuid":"tail","parentUuid":"summary"}),
+            json!({"type":"assistant","uuid":"latest","parentUuid":"tail"}),
+        ];
+        assert_eq!(
+            conversation_ids(&records),
+            ["u1", "head", "compact", "summary", "tail", "latest"]
+        );
+    }
+
+    #[test]
+    fn missing_compaction_ancestors_do_not_include_unrelated_branches() {
+        let records = vec![
+            json!({"type":"user","uuid":"unrelated","parentUuid":null}),
+            json!({"type":"assistant","uuid":"sidechain","isSidechain":true,"parentUuid":"unrelated"}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"missing","compactMetadata":{"preservedSegment":{"headUuid":"sidechain"}}}),
+            json!({"type":"user","uuid":"latest","parentUuid":"compact"}),
+        ];
+        assert_eq!(conversation_ids(&records), ["compact", "latest"]);
+    }
+
+    #[test]
+    fn compaction_as_latest_record_keeps_only_its_selected_ancestry() {
+        let records = vec![
+            json!({"type":"user","uuid":"u1","parentUuid":null}),
+            json!({"type":"assistant","uuid":"selected","parentUuid":"u1"}),
+            json!({"type":"assistant","uuid":"discarded","parentUuid":"u1"}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"selected"}),
+        ];
+        assert_eq!(conversation_ids(&records), ["u1", "selected", "compact"]);
+    }
+
+    #[test]
+    fn explicit_root_and_legacy_records_have_distinct_ancestry_semantics() {
+        let records = vec![
+            json!({"type":"user","uuid":"old","parentUuid":null}),
+            json!({"type":"user","uuid":"root","parentUuid":null}),
+        ];
+        assert_eq!(conversation_ids(&records), ["root"]);
+        let legacy = vec![
+            json!({"type":"user","uuid":"first"}),
+            json!({"type":"assistant","uuid":"second"}),
+        ];
+        assert_eq!(conversation_ids(&legacy), ["first", "second"]);
     }
 
     #[test]
