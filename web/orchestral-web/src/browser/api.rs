@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use wasm_bindgen::JsValue;
 
-use crate::browser::platform::new_uuid;
+use crate::browser::platform::{new_uuid, now};
 use crate::model::{
     AgentConnectorView, AgentSessionActionOutcome, AgentSessionChangeKindView,
     AgentSessionChangeView, AgentSessionDetail, AgentSessionPage, AgentSessionSummary, DeviceView,
@@ -18,6 +18,7 @@ use crate::model::{
 use crate::sse::{SessionSequenceDisposition, SessionSequenceGuard, SseParser};
 
 const API_BASE: &str = "/api/v1";
+const SESSION_HEARTBEAT_RECONCILE_INTERVAL_MS: f64 = 5_000.0;
 
 pub struct AgentInputRequest<'a> {
     pub text: &'a str,
@@ -588,6 +589,7 @@ impl ApiClient {
         let mut stream = wasm_streams::ReadableStream::from_raw(body).into_stream();
         let mut parser = SseParser::default();
         let mut sequence_guard = SessionSequenceGuard::with_cursor(after);
+        let mut last_heartbeat_reconcile = now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| ApiError::transport(js_message(&error)))?;
             let bytes = Uint8Array::new(&chunk).to_vec();
@@ -641,6 +643,28 @@ impl ApiClient {
                             code: "session_stream_failed".to_owned(),
                             details: None,
                         });
+                    }
+                    StreamEvent::KeepAlive => {
+                        let observed_at = now();
+                        if observed_at - last_heartbeat_reconcile
+                            >= SESSION_HEARTBEAT_RECONCILE_INTERVAL_MS
+                        {
+                            last_heartbeat_reconcile = observed_at;
+                            // A live HTTP connection proves transport health,
+                            // not that every native transcript item reached
+                            // the notification stream. Reconcile the bounded
+                            // snapshot on idle heartbeats, including after a
+                            // previous reconciliation request failed.
+                            on_change(AgentSessionChangeView {
+                                connector_id: connector_id.to_owned(),
+                                session_id: session_id.to_owned(),
+                                sequence: after,
+                                change: AgentSessionChangeKindView::RefreshRequired {
+                                    reason: "session_stream_heartbeat".to_owned(),
+                                },
+                            })
+                            .await?;
+                        }
                     }
                     _ => {}
                 }
