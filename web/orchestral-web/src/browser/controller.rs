@@ -2795,13 +2795,14 @@ impl AppController {
                 &signal,
                 etag.as_deref(),
             )
-            .await?;
+            .await;
         if signal.aborted()
             || *self.agent_session_stream_generation.read() != generation
             || !agent_observation_is_current(&self.state.read(), &target)
         {
             return Ok(());
         }
+        let observation = observation?;
         let (detail, etag) = match observation {
             AgentSessionObservation::NotModified { etag } => (None, etag),
             AgentSessionObservation::Modified { detail, etag } => (Some(detail), etag),
