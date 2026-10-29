@@ -196,8 +196,9 @@ Run；未完成的 Run 先由 Controller 按现有 checkpoint 合同恢复，等
 跨 Run 续聊会在历史条数和 token 预算内优先恢复最近一条被压缩的用户输入；有界摘要
 保留类型化的工具失败状态，但工具执行成功不等于任务已通过验证。
 
-内置 `session_read` 工具允许 Agent 搜索当前会话的原始记录，再按 JSON 字段或分块读取
-完整结果。它不能选择其他会话，且沿用 Host 权限、取消和 Tool Effect 日志。
+内置 `session_read` 工具允许 Agent 搜索当前会话记录的可读投影，再按 JSON 字段或分块读取。
+Provider 私有续接、工具调用的私有扩展和图片二进制数据不向模型开放，原始日志保持不变。
+它不能选择其他会话，且沿用 Host 权限、取消和 Tool Effect 日志。
 来源、分页与恢复兼容性详见 [Session Context and Recall](../../docs/agent-foundation/session-context-v1.md)。
 
 内置 Agent 自动复用现有项目指令。对 `-C` 和每个 `--add-dir` 工作区，从最近的 Git 根目录

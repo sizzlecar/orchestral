@@ -92,13 +92,18 @@ CLI Host 注册 `orchestral/session_read/v1`，模型可见名称为 `session_re
 
 - Session 身份从调用 Run 的 Host registration 解析，不接受模型指定 Session 或日志路径。
 - 查询与读取经过统一 GuardedToolRuntime、Run grant、取消、输出预算和 Tool Effect journal。
-- `query` 是对原始记录 canonical JSON 的大小写不敏感字面搜索。摘要不参与搜索，避免
+- `query` 是对记录的可读投影 canonical JSON 的大小写不敏感字面搜索。摘要不参与搜索，避免
   同一来源以摘要形式重复命中；按 `session_seq` 仍可读取任何记录。
 - `after_seq` 与返回的 `next_after_seq` 是排他分页游标。首次返回 `through_seq`；后续
   复用它固定历史前缀，新追加记录不会改变这一查询范围。
 - 搜索结果包含原始序号、Run、事件类型、完整记录 digest 和明确标记截断的 preview。
-- 使用 `session_seq` 读取完整原始记录，或用 RFC 6901 `json_pointer` 精确选择字段。
-  `content` 是 canonical JSON 的 UTF-8 分块；按 `next_offset` 重组后再解析 JSON。
+- 使用 `session_seq` 读取记录的可读投影，或用 RFC 6901 `json_pointer` 精确选择字段。
+  `content` 是该投影 canonical JSON 的 UTF-8 分块；按 `next_offset` 重组后再解析 JSON。
+- 搜索、preview、整条读取与字段读取使用同一投影。Provider `Continuation`、Tool call 的
+  私有 `extensions` 和图片二进制数据不向模型开放。隐藏的内容槽位保留为 `null`，不改变
+  可读字段的数组索引；直接选择隐藏字段或其子字段会拒绝，读取父字段也不会泄漏它们。
+  普通用户 JSON 与 Tool result 不按字段名称猜测过滤。原始 journal 不被改写，返回的
+  digest 仍标识完整原始记录，不是可读投影的哈希。
 - 单页最多 20 条，输出上限取 Host 预算与 16 KiB 的较小值。单记录内容可持续分块读取。
 - 已提交的回查结果沿用 effect journal 缓存；恢复不会悄悄用更新后的历史替换已观察结果。
 
@@ -113,7 +118,7 @@ CLI Host 注册 `orchestral/session_read/v1`，模型可见名称为 `session_re
 ## 验证
 
 `core/orchestral-runtime/tests/session_recall.rs` 验证权限、会话隔离、固定前缀分页、精确
-字段读取、Unicode 分块和提交结果重放。Session context 单元与属性测试验证原始来源、
+字段读取、Unicode 分块、私有续接隔离和提交结果重放。Session context 单元与属性测试验证原始来源、
 预算、用户修正、失败状态，以及 Tool exchange 原子性。
 
 `apps/orchestral-cli/tests/agent_live_e2e/context_reliability.rs` 实际启动 CLI/TUI，使用受控

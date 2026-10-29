@@ -12,11 +12,13 @@ pub struct SessionReadRequest {
     pub after_seq: u64,
     /// Inclusive immutable upper cursor; reuse the returned value across pages.
     pub through_seq: Option<u64>,
-    /// Case-insensitive literal search over original record JSON.
+    /// Case-insensitive literal search over the model-readable record projection.
     pub query: Option<String>,
-    /// Select one original record for exact, paginated reading.
+    /// Select one record's readable projection for exact, paginated reading.
     pub session_seq: Option<u64>,
-    /// RFC 6901 pointer into that record; omitted means the complete record.
+    /// RFC 6901 pointer into that projection; omitted means the complete view.
+    /// Provider-owned state and inline image bytes are unavailable. Redacted
+    /// content slots remain null so visible content indexes do not shift.
     pub json_pointer: Option<String>,
     /// UTF-8 byte offset into the selected value's canonical JSON.
     #[serde(default)]
@@ -28,7 +30,7 @@ pub struct SessionReadRequest {
 }
 
 /// One search hit. Preview text is explicitly incomplete; use its sequence
-/// with `session_read` to inspect original fields and full content.
+/// with `session_read` to inspect readable fields and full visible content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionReadHit {
@@ -51,7 +53,8 @@ pub struct SessionReadPage {
 }
 
 /// Exact UTF-8 chunk of canonical JSON, suitable for reassembly. The digest
-/// identifies the entire original record, even when selecting one JSON field.
+/// identifies the entire original record, even when selecting a projected JSON
+/// field. It is a provenance digest, not the hash of the returned readable view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionReadChunk {

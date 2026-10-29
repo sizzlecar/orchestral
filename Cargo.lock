@@ -2336,6 +2336,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
+
+[[package]]
 name = "include_dir"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3330,8 +3336,10 @@ name = "orchestral-model-openai"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
+ "imagesize",
  "orchestral-core",
  "orchestral-model-protocol-testkit",
  "reqwest 0.12.28",

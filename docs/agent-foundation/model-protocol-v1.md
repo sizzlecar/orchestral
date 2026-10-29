@@ -86,6 +86,15 @@ function_call 顺序及加密内容，不重复编码同一条 canonical 文本�
 只有 completed/incomplete terminal response 才提交 Continuation 和 Finish；截断、取消和
 失败不能将流中已出现的工具片段提交为完成。usage 与推理摘要分别映射为标准事件。
 
+Continuation 仅用于适配器续接。TUI 恢复历史只显示 canonical 可读内容，不把原生 output
+数组再次渲染为回答；Session 回查也不开放其私有字段。完整续接仍保留在 journal 中。
+
+两种 OpenAI API 的软上下文规划都将图片 Base64 视为传输数据，按解码后的图片尺寸估算
+图像开销（32×32 patches，每 patch 3 个规划 token），而不把编码字符串当正文。该估算不
+声明任何模型容量或精确视觉 token 数，不按模型名称选择算法；服务的缩放与计量仍可能不同。
+估算最多采用现有保守 wire 上界，实测 usage 可继续校准未改变的请求前缀。严格 input/cost
+预留仍使用保守 wire 计数，发送的原图不变；计量身份包含算法版本以保护恢复一致性。
+
 工具声明在 adapter 内转换为 API 接受的对象投影，不改变 canonical schema 或 Host 权限。
 Host 的组合约束校验保留 `allOf`、`anyOf`、`oneOf`、`not`；具体工具仍执行自己的参数与
 效果校验。协议、schema 编码版本和工具结果编码均参与恢复身份与输入计量。
