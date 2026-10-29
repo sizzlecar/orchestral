@@ -304,7 +304,7 @@ async fn retry_waits_and_durable_failures_keep_attempt_and_cumulative_time() {
     assert!(
         notices
             .iter()
-            .any(|message| message.starts_with("Attempt 1/4 · total 20s")),
+            .any(|message| message == "Waiting for model response (20s)"),
         "{notices:?}"
     );
     assert!(
@@ -316,14 +316,24 @@ async fn retry_waits_and_durable_failures_keep_attempt_and_cumulative_time() {
     assert!(
         notices
             .iter()
-            .any(|message| message.starts_with("Attempt 2/4 · total 37s")),
+            .any(|message| message.starts_with("Retry 1/3 · total 37s")),
         "{notices:?}"
     );
     assert!(
         notices
             .iter()
-            .any(|message| message == "Attempt 2/4 · total 62s · Waiting for model output (10s)"),
+            .any(|message| message == "Retry 1/3 · total 62s · Waiting for model output (10s)"),
         "{notices:?}"
+    );
+    let first_retry = notices
+        .iter()
+        .position(|message| message.contains("retry 1/3"))
+        .unwrap();
+    assert!(
+        notices[..first_retry]
+            .iter()
+            .all(|message| !message.contains("Retry") && !message.contains("Attempt")),
+        "normal waits must not advertise retries: {notices:?}"
     );
     assert_eq!(failure.details["phase"], "response_body");
     assert_eq!(failure.details["send_elapsed_ms"], 25_000);

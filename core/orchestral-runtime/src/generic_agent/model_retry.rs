@@ -248,13 +248,17 @@ fn report_model_wait(
     timing: ModelAttemptTiming,
 ) {
     let run_id = &run.run.spec.run_id;
-    let message = format!(
-        "Attempt {}/{} · total {}s · Waiting for model {phase} ({}s)",
-        timing.attempt_number,
-        timing.max_attempts,
-        timing.request_started.elapsed().as_secs(),
-        elapsed.as_secs(),
-    );
+    let waiting = format!("Waiting for model {phase} ({}s)", elapsed.as_secs());
+    let message = if timing.attempt_number > 1 {
+        format!(
+            "Retry {}/{} · total {}s · {waiting}",
+            timing.attempt_number - 1,
+            timing.max_attempts.saturating_sub(1),
+            timing.request_started.elapsed().as_secs(),
+        )
+    } else {
+        waiting
+    };
     publish_telemetry(
         inner,
         run_id,
