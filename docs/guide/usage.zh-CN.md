@@ -88,11 +88,29 @@ F1 / Ctrl+] 打开命令并保留草稿。`/` 发现命令，`//` 发送以斜�
 请求的输入 token 数；`≈` 表示规划估算，收到服务端用量后更新为实报值。它不是会话累计用量，
 也不是实时 KV 缓存占用。`limit` 是已声明容量与 Host 预算的较小值；未知容量显示 `unknown`。
 
+官方 `api.openai.com` 默认使用 **Responses API**；其他兼容服务默认使用 **Chat Completions**。
+完整 `/responses` 或 `/chat/completions` URL 可直接指定协议，provider 的
+`config.api: responses` 或 `config.api: chat_completions` 可覆盖默认选择。例如：
+
+```sh
+orchestral --base-url https://your-gateway.example/v1/responses --api-key-env LOCAL_MODEL_API_KEY --model your-model-id
+```
+
+Responses 支持流式文本、工具调用、图片、结构化输出，以及加密推理状态的无状态续接。
+推理强度发送为 `reasoning.effort`，输出上限发送为 `max_output_tokens`。除显式选择 `none`
+外，温度保留服务默认值，避免给推理请求注入不支持的采样参数。可选 `sampling.top_p` 交给服务
+验证，其他 Chat Completions 采样扩展在本地报错。Responses 不支持兼容模板的 `on`/`off`
+开关，应选择具体强度或 `default`。每个模型支持哪些强度仍由服务判断。
+工具参数在接口侧投影为非严格对象声明；执行前，Host 仍按完整原始 schema 校验，包括参数
+互斥规则。协议和 schema 编码参与恢复身份校验；恢复旧协议下尚未结束的 Run 时应保留原协议配置。
+
 `/reasoning` 选择当前模型的推理设置，也可使用 `/reasoning <值>` 或启动参数
 `--reasoning <值>`。`default` 保留服务默认行为。Gemini 的菜单使用适配器中的模型能力，
 无需查询 OpenAI 兼容接口，也无需刷新 Google 凭据。Gemini 3 及更新模型按支持范围提供
 `minimal`、`low`、`medium`、`high`；Gemini 2.5 使用动态思考预算的 `on`，Flash 系列还支持
-`off`，Pro 不支持关闭思考。未知模型只列出 `default`，显式原生设置由服务验证。
+`off`，Pro 不支持关闭思考。兼容服务未声明推理能力时，菜单列出常见强度并标注 **Unverified**，
+由服务验证，不能视为模型已支持。服务明确声明的列表（包括空列表）优先；也可通过
+`/reasoning <值>` 输入自定义强度。没有适配器候选值的未知模型仍只列出 `default`。
 
 Google 模型目录在后台更新。启动先用本地缓存或随包目录，不等待下载；更新结果供下次
 切换或启动模型时使用。模型请求等待超过 10 秒时，状态栏显示等待模型响应或输出及耗时，

@@ -154,14 +154,52 @@ async fn reasoning_discovery_errors_remain_distinct_from_unknown_capabilities() 
         json!({"data":[{"id":"model"}]}),
     )])
     .await;
+    let meta = metadata(&endpoint);
+    let menu = reasoning(&meta, "model").await.unwrap();
     assert_eq!(
-        reasoning(&metadata(&endpoint), "model")
-            .await
-            .unwrap()
-            .choices
-            .len(),
-        1
+        menu.choices
+            .iter()
+            .map(|choice| choice.label.as_str())
+            .collect::<Vec<_>>(),
+        ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"]
     );
+    for choice in menu.choices.iter().skip(1) {
+        assert!(choice.description.contains("Unverified"));
+        let selection = serde_json::from_str(&choice.value).unwrap();
+        let mut overrides = ModelOverrides::default();
+        apply_selection(&meta, "model", &mut overrides, selection).unwrap();
+        assert_eq!(overrides.model.as_deref(), Some("model"));
+    }
+}
+
+#[tokio::test]
+async fn declared_empty_reasoning_does_not_offer_unverified_candidates() {
+    let (endpoint, _server) = server(vec![(
+        axum::http::StatusCode::OK,
+        json!({"data":[{"id":"model","reasoning":{"supported_efforts":[]}}]}),
+    )])
+    .await;
+    let menu = reasoning(&metadata(&endpoint), "model").await.unwrap();
+    assert_eq!(menu.choices.len(), 1);
+    assert!(!menu.choices[0].description.contains("not declared"));
+}
+
+#[tokio::test]
+async fn unknown_reasoning_preserves_an_explicit_custom_effort_and_arc_candidates() {
+    let (endpoint, _server) = server(vec![(
+        axum::http::StatusCode::OK,
+        json!({"data":[{"id":"model"}]}),
+    )])
+    .await;
+    let mut meta = metadata(&endpoint);
+    meta.reasoning = ReasoningPreference::from_effort("custom-depth").unwrap();
+    meta.model_controls = Arc::new(meta.model_controls.clone());
+    let menu = reasoning(&meta, "model").await.unwrap();
+    assert!(menu.choices.iter().any(|choice| choice.label == "xhigh"));
+    assert!(menu
+        .choices
+        .iter()
+        .any(|choice| choice.label == "custom-depth"));
 }
 
 #[tokio::test]
@@ -437,8 +475,10 @@ fn binary_reasoning_menu_lists_only_default_on_off_and_marks_unknown_explicitly(
         "selectable choices must not become a read-only detail panel"
     );
     assert!(menu.choices[0].description.contains("not declared"));
-    assert_eq!(menu.choices.len(), 1);
-    assert!(menu.choices[0].description.contains("/reasoning <value>"));
+    assert_eq!(menu.choices.len(), 8);
+    assert!(menu.choices[1..]
+        .iter()
+        .all(|choice| choice.description.contains("Unverified")));
 }
 
 #[test]

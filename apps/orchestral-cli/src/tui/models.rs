@@ -192,10 +192,28 @@ fn reasoning_menu(
     capabilities: &ModelReasoningCapabilities,
 ) -> Menu {
     let declared = capabilities.supported_preferences.is_some();
+    let mut choices = capabilities.choices();
+    if !declared {
+        for value in metadata
+            .model_controls
+            .reasoning_preference_candidates()
+            .into_iter()
+            .chain(std::iter::once(metadata.reasoning.clone()))
+        {
+            if !choices.contains(&value)
+                && metadata
+                    .model_controls
+                    .validate_reasoning_preference(&value)
+                    .is_ok()
+            {
+                choices.push(value);
+            }
+        }
+    }
     Menu::new(
         MenuKind::Models,
         format!("Reasoning · current: {} · {}", metadata.reasoning, model),
-        capabilities.choices()
+        choices
             .into_iter()
             .map(|value| {
                 let description = match &value {
@@ -210,17 +228,17 @@ fn reasoning_menu(
                         "Use service default (thinking off); omit controls"
                     }
                     ReasoningPreference::Default if !declared => {
-                        "Capabilities not declared; use /reasoning <value> or --reasoning for the service to validate an explicit request"
+                        "Service default; model capabilities were not declared"
                     }
                     ReasoningPreference::Default => "Use service default; omit reasoning controls",
+                    _ if !declared => {
+                        "Unverified: the adapter can send this value; the service validates model support"
+                    }
                     ReasoningPreference::On => {
                         "Enable thinking; this is a toggle, not an effort level"
                     }
                     ReasoningPreference::Off => "Disable thinking explicitly",
-                    _ if declared => "Control supported by the current model",
-                    _ => {
-                        "Capability not declared; explicit request will be validated by the service"
-                    }
+                    _ => "Control supported by the current model",
                 };
                 choice(
                     &value.to_string(),

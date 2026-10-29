@@ -309,6 +309,11 @@ fn apply_connection_overrides(
     };
     if let Some(endpoint) = endpoint {
         set_yaml_key(
+            ensure_mapping_entry(&mut connection, "config"),
+            "api",
+            serde_yaml::to_value(endpoint.default_api())?,
+        );
+        set_yaml_key(
             &mut connection,
             "endpoint",
             YamlValue::String(endpoint.base_url().to_owned()),
@@ -499,6 +504,41 @@ fn has_env(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_url_protocol_survives_connection_normalization() {
+        for (url, expected) in [
+            (
+                "https://api.openai.com/v1/chat/completions",
+                "chat_completions",
+            ),
+            ("https://gateway.example/v1/responses", "responses"),
+            ("http://localhost:8000/v1", "chat_completions"),
+        ] {
+            let mut root: YamlValue = serde_yaml::from_str(&embedded_default_config()).unwrap();
+            let config: OrchestralConfig =
+                serde_yaml::from_str(&embedded_default_config()).unwrap();
+            apply_connection_overrides(
+                root.as_mapping_mut().unwrap(),
+                &config,
+                &ModelOverrides {
+                    base_url: Some(url.to_owned()),
+                    no_auth: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let backends = root["providers"]["backends"].as_sequence().unwrap();
+            let backend = backends
+                .iter()
+                .find(|backend| backend["name"] == "cli-openai")
+                .unwrap();
+            assert_eq!(backend["config"]["api"].as_str(), Some(expected));
+            let endpoint = backend["endpoint"].as_str().unwrap();
+            assert!(!endpoint.ends_with("/responses"));
+            assert!(!endpoint.ends_with("/chat/completions"));
+        }
+    }
 
     #[test]
     fn concurrent_generated_configs_preserve_each_process_connection() {

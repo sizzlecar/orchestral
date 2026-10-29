@@ -231,6 +231,10 @@ mod tests {
                     "openai-compatible/continuation".to_owned(),
                     json!(crate::continuation::NAMESPACE)
                 ),
+                (
+                    "openai-compatible/tool-schema".to_owned(),
+                    json!(crate::tool_schema::IDENTITY)
+                ),
             ])
         );
         let resumed = backend().with_tool_result_format(OpenAiToolResultFormat::Json);

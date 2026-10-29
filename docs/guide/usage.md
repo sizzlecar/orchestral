@@ -10,7 +10,7 @@ No YAML or placeholder key is needed for a server without authentication:
 orchestral --base-url http://127.0.0.1:8000/v1
 ```
 
-A server root, `/v1` base, or full `/chat/completions` endpoint is accepted. If the server
+A server root, `/v1` base, full `/chat/completions`, or `/responses` endpoint is accepted. If the server
 lists exactly one model, Orchestral selects it. Otherwise choose a model explicitly:
 
 ```sh
@@ -40,6 +40,27 @@ Set `LOCAL_MODEL_API_KEY` in your environment first. Orchestral sends it only wh
 selected. In YAML, use a provider `endpoint` with `config: { auth: none }` for a keyless service;
 the default authentication mode is `api_key`. The model needs tool-calling support to perform
 coding actions; OpenAI-compatible HTTP alone does not guarantee a model has that capability.
+
+The official `api.openai.com` service defaults to **Responses API**, including tool calls,
+streaming, structured output, images, and stateless continuation of encrypted reasoning.
+Other services default to **Chat Completions**. An explicit resource URL selects its protocol;
+provider `config.api: responses` or `config.api: chat_completions` overrides the default.
+For example, a Responses-compatible gateway can use:
+
+```sh
+orchestral --base-url https://your-gateway.example/v1/responses --api-key-env LOCAL_MODEL_API_KEY --model your-model-id
+```
+
+Responses sends effort controls as `reasoning.effort`, and output limits as `max_output_tokens`.
+It leaves temperature at the service default unless effort is explicitly `none`; this avoids
+injecting a sampling parameter into reasoning requests. Optional `sampling.top_p` is passed
+through for service validation; other Chat Completions sampling extensions fail locally.
+Responses does not accept the compatible-template `on`/`off` thinking switch: select an
+effort or `default`. Model support for each effort remains the service's decision.
+Tools use non-strict object declarations compatible with the API; the Host still validates
+the complete original schema, including mutually exclusive argument forms, before effects.
+API choice and schema encoding are bound into recovery identity. Retain the original API
+configuration when recovering an unfinished Run created with an earlier protocol.
 
 OpenAI-compatible tool results default to `text`: typed metadata followed by fenced multiline
 text in one string, preserving source indentation, tabs, and line endings. A model profile can
@@ -106,6 +127,10 @@ intersected with the Host budget; absent metadata remains `unknown`.
 
 `/reasoning` selects reasoning controls for the current model; `/reasoning <value>` and
 `--reasoning <value>` set an explicit preference. `default` preserves service defaults.
+When a compatible service omits reasoning capabilities, the menu also offers common effort
+spellings marked **Unverified**; selecting one asks the service to validate it. These entries
+do not claim support. A declared capability list (including an empty list) takes precedence.
+Custom efforts remain available through `/reasoning <value>`.
 Gemini menus use the adapter's model capabilities without OpenAI-compatible discovery or
 Google credential refresh. Gemini 3 and later expose their supported `minimal`, `low`,
 `medium`, and `high` levels. Gemini 2.5 offers dynamic thinking with `on`; Flash models

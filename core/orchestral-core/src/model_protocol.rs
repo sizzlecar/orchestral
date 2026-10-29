@@ -569,6 +569,13 @@ pub trait ModelBackend: Send + Sync {
         ModelReasoningCapabilities::default()
     }
 
+    /// Common explicit controls this adapter can encode locally. These are
+    /// candidates for user selection, not a declaration of model support.
+    /// Clients must label them as unverified when service metadata is absent.
+    fn reasoning_preference_candidates(&self) -> Vec<ReasoningPreference> {
+        Vec::new()
+    }
+
     /// Inspect optional reasoning metadata without generating model output.
     /// Adapters own discovery, credentials, and protocol-specific parsing.
     /// This must not mutate the execution descriptor or token-meter identity.
@@ -630,6 +637,10 @@ impl ModelBackend for Arc<dyn ModelBackend> {
 
     fn reasoning_capabilities(&self) -> ModelReasoningCapabilities {
         (**self).reasoning_capabilities()
+    }
+
+    fn reasoning_preference_candidates(&self) -> Vec<ReasoningPreference> {
+        (**self).reasoning_preference_candidates()
     }
 
     async fn resolve_reasoning_capabilities(

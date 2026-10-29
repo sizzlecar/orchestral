@@ -38,6 +38,8 @@ providers:
       kind: openai
       api_key_env: OPENAI_API_KEY
       config:
+        # Official OpenAI uses responses; other services use chat_completions.
+        # api: responses
         stream_idle_timeout_secs: 300
     - name: google
       kind: gemini
