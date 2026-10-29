@@ -13,6 +13,7 @@ pub use sampling::OpenAiSamplingConfig;
 mod responses;
 mod tool_result;
 mod tool_schema;
+mod vision;
 pub use tool_result::OpenAiToolResultFormat;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -310,8 +311,13 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
             ),
         };
         let config = config.expect("OpenAI token meter scalar configuration is serializable");
-        let config = serde_json::to_vec(&(config, tool_schema::IDENTITY, self.api))
-            .expect("tool schema encoding identity is serializable");
+        let config = serde_json::to_vec(&(
+            config,
+            tool_schema::IDENTITY,
+            self.api,
+            vision::PLANNING_IDENTITY,
+        ))
+        .expect("tool schema encoding identity is serializable");
         // Preserve existing recovery identities when no control was selected.
         // Explicit controls affect both wire size and the model's continuation.
         let config = match &self.reasoning {
@@ -345,10 +351,14 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
         tools: &[ModelToolDefinition],
     ) -> Result<ModelContextEstimate, ModelError> {
         let (wire_bytes, framing) = self.input_wire_size(messages, tools)?;
+        let (image_bytes, image_tokens) = vision::planning_size(messages)?;
         Ok(ModelContextEstimate {
             tokens: wire_bytes
+                .saturating_sub(image_bytes)
                 .div_ceil(CONTEXT_ESTIMATE_BYTES_PER_TOKEN)
-                .saturating_add(framing),
+                .saturating_add(framing)
+                .saturating_add(image_tokens)
+                .min(wire_bytes.saturating_add(framing)),
             accounting: ModelTokenAccounting::Estimated,
         })
     }

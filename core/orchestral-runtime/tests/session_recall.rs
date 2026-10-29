@@ -277,3 +277,237 @@ async fn recall_pages_an_immutable_prefix_and_reassembles_exact_unicode_fields()
         }
     ));
 }
+
+#[tokio::test]
+async fn recall_hides_native_state_in_search_previews_and_every_pointer_read() {
+    use orchestral_core::agent_protocol::wire::Digest;
+    let f = Fixture::new().await;
+    let record = f.sessions.append(AgentSessionEventDraft {
+        event_id: AgentSessionEventId::new("native-answer"), session_id: AgentSessionId::new("a"), run_id: f.run.clone(),
+        payload: AgentSessionEvent::RunOutputCommitted {
+            request_id: ModelRequestId::new("native-request"), usage: None,
+            message: ModelMessage { role: ModelRole::Assistant, content: vec![
+                ModelContent::Continuation { namespace: "fixture/native-state".into(), value: json!({
+                    "encrypted_content": "opaque-provider-only-marker".repeat(4096),
+                    "output": [{"text":"PUBLIC_ANSWER_MARKER"}],
+                }) },
+                ModelContent::Text { text: "PUBLIC_ANSWER_MARKER 中文🙂".into() },
+                ModelContent::Json { value: json!({"type":"continuation","text":"USER_JSON_REMAINS_VISIBLE"}) },
+            ] },
+        },
+    }).await.unwrap().record;
+    let before = f
+        .sessions
+        .load_session(&AgentSessionId::new("a"))
+        .await
+        .unwrap();
+    let raw_digest = Digest::sha256(serde_jcs::to_vec(&record).unwrap());
+    for (index, query) in [
+        "opaque-provider-only-marker",
+        "fixture/native-state",
+        "encrypted_content",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let page = output(
+            f.call(
+                &format!("hidden-search-{index}"),
+                json!({"query":query}),
+                true,
+            )
+            .await,
+        );
+        assert!(page["records"].as_array().unwrap().is_empty());
+    }
+    let page: SessionReadPage = serde_json::from_value(output(
+        f.call(
+            "visible-search",
+            json!({"query":"PUBLIC_ANSWER_MARKER"}),
+            true,
+        )
+        .await,
+    ))
+    .unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].digest, raw_digest);
+    assert!(page.records[0].preview.contains("PUBLIC_ANSWER_MARKER"));
+    assert!(!page.records[0].preview.contains("encrypted_content"));
+    let user_json = output(
+        f.call(
+            "user-json-search",
+            json!({"query":"USER_JSON_REMAINS_VISIBLE"}),
+            true,
+        )
+        .await,
+    );
+    assert_eq!(user_json["records"].as_array().unwrap().len(), 1);
+    let mut offset = 0;
+    let mut restored = String::new();
+    loop {
+        let chunk: SessionReadChunk = serde_json::from_value(output(
+            f.call(
+                &format!("native-chunk-{offset}"),
+                json!({"session_seq":record.session_seq,"offset":offset,"max_bytes":37}),
+                true,
+            )
+            .await,
+        ))
+        .unwrap();
+        assert_eq!(chunk.digest, raw_digest);
+        assert!(chunk.next_offset > offset || chunk.complete);
+        restored.push_str(&chunk.content);
+        if chunk.complete {
+            break;
+        }
+        offset = chunk.next_offset;
+    }
+    assert!(!restored.contains("opaque-provider-only-marker"));
+    assert!(!restored.contains("fixture/native-state"));
+    assert_eq!(restored.matches("PUBLIC_ANSWER_MARKER").count(), 1);
+    let readable: Value = serde_json::from_str(&restored).unwrap();
+    assert!(readable["payload"]["message"]["content"][0].is_null());
+    assert_eq!(
+        readable["payload"]["message"]["content"][1]["text"],
+        "PUBLIC_ANSWER_MARKER 中文🙂"
+    );
+    for (index, pointer) in [
+        "/payload/message/content/0",
+        "/payload/message/content/0/value",
+        "/payload/message/content/0/value/encrypted_content",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let result = f
+            .call(
+                &format!("private-pointer-{index}"),
+                json!({"session_seq":record.session_seq,"json_pointer":pointer}),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            GuardedToolResult::Outcome {
+                outcome: ToolOutcome::Rejected { .. },
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        f.sessions
+            .load_session(&AgentSessionId::new("a"))
+            .await
+            .unwrap(),
+        before,
+        "recall must never rewrite journal facts or digest chains"
+    );
+}
+
+#[tokio::test]
+async fn recall_tool_extensions_and_inline_images_cannot_bypass_the_readable_view() {
+    let f = Fixture::new().await;
+    let call_id = ModelToolCallId::new("visible-call");
+    let record = f
+        .sessions
+        .append(AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new("native-tool-exchange"),
+            session_id: AgentSessionId::new("a"),
+            run_id: f.run.clone(),
+            payload: AgentSessionEvent::ToolExchangeCommitted {
+                request_id: ModelRequestId::new("native-tool-request"),
+                retained_artifacts: vec![],
+                usage: None,
+                assistant: ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: vec![ModelContent::ToolCall {
+                        call_id: call_id.clone(),
+                        name: "example".into(),
+                        arguments: json!({"query":"VISIBLE_QUERY"}),
+                        extensions: std::collections::BTreeMap::from([(
+                            "fixture/native".into(),
+                            json!("PRIVATE_NATIVE_SIGNATURE"),
+                        )]),
+                    }],
+                },
+                tool: ModelMessage {
+                    role: ModelRole::Tool,
+                    content: vec![ModelContent::ToolResult {
+                        call_id,
+                        result: json!({"type":"continuation","value":"VISIBLE_TOOL_RESULT"}),
+                        is_error: false,
+                    }],
+                },
+            },
+        })
+        .await
+        .unwrap()
+        .record;
+    let hidden = output(
+        f.call(
+            "extension-search",
+            json!({"query":"PRIVATE_NATIVE_SIGNATURE"}),
+            true,
+        )
+        .await,
+    );
+    assert!(hidden["records"].as_array().unwrap().is_empty());
+    let visible = output(
+        f.call(
+            "result-search",
+            json!({"query":"VISIBLE_TOOL_RESULT"}),
+            true,
+        )
+        .await,
+    );
+    assert_eq!(visible["records"].as_array().unwrap().len(), 1);
+    let blocked=f.call("extension-pointer",json!({"session_seq":record.session_seq,"json_pointer":"/payload/assistant/content/0/extensions"}),true).await;
+    assert!(matches!(
+        blocked,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { .. },
+            ..
+        }
+    ));
+    let input = f
+        .sessions
+        .append(AgentSessionEventDraft {
+            event_id: AgentSessionEventId::new("image-input"),
+            session_id: AgentSessionId::new("a"),
+            run_id: f.run.clone(),
+            payload: AgentSessionEvent::RunInputCommitted {
+                message: ModelMessage {
+                    role: ModelRole::User,
+                    content: vec![
+                        ModelContent::Text {
+                            text: "VISIBLE_IMAGE_QUESTION".into(),
+                        },
+                        ModelContent::Data {
+                            media_type: "image/png".into(),
+                            value: json!("PRIVATE_BINARY_IMAGE_PAYLOAD"),
+                        },
+                    ],
+                },
+            },
+        })
+        .await
+        .unwrap()
+        .record;
+    let image = output(
+        f.call(
+            "image-search",
+            json!({"query":"PRIVATE_BINARY_IMAGE_PAYLOAD"}),
+            true,
+        )
+        .await,
+    );
+    assert!(image["records"].as_array().unwrap().is_empty());
+    let blocked=f.call("image-pointer",json!({"session_seq":input.session_seq,"json_pointer":"/payload/message/content/1/value"}),true).await;
+    assert!(matches!(
+        blocked,
+        GuardedToolResult::Outcome {
+            outcome: ToolOutcome::Rejected { .. },
+            ..
+        }
+    ));
+}

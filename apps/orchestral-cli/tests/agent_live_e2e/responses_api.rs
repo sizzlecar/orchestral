@@ -183,3 +183,105 @@ fn responses_cli_edits_through_guarded_tools_and_restores_native_history_after_r
         );
     }
 }
+
+#[test]
+fn responses_tui_sends_large_images_and_restores_only_readable_answers() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let exit = |mut tui: PtyHarness| {
+        tui.send(b"\x04");
+        assert!(tui.finish(LOCAL_PROCESS_TIMEOUT).status.success());
+    };
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("responses-vision-history");
+    // Only the image header is inspected by the local transport fixture. Its
+    // encoded payload exceeds the entire 128K context window when read as text.
+    let mut image = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    image.extend(1600_u32.to_be_bytes());
+    image.extend(1000_u32.to_be_bytes());
+    image.resize(900_000, 0);
+    let path = workspace.path("screenshot.png");
+    fs::write(&path, &image).unwrap();
+    let expected = format!("data:image/png;base64,{}", STANDARD.encode(&image));
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(move |request| {
+            assert_eq!(request.path, "/v1/responses");
+            let input = request.body["input"].as_array().unwrap();
+            let user = input.iter().find(|item| item["role"] == "user").unwrap();
+            assert_eq!(user["content"][1]["type"], "input_image");
+            assert_eq!(user["content"][1]["image_url"], expected);
+            reply(text("image-answer", "IMAGE_ANSWER_VISIBLE"), true)
+        }),
+        Box::new(move |request| {
+            let input = request.body["input"].as_array().unwrap();
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| item["id"] == "msg-image-answer")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| item["encrypted_content"] == "opaque-image-answer")
+                    .count(),
+                1
+            );
+            reply(text("followup", "CONTINUATION_REPLAY_OK"), false)
+        }),
+    ]);
+    workspace.configure_local_openai(&format!("{endpoint}/v1/responses"));
+    workspace.rewrite_config(|config| {
+        config["agent"]["max_context_tokens"] = serde_yaml::to_value(128_000).unwrap();
+    });
+    let command = || local_tui_command(&workspace, "vision-session", "Inspect the user's image.");
+    let mut first = PtyHarness::spawn(command());
+    first.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
+    first.send(format!("\x1b[200~{}\x1b[201~", path.display()).as_bytes());
+    first.wait_for_screen(|s| s.contains("Attached [Image #1]"), LOCAL_PROCESS_TIMEOUT);
+    first.send(b" Describe this image\r");
+    let live = first.wait_for_screen(
+        |s| s.contains("IMAGE_ANSWER_VISIBLE") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert_eq!(live.matches("IMAGE_ANSWER_VISIBLE").count(), 1);
+    assert!(!live.contains("opaque-image-answer"));
+    exit(first);
+
+    let mut resumed = PtyHarness::spawn(command());
+    let history = resumed.wait_for_screen(
+        |s| s.contains("IMAGE_ANSWER_VISIBLE") && s.contains("Ask Orchestral"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert_eq!(history.matches("IMAGE_ANSWER_VISIBLE").count(), 1);
+    for hidden in [
+        "opaque-image-answer",
+        "encrypted_content",
+        "responses-output/v1",
+        "iVBORw0KGgo",
+    ] {
+        assert!(
+            !history.contains(hidden),
+            "private state appeared in restored history"
+        );
+    }
+    resumed.send_paste("Continue from the image answer.");
+    resumed.wait_for_screen(
+        |s| s.contains("CONTINUATION_REPLAY_OK") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    exit(resumed);
+    assert_eq!(server.join().unwrap().len(), 2);
+    let records = session_records(&workspace);
+    let original = records.iter().find(|record| {
+        record["payload"]["type"] == "run_output_committed"
+            && record["payload"]["message"]["content"]
+                .to_string()
+                .contains("opaque-image-answer")
+    });
+    assert!(
+        original.is_some(),
+        "rendering must preserve native continuation in the journal"
+    );
+}

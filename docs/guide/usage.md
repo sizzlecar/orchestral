@@ -241,8 +241,10 @@ recent compacted user request verbatim within the history/token budget. Bounded
 summaries retain typed failure outcomes; successful Tool execution alone is not
 evidence that the task has been verified.
 
-The built-in `session_read` Tool lets the Agent search its own original Session
-history, then read exact JSON fields or paginated chunks. It cannot select another
+The built-in `session_read` Tool lets the Agent search a readable view of its original
+Session history, then read exact JSON fields or paginated chunks. Provider continuation,
+private Tool-call extensions and inline image bytes are excluded; journal records remain
+unchanged. It cannot select another
 Session, and uses the same Host grants, cancellation and effect journal as other
 Tools. See [Session Context and Recall](../../docs/agent-foundation/session-context-v1.md)
 for snapshot cursors, SDK registration and recovery compatibility.

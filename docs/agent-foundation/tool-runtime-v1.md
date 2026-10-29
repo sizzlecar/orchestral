@@ -55,5 +55,5 @@ let result = runtime.invoke(
 
 `EffectScope::SessionRead` 是独立的只读能力，不隐含 filesystem、network 或其他 Session
 访问权限。内置 `session_read` 从 Host registration 解析调用 Run 所属 Session，支持
-原始记录搜索、固定前缀分页和精确字段分块读取，仍经过上述统一执行路径。
+记录的可读投影搜索、固定前缀分页和精确字段分块读取，仍经过上述统一执行路径。
 详见 [Session Context and Recall v1](./session-context-v1.md)。

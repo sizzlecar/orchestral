@@ -193,8 +193,44 @@ fn model_text(message: &ModelMessage) -> String {
                 name, arguments, ..
             } => Some(format!("{name}: {arguments}")),
             ModelContent::ToolResult { result, .. } => Some(result.to_string()),
-            content => serde_json::to_string(content).ok(),
+            ModelContent::Continuation { .. } => None,
+            ModelContent::Json { value } | ModelContent::Data { value, .. } => {
+                Some(value.to_string())
+            }
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestral_core::model_protocol::ModelRole;
+    use serde_json::json;
+
+    #[test]
+    fn restored_answers_render_once_without_provider_continuation() {
+        let message = ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![
+                ModelContent::Text {
+                    text: "The visible answer".into(),
+                },
+                ModelContent::Continuation {
+                    namespace: "fixture/provider-state".into(),
+                    value: json!([
+                        {"type":"reasoning","encrypted_content":"PRIVATE_CIPHERTEXT"},
+                        {"type":"message","content":[{"type":"output_text","text":"The visible answer"}]},
+                    ]),
+                },
+            ],
+        };
+        assert_eq!(model_text(&message), "The visible answer");
+        let private_only = ModelMessage {
+            role: ModelRole::Assistant,
+            content: message.content[1..].to_vec(),
+        };
+        assert!(model_text(&private_only).is_empty());
+    }
 }
