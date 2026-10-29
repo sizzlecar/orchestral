@@ -46,7 +46,8 @@ use orchestral_model_gemini::{
     GeminiAuthentication, GeminiModelBackend, GeminiModelConfig, GoogleCloudAccessTokenProvider,
 };
 use orchestral_model_openai::{
-    OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiSamplingConfig, OpenAiToolResultFormat,
+    OpenAiApi, OpenAiCompatibleBackend, OpenAiCompatibleConfig, OpenAiSamplingConfig,
+    OpenAiToolResultFormat,
 };
 use orchestral_runtime::api::AgentApi;
 use orchestral_runtime::session_history::JournalSessionHistory;
@@ -2104,7 +2105,12 @@ pub(crate) fn build_model_backend(
                 .context("parse model profile config.tool_result_format")?
                 .unwrap_or_default();
             let api_key = crate::openai_connection::api_key(backend)?;
-            let endpoint = crate::openai_connection::endpoint(backend)?.base_url().to_owned();
+            let endpoint = crate::openai_connection::endpoint(backend)?;
+            let api = backend.config.get("api")
+                .map(|value| serde_json::from_value::<OpenAiApi>(value.clone()))
+                .transpose().context("parse backend config.api (responses or chat_completions)")?
+                .unwrap_or_else(|| endpoint.default_api());
+            let endpoint = endpoint.base_url().to_owned();
             let backend = Arc::new(
                 OpenAiCompatibleBackend::new(OpenAiCompatibleConfig {
                     backend_id: format!("openai-compatible/{}", backend.name),
@@ -2121,6 +2127,7 @@ pub(crate) fn build_model_backend(
                     max_buffered_events,
                 })
                 .context("build OpenAI-compatible ModelBackend")?
+                .with_api(api)
                 .with_sampling(sampling)
                 .context("configure OpenAI-compatible sampling")?
                 .with_tool_result_format(tool_result_format)

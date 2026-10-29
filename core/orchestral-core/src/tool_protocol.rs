@@ -1337,9 +1337,43 @@ pub enum ToolProtocolErrorCode {
 }
 
 fn validate_json_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(allowed) = schema.as_bool() {
+        return if allowed {
+            Ok(())
+        } else {
+            Err(format!("{path} is disallowed by schema"))
+        };
+    }
     let schema = schema
         .as_object()
         .ok_or_else(|| format!("schema at '{path}' must be an object"))?;
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword) {
+            let branches = branches
+                .as_array()
+                .ok_or_else(|| format!("{path} schema {keyword} must be an array"))?;
+            let matching = branches
+                .iter()
+                .filter(|branch| validate_json_value(value, branch, path).is_ok())
+                .count();
+            let valid = match keyword {
+                "allOf" => matching == branches.len(),
+                "anyOf" => matching > 0,
+                "oneOf" => matching == 1,
+                _ => unreachable!("closed set of schema combinators"),
+            };
+            if !valid {
+                return Err(format!(
+                    "{path} does not satisfy {keyword} ({matching} matching branches)"
+                ));
+            }
+        }
+    }
+    if let Some(negated) = schema.get("not") {
+        if validate_json_value(value, negated, path).is_ok() {
+            return Err(format!("{path} matches a disallowed not schema"));
+        }
+    }
     if let Some(type_spec) = schema.get("type") {
         validate_json_type(value, type_spec, path)?;
     }
@@ -1564,6 +1598,53 @@ mod tests {
             max_timeout_ms: Some(1_000),
             max_output_bytes: Some(10_000),
         }
+    }
+
+    #[test]
+    fn schema_combinators_enforce_alternatives_without_changing_model_surface() {
+        let schema = ModelToolSchema {
+            name: "choose_input".into(),
+            description: "Choose exactly one input form".into(),
+            input_schema: json!({
+                "type":"object", "properties":{"single":{"type":"string"},"batch":{"type":"array","items":{"type":"string"}}},
+                "additionalProperties":false,
+                "oneOf":[
+                    {"required":["single"],"not":{"required":["batch"]}},
+                    {"required":["batch"],"not":{"anyOf":[{"required":["single"]}]}}
+                ]
+            }),
+        };
+        for valid in [json!({"single":"one"}), json!({"batch":["one","two"]})] {
+            schema.validate_arguments(&valid).unwrap();
+        }
+        for invalid in [
+            json!({}),
+            json!({"single":"one","batch":["two"]}),
+            json!({"batch":[1]}),
+            json!({"single":"one","unknown":true}),
+        ] {
+            assert_eq!(
+                schema.validate_arguments(&invalid).unwrap_err().code,
+                ToolProtocolErrorCode::SchemaViolation
+            );
+        }
+        assert!(validate_json_value(
+            &json!(1),
+            &json!({"oneOf":[{"type":"number"},{"type":"integer"}]}),
+            "$"
+        )
+        .is_err());
+        assert!(validate_json_value(
+            &json!(1),
+            &json!({"allOf":[{"type":"number"},{"const":2}]}),
+            "$"
+        )
+        .is_err());
+        assert!(validate_json_value(&json!(2), &json!({"allOf":[true,{"const":2}]}), "$").is_ok());
+        assert!(validate_json_value(&json!(2), &json!({"anyOf":[false,{"const":2}]}), "$").is_ok());
+        assert!(
+            validate_json_value(&json!(3), &json!({"anyOf":[false,{"const":2}]}), "$").is_err()
+        );
     }
 
     #[test]

@@ -66,6 +66,24 @@ fn neutral_capabilities_keep_unknown_support_and_separate_toggles_from_literal_e
 }
 
 #[test]
+fn protocol_candidates_do_not_declare_model_support_and_survive_arc_forwarding() {
+    let backend: std::sync::Arc<dyn ModelBackend> =
+        std::sync::Arc::new(backend(OpenAiToolResultFormat::Json));
+    let forwarded: std::sync::Arc<dyn ModelBackend> = std::sync::Arc::new(backend.clone());
+    assert!(forwarded
+        .reasoning_capabilities()
+        .supported_preferences
+        .is_none());
+    let candidates = forwarded.reasoning_preference_candidates();
+    assert!(candidates.contains(&ReasoningPreference::XHigh));
+    assert!(!candidates.contains(&ReasoningPreference::Default));
+    for candidate in &candidates {
+        forwarded.validate_reasoning_preference(candidate).unwrap();
+    }
+    assert_eq!(candidates, backend.reasoning_preference_candidates());
+}
+
+#[test]
 fn neutral_reasoning_preserves_native_wire_controls_and_recovery_identity() {
     for preference in [
         ReasoningPreference::Default,

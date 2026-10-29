@@ -47,6 +47,8 @@ mod local_host;
 mod model_retry;
 #[path = "agent_live_e2e/project_instructions.rs"]
 mod project_instructions;
+#[path = "agent_live_e2e/responses_api.rs"]
+mod responses_api;
 #[path = "agent_live_e2e/session_history.rs"]
 mod session_history;
 #[path = "agent_live_e2e/tool_content.rs"]

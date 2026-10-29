@@ -4,14 +4,17 @@ use std::time::Duration;
 use orchestral_core::model_protocol::ModelError;
 use reqwest::{Client, Url};
 
-use crate::OpenAiReasoningCapabilities;
+use crate::{OpenAiApi, OpenAiReasoningCapabilities};
 
 /// Validated OpenAI-compatible API base, without credentials or query parameters.
 #[derive(Debug, Clone)]
-pub struct OpenAiEndpoint(Url);
+pub struct OpenAiEndpoint {
+    base: Url,
+    api: OpenAiApi,
+}
 
 impl OpenAiEndpoint {
-    /// Accept a server root, API base, or full Chat Completions endpoint.
+    /// Accept a server root, API base, or full Chat Completions/Responses URL.
     pub fn parse(value: &str) -> Result<Self, ModelError> {
         let mut url = Url::parse(value.trim()).map_err(|_| {
             ModelError::invalid_request("invalid API URL; use http(s)://HOST[:PORT]/v1")
@@ -28,14 +31,31 @@ impl OpenAiEndpoint {
             ));
         }
         let path = url.path().trim_end_matches('/');
-        let path = path.strip_suffix("/chat/completions").unwrap_or(path);
+        let (path, api) = if let Some(path) = path.strip_suffix("/chat/completions") {
+            (path, OpenAiApi::ChatCompletions)
+        } else if let Some(path) = path.strip_suffix("/responses") {
+            (path, OpenAiApi::Responses)
+        } else {
+            // Select by service protocol, never by a model-name heuristic.
+            let api = if url.host_str() == Some("api.openai.com") {
+                OpenAiApi::Responses
+            } else {
+                OpenAiApi::ChatCompletions
+            };
+            (path, api)
+        };
         let base = if path.is_empty() { "/v1" } else { path }.to_owned();
         url.set_path(&base);
-        Ok(Self(url))
+        Ok(Self { base: url, api })
     }
 
     pub fn base_url(&self) -> &str {
-        self.0.as_str()
+        self.base.as_str()
+    }
+
+    /// Protocol selected by an explicit resource URL or the service default.
+    pub fn default_api(&self) -> OpenAiApi {
+        self.api
     }
 
     pub fn completions_url(&self) -> String {
@@ -44,6 +64,10 @@ impl OpenAiEndpoint {
 
     pub fn models_url(&self) -> String {
         format!("{}/models", self.base_url())
+    }
+
+    pub fn responses_url(&self) -> String {
+        format!("{}/responses", self.base_url())
     }
 }
 
@@ -361,6 +385,7 @@ mod tests {
             "http://localhost:8000/",
             "http://localhost:8000/v1/",
             "http://localhost:8000/v1/chat/completions",
+            "http://localhost:8000/v1/responses",
         ] {
             let endpoint = OpenAiEndpoint::parse(value).unwrap();
             assert_eq!(
@@ -375,6 +400,31 @@ mod tests {
                 .models_url(),
             "https://gateway.example/proxy/openai/v2/models"
         );
+    }
+
+    #[test]
+    fn protocol_selection_uses_service_or_explicit_resource_without_model_heuristics() {
+        for (url, expected) in [
+            ("https://api.openai.com/v1", OpenAiApi::Responses),
+            (
+                "https://api.openai.com/v1/chat/completions",
+                OpenAiApi::ChatCompletions,
+            ),
+            (
+                "https://gateway.example/api/responses",
+                OpenAiApi::Responses,
+            ),
+            (
+                "https://api.openai.com.example/v1",
+                OpenAiApi::ChatCompletions,
+            ),
+            ("http://localhost:8000/v1", OpenAiApi::ChatCompletions),
+        ] {
+            let endpoint = OpenAiEndpoint::parse(url).unwrap();
+            assert_eq!(endpoint.default_api(), expected);
+            assert!(!endpoint.base_url().ends_with("/responses"));
+            assert!(endpoint.responses_url().ends_with("/responses"));
+        }
     }
 
     #[test]

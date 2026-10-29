@@ -73,6 +73,27 @@ descriptor、token meter 和 Run 的恢复身份。`supported_preferences: None`
 表示服务当前没有模型。Host 可在不支持发现时展示配置中的 profiles，服务查询失败仍显式
 报错。模型发现与推理能力查询都不得触发生成请求。
 
+## OpenAI Responses 与兼容服务
+
+OpenAI 适配器支持 `OpenAiApi::{Responses, ChatCompletions}`；原生 wire 格式仍留在
+plugin 内。官方服务默认走 Responses，其他服务默认走 Chat Completions。完整 resource
+URL 或 backend `config.api` 显式选择协议；客户端规范化 URL 时保留该选择。
+
+Responses 使用 `store: false`，将完整原生 output 数组作为 Assistant 的
+`openai-compatible/responses-output/v1` Continuation 保留。重放原始 reasoning、message、
+function_call 顺序及加密内容，不重复编码同一条 canonical 文本或工具调用。canonical 工具
+参数与原生调用必须一致，结果使用原始 `call_id`；执行身份仍按 request ID 稳定隔离。
+只有 completed/incomplete terminal response 才提交 Continuation 和 Finish；截断、取消和
+失败不能将流中已出现的工具片段提交为完成。usage 与推理摘要分别映射为标准事件。
+
+工具声明在 adapter 内转换为 API 接受的对象投影，不改变 canonical schema 或 Host 权限。
+Host 的组合约束校验保留 `allOf`、`anyOf`、`oneOf`、`not`；具体工具仍执行自己的参数与
+效果校验。协议、schema 编码版本和工具结果编码均参与恢复身份与输入计量。
+
+`ModelBackend::reasoning_preference_candidates()` 只声明适配器能发送的候选值，不声明
+模型支持。能力元数据缺失时，客户端可显示这些候选并明确标注未验证；服务明确声明的列表
+优先，包括显式空列表。该 SPI 默认返回空列表，不影响其他适配器。
+
 ## 模型容量发现与 Host 预算
 
 `ModelBackend::resolve_descriptor()` 是可选的异步启动阶段：静态适配器直接返回

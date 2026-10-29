@@ -10,7 +10,9 @@ pub use reasoning::{
 };
 mod sampling;
 pub use sampling::OpenAiSamplingConfig;
+mod responses;
 mod tool_result;
+mod tool_schema;
 pub use tool_result::OpenAiToolResultFormat;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -30,8 +32,18 @@ use orchestral_core::model_protocol::{
     ModelToolCallId, ModelToolDefinition, ModelUsage,
 };
 use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
+
+/// Wire protocol for an OpenAI-compatible service. An official OpenAI base
+/// selects Responses; other bases select Chat Completions unless overridden.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiApi {
+    ChatCompletions,
+    Responses,
+}
 
 #[derive(Clone)]
 pub struct OpenAiCompatibleConfig {
@@ -67,12 +79,6 @@ impl OpenAiCompatibleConfig {
         OpenAiEndpoint::parse(&self.endpoint)?;
         Ok(())
     }
-
-    fn completions_url(&self) -> String {
-        OpenAiEndpoint::parse(&self.endpoint)
-            .expect("configuration was validated")
-            .completions_url()
-    }
 }
 
 pub struct OpenAiCompatibleBackend {
@@ -81,6 +87,7 @@ pub struct OpenAiCompatibleBackend {
     sampling: OpenAiSamplingConfig,
     reasoning: Option<OpenAiReasoningControl>,
     tool_result_format: OpenAiToolResultFormat,
+    api: OpenAiApi,
 }
 
 impl OpenAiCompatibleBackend {
@@ -88,6 +95,7 @@ impl OpenAiCompatibleBackend {
     /// when retaining the encoding identity of an earlier JSON-configured Run.
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, ModelError> {
         config.validate()?;
+        let api = OpenAiEndpoint::parse(&config.endpoint)?.default_api();
         let client = Client::builder()
             .connect_timeout(config.timeout.min(Duration::from_secs(30)))
             .read_timeout(config.timeout)
@@ -99,7 +107,21 @@ impl OpenAiCompatibleBackend {
             sampling: OpenAiSamplingConfig::default(),
             reasoning: None,
             tool_result_format: OpenAiToolResultFormat::default(),
+            api,
         })
+    }
+
+    /// Override the service default, including Responses-compatible proxies.
+    pub fn with_api(mut self, api: OpenAiApi) -> Self {
+        self.api = api;
+        self
+    }
+
+    fn continuation_namespace(&self) -> &'static str {
+        match self.api {
+            OpenAiApi::ChatCompletions => continuation::NAMESPACE,
+            OpenAiApi::Responses => responses::NAMESPACE,
+        }
     }
 
     /// Select explicit sampling parameters without changing omitted defaults.
@@ -122,6 +144,9 @@ impl OpenAiCompatibleBackend {
         preference: ReasoningPreference,
     ) -> Result<Self, ModelError> {
         self.reasoning = OpenAiReasoningControl::from_preference(&preference)?;
+        if self.api == OpenAiApi::Responses {
+            responses::validate_reasoning(self.reasoning.as_ref())?;
+        }
         Ok(self)
     }
 
@@ -134,6 +159,9 @@ impl OpenAiCompatibleBackend {
     }
 
     fn build_request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
+        if self.api == OpenAiApi::Responses {
+            return responses::request_body(self, request);
+        }
         let mut body = Map::new();
         body.insert("model".to_owned(), Value::String(self.config.model.clone()));
         body.insert(
@@ -179,16 +207,16 @@ impl OpenAiCompatibleBackend {
                         .tools
                         .iter()
                         .map(|tool| {
-                            json!({
+                            Ok(json!({
                                 "type": "function",
                                 "function": {
                                     "name": tool.name,
                                     "description": tool.description,
-                                    "parameters": tool.input_schema,
+                                    "parameters": tool_schema::parameters(&tool.input_schema)?,
                                 }
-                            })
+                            }))
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, ModelError>>()?,
                 ),
             );
             body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
@@ -282,6 +310,8 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
             ),
         };
         let config = config.expect("OpenAI token meter scalar configuration is serializable");
+        let config = serde_json::to_vec(&(config, tool_schema::IDENTITY, self.api))
+            .expect("tool schema encoding identity is serializable");
         // Preserve existing recovery identities when no control was selected.
         // Explicit controls affect both wire size and the model's continuation.
         let config = match &self.reasoning {
@@ -326,6 +356,13 @@ impl ModelTokenMeter for OpenAiCompatibleBackend {
 
 #[async_trait]
 impl ModelBackend for OpenAiCompatibleBackend {
+    fn reasoning_preference_candidates(&self) -> Vec<ReasoningPreference> {
+        OpenAiReasoningEffort::ALL
+            .into_iter()
+            .map(|effort| ReasoningPreference::from_effort(effort.as_str()).expect("known effort"))
+            .collect()
+    }
+
     async fn list_models(&self) -> Result<Option<Vec<String>>, ModelError> {
         let endpoint = OpenAiEndpoint::parse(&self.config.endpoint)?;
         discover_models(&endpoint, &self.config.api_key)
@@ -355,7 +392,11 @@ impl ModelBackend for OpenAiCompatibleBackend {
         &self,
         preference: &ReasoningPreference,
     ) -> Result<(), ModelError> {
-        OpenAiReasoningControl::from_preference(preference).map(|_| ())
+        let control = OpenAiReasoningControl::from_preference(preference)?;
+        if self.api == OpenAiApi::Responses {
+            responses::validate_reasoning(control.as_ref())?;
+        }
+        Ok(())
     }
 
     fn descriptor(&self) -> ModelDescriptor {
@@ -365,7 +406,14 @@ impl ModelBackend for OpenAiCompatibleBackend {
         )]);
         extensions.insert(
             "openai-compatible/continuation".to_owned(),
-            Value::String(continuation::NAMESPACE.to_owned()),
+            Value::String(self.continuation_namespace().to_owned()),
+        );
+        if self.api == OpenAiApi::Responses {
+            extensions.insert("openai-compatible/api".to_owned(), json!(self.api));
+        }
+        extensions.insert(
+            "openai-compatible/tool-schema".to_owned(),
+            Value::String(tool_schema::IDENTITY.to_owned()),
         );
         let encoding_identity = match self.tool_result_format {
             OpenAiToolResultFormat::Text => Some(tool_result::TEXT_ENCODING_IDENTITY),
@@ -407,7 +455,12 @@ impl ModelBackend for OpenAiCompatibleBackend {
         request.validate()?;
         self.descriptor().validate()?;
         let body = self.build_request_body(&request)?;
-        let mut http_request = self.client.post(self.config.completions_url()).json(&body);
+        let endpoint = OpenAiEndpoint::parse(&self.config.endpoint)?;
+        let url = match self.api {
+            OpenAiApi::ChatCompletions => endpoint.completions_url(),
+            OpenAiApi::Responses => endpoint.responses_url(),
+        };
+        let mut http_request = self.client.post(url).json(&body);
         if !self.config.api_key.is_empty() {
             http_request = http_request.bearer_auth(&self.config.api_key);
         }
@@ -448,13 +501,25 @@ impl ModelBackend for OpenAiCompatibleBackend {
             .map_err(map_transport_error)?;
             let value = serde_json::from_slice(&bytes)
                 .map_err(|error| ModelError::protocol(format!("invalid OpenAI JSON: {error}")))?;
-            return Ok(stream::iter(parse_response(&request, &value)?.into_iter().map(Ok)).boxed());
+            let events = match self.api {
+                OpenAiApi::ChatCompletions => parse_response(&request, &value)?,
+                OpenAiApi::Responses => sequence_events(
+                    &request,
+                    responses::Decoder::new(
+                        request.request_id.clone(),
+                        self.config.max_buffered_events,
+                    )
+                    .complete(&value)?,
+                ),
+            };
+            return Ok(stream::iter(events.into_iter().map(Ok)).boxed());
         }
-        Ok(openai_event_stream(
+        Ok(event_stream(
             request,
             response.bytes_stream().boxed(),
             cancellation,
             self.config.max_buffered_events,
+            self.api,
         ))
     }
 }
@@ -562,6 +627,7 @@ struct OpenAiStreamState {
     emitted_content: bool,
     terminated: bool,
     max_buffered_events: usize,
+    responses: Option<responses::Decoder>,
 }
 
 impl OpenAiStreamState {
@@ -591,6 +657,14 @@ impl OpenAiStreamState {
     }
 
     fn handle_frame(&mut self, frame: String) -> Result<(), ModelError> {
+        if let Some(responses) = &mut self.responses {
+            for event in responses.handle_frame(&frame)? {
+                let terminal = matches!(event, ModelEvent::Finish { .. });
+                self.emit(event)?;
+                self.terminated |= terminal;
+            }
+            return Ok(());
+        }
         if frame.trim() == "[DONE]" {
             return self.finalize();
         }
@@ -748,6 +822,11 @@ impl OpenAiStreamState {
         if self.terminated {
             return Ok(());
         }
+        if self.responses.is_some() {
+            return Err(ModelError::protocol(
+                "Responses stream ended without a terminal response event",
+            ));
+        }
         let mut reason = self
             .finish_reason
             .clone()
@@ -771,12 +850,31 @@ impl OpenAiStreamState {
     }
 }
 
+#[cfg(test)]
 fn openai_event_stream(
     request: ModelRequest,
     bytes: HttpByteStream,
     cancellation: CancellationToken,
     max_buffered_events: usize,
 ) -> ModelStream {
+    event_stream(
+        request,
+        bytes,
+        cancellation,
+        max_buffered_events,
+        OpenAiApi::ChatCompletions,
+    )
+}
+
+fn event_stream(
+    request: ModelRequest,
+    bytes: HttpByteStream,
+    cancellation: CancellationToken,
+    max_buffered_events: usize,
+    api: OpenAiApi,
+) -> ModelStream {
+    let responses = (api == OpenAiApi::Responses)
+        .then(|| responses::Decoder::new(request.request_id.clone(), max_buffered_events));
     let state = OpenAiStreamState {
         request_id: request.request_id,
         bytes,
@@ -790,6 +888,7 @@ fn openai_event_stream(
         emitted_content: false,
         terminated: false,
         max_buffered_events,
+        responses,
     };
     stream::unfold(state, |mut state| async move {
         loop {
