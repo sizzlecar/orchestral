@@ -50,6 +50,7 @@ pub(crate) struct RenderCache {
     offsets: Vec<usize>,
     committed_rows: usize,
     settled_rows: usize,
+    streaming_history: Option<(usize, usize)>,
     scrollback_emitted: usize,
     scrollback_cursor: ScrollbackCursor,
     exit_cursor_row: u16,
@@ -535,6 +536,12 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
             from -= 1;
         }
         let row = cache.offsets.get(from).copied().unwrap_or(cache.rows.len());
+        if cache
+            .streaming_history
+            .is_some_and(|(index, _)| index >= from)
+        {
+            cache.streaming_history = None;
+        }
         cache.rows.truncate(row);
         cache.offsets.truncate(from);
         let mut index = from;
@@ -550,26 +557,41 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
             } else {
                 index + 1
             };
-            // Keep an active group out of native scrollback until all its
-            // summaries settle, including entries hidden by the folded view.
+            // Keep active reasoning/tool groups editable, including summaries
+            // hidden by the folded view. Answer streams have a block frontier.
             cache.offsets.resize(end, cache.rows.len());
             let mut lines = Vec::new();
             if index > 0 && should_separate(state.transcript[index - 1].role, entry.role) {
                 lines.push(Line::default());
             }
-            if let Some(stream) = state.streaming_text(entry) {
-                push_markdown(&mut lines, "• ", &stream, ASSISTANT, true, width);
+            let history_lines = if let Some(stream) = state.streaming_text(entry) {
+                Some(super::markdown::push_markdown_with_history(
+                    &mut lines, "• ", &stream, ASSISTANT, true, width,
+                ))
             } else {
                 push_entry_lines(&mut lines, entry, width, state.tools_expanded, false);
-            }
+                None
+            };
             for summary in &state.transcript[index + 1..end] {
                 push_entry_lines(&mut lines, summary, width, state.tools_expanded, true);
             }
-            cache.rows.extend(viewport::wrap(
+            let wrapped = viewport::wrap(
                 entry.id.clone().unwrap_or_else(|| format!("entry-{index}")),
                 lines,
                 width as usize,
-            ));
+            );
+            if let Some(frontier) = history_lines {
+                // The first active entry is the ordered history barrier. Never
+                // archive a later stream ahead of an earlier mutable entry.
+                if cache.streaming_history.is_none() {
+                    let rows = wrapped
+                        .iter()
+                        .take_while(|row| row.anchor.line < frontier)
+                        .count();
+                    cache.streaming_history = Some((index, cache.rows.len() + rows));
+                }
+            }
+            cache.rows.extend(wrapped);
             index = end;
         }
         cache.committed_rows = cache.rows.len();
@@ -591,7 +613,13 @@ fn update_transcript_cache(state: &UiState, cache: &mut RenderCache, width: u16)
                         && !has_stream)
             });
         cache.settled_rows = first_unsettled
-            .and_then(|idx| cache.offsets.get(idx).copied())
+            .and_then(|idx| {
+                cache
+                    .streaming_history
+                    .filter(|(index, _)| *index == idx)
+                    .map(|(_, frontier)| frontier)
+                    .or_else(|| cache.offsets.get(idx).copied())
+            })
             .unwrap_or(cache.committed_rows);
         let settled_entries = first_unsettled.unwrap_or(state.transcript.len());
         cache.scrollback_emitted = resolve_scrollback_cursor(
@@ -629,7 +657,7 @@ fn scrollback_cursor_at(
     let emitted = emitted.min(settled_rows).min(rows.len());
     if emitted == 0 {
         ScrollbackCursor::Start
-    } else if emitted < settled_rows {
+    } else if emitted < rows.len() {
         ScrollbackCursor::Before(rows[emitted].anchor.clone())
     } else {
         let settled_entries = offsets
@@ -650,7 +678,7 @@ fn resolve_scrollback_cursor(
     let settled = &rows[..settled_rows.min(rows.len())];
     match cursor {
         ScrollbackCursor::Start => 0,
-        ScrollbackCursor::Before(anchor) => settled
+        ScrollbackCursor::Before(anchor) => rows
             .iter()
             .enumerate()
             .filter(|(_, row)| row.anchor.entry == anchor.entry)
@@ -659,7 +687,8 @@ fn resolve_scrollback_cursor(
             })
             .last()
             .map(|(i, _)| i)
-            .unwrap_or(0),
+            .unwrap_or(0)
+            .min(settled.len()),
         ScrollbackCursor::SettledEnd { settled_entries } => {
             if *settled_entries >= total_settled_entries {
                 settled.len()
@@ -2187,6 +2216,98 @@ mod tests {
         assert_eq!(super::fmt_elapsed_compact(0), "0s");
         assert_eq!(super::fmt_elapsed_compact(61), "1m 01s");
         assert_eq!(super::fmt_elapsed_compact(3_661), "1h 01m 01s");
+    }
+
+    #[test]
+    fn overflowing_streamed_answer_remains_in_native_history_before_commit() {
+        let mut state = UiState::new("stream-history", "model");
+        update(
+            &mut state,
+            UiMsg::RemoteRunStarted {
+                run_id: "run".into(),
+                input: "Inspect this project".into(),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut cache = super::RenderCache::default();
+        for index in 0..24 {
+            update(
+                &mut state,
+                UiMsg::StreamDelta {
+                    delta_id: format!("chunk-{index}"),
+                    output_id: "answer".into(),
+                    order: index,
+                    text: format!("Answer paragraph {index:02}.\n\n"),
+                },
+            );
+            super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+            state.transcript_dirty_from = state.transcript.len();
+            let combined = format!(
+                "{}{}",
+                buffer_to_string(terminal.backend().scrollback()),
+                buffer_to_string(terminal.backend().buffer())
+            );
+            for prior in 0..=index {
+                let expected = format!("Answer paragraph {prior:02}.");
+                assert_eq!(combined.matches(&expected).count(), 1,
+                    "missing or repeated {expected} while the model is still streaming:\n{combined}");
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_large_streamed_block_archives_every_newly_completed_row() {
+        let mut state = UiState::new("stream-block-history", "model");
+        update(
+            &mut state,
+            UiMsg::RemoteRunStarted {
+                run_id: "run".into(),
+                input: "Inspect the table".into(),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut cache = super::RenderCache::default();
+        let table = format!(
+            "Completed introduction.\n\n| Column |\n| --- |\n{}",
+            (0..20)
+                .map(|index| format!("| table-cell-{index:02} |\n"))
+                .collect::<String>()
+        );
+        for (order, text) in [table, "\nAfter the table.\n\nNext paragraph.".into()]
+            .into_iter()
+            .enumerate()
+        {
+            update(
+                &mut state,
+                UiMsg::StreamDelta {
+                    delta_id: format!("chunk-{order}"),
+                    output_id: "answer".into(),
+                    order: order as u64,
+                    text,
+                },
+            );
+            super::draw_with_scrollback(&mut terminal, &state, &mut cache).unwrap();
+            state.transcript_dirty_from = state.transcript.len();
+            let history = buffer_to_string(terminal.backend().scrollback());
+            if order == 0 {
+                assert!(history.contains("Completed introduction."));
+                assert!(
+                    !history.contains("table-cell"),
+                    "a growing table must stay editable"
+                );
+            } else {
+                let combined =
+                    format!("{history}{}", buffer_to_string(terminal.backend().buffer()));
+                for index in 0..20 {
+                    let expected = format!("table-cell-{index:02}");
+                    assert_eq!(
+                        combined.matches(&expected).count(),
+                        1,
+                        "missing or repeated {expected}: {combined}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
