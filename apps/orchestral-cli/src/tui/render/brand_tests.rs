@@ -323,7 +323,7 @@ fn streamed_responses_stay_before_later_user_input_through_commit_and_resize() {
     };
     ordered(&body);
     assert!(
-        !super::tests::buffer_to_string(terminal.backend().scrollback())
+        super::tests::buffer_to_string(terminal.backend().scrollback())
             .contains("Earlier response paragraph")
     );
     state.transcript_dirty_from = state.transcript.len();

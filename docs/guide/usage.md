@@ -158,6 +158,8 @@ Ctrl+O expands or collapses tool records and thinking summaries; PgUp/PgDn reads
 and End follows new output. Native terminal text selection is retained; `/copy` copies the last
 committed answer when a local clipboard utility is available. `/`, F1 and `/help` expose the
 same action menu, including keyboard shortcuts and appearance settings; `NO_COLOR` disables styling.
+While an answer streams, completed Markdown blocks that leave the screen enter native terminal
+history immediately. The last block remains editable until more content arrives or the answer commits.
 `/skills` searches discovered workspace skills. Enter opens full descriptions and sources; Space
 toggles enablement preferences, with pending restart changes distinguished from the current process.
 Browsing skills neither loads model instructions nor adds conversation entries.

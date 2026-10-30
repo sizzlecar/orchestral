@@ -759,6 +759,137 @@ fn tui_pty_preserves_graphemes_draft_and_focus_through_help_and_history() {
 }
 
 #[test]
+fn tui_pty_preserves_streamed_history_before_finish_through_reading_and_resize() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("tui-stream-history");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (release, wait) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_PROCESS_TIMEOUT;
+        let mut stream = loop {
+            assert!(Instant::now() < deadline, "waiting for stream request");
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let request = read_http_fixture_request(&mut stream);
+                    if request.method == "GET" {
+                        write_http_fixture_response(
+                            &mut stream,
+                            json_response(json!({"data":[{"id":"fixture-model"}]})),
+                        );
+                        continue;
+                    }
+                    assert!(request.path.ends_with("/chat/completions"));
+                    break stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("accept stream fixture: {error}"),
+            }
+        };
+        let chunk = |start, end| {
+            let text = (start..end)
+                .map(|i| format!("Stream paragraph {i:03}.\n\n"))
+                .collect::<String>();
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":{"content":text}}]})
+            )
+        };
+        let first = chunk(0, 20);
+        let second = chunk(20, 40);
+        let finish = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+        );
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", first.len() + second.len() + finish.len()).unwrap();
+        stream.write_all(first.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        wait.recv_timeout(LOCAL_PROCESS_TIMEOUT).unwrap();
+        stream.write_all(second.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        wait.recv_timeout(LOCAL_PROCESS_TIMEOUT).unwrap();
+        stream.write_all(finish.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+    workspace.configure_local_openai(&endpoint);
+    let mut tui = PtyHarness::spawn_with_size(
+        local_tui_command(
+            &workspace,
+            "streaming-history",
+            "Follow the user's request.",
+        ),
+        80,
+        12,
+    );
+    tui.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
+    tui.send_paste("Inspect the project.");
+    tui.wait_for_screen(
+        |s| s.contains("Stream paragraph 019.") && s.contains("Working"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    let assert_history = |tui: &mut PtyHarness, count| {
+        let text = full_scrollback_contents(tui.screen.screen_mut());
+        tui.screen.screen_mut().set_scrollback(0);
+        for i in 0..count {
+            let expected = format!("Stream paragraph {i:03}.");
+            assert_eq!(
+                text.matches(&expected).count(),
+                1,
+                "missing or repeated {expected}:\n{text}"
+            );
+        }
+        for ui in [
+            "Working",
+            "_>. ORCHESTRAL",
+            "Add guidance while Orchestral works",
+        ] {
+            assert!(
+                text.matches(ui).count() <= 1,
+                "UI leaked into native history: {text}"
+            );
+        }
+    };
+    assert_history(&mut tui, 20);
+    tui.send(b"\x1b[5~");
+    let reading = tui.wait_for_screen(|s| s.contains("end to follow"), LOCAL_PROCESS_TIMEOUT);
+    let anchor = reading.lines().next().unwrap().trim().to_owned();
+    release.send(()).unwrap();
+    let during = tui.wait_for_screen(|s| s.contains("new output"), LOCAL_PROCESS_TIMEOUT);
+    assert_eq!(during.lines().next().unwrap().trim(), anchor);
+    tui.send(b"\x1b[F");
+    tui.wait_for_screen(
+        |s| s.contains("Stream paragraph 039."),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    assert_history(&mut tui, 40);
+    for (cols, rows) in [(80, 28), (60, 12), (100, 24)] {
+        tui.resize(cols, rows);
+        tui.wait_for_screen(
+            |s| s.contains("Stream paragraph 039.") && s.lines().count() == rows as usize,
+            LOCAL_PROCESS_TIMEOUT,
+        );
+        assert_history(&mut tui, 40);
+    }
+    release.send(()).unwrap();
+    tui.wait_for_screen(|s| s.contains("replied"), LOCAL_PROCESS_TIMEOUT);
+    assert_history(&mut tui, 40);
+    tui.send(b"\x04");
+    let output = tui.finish(LOCAL_PROCESS_TIMEOUT);
+    assert!(output.status.success());
+    output.assert_terminal_restored();
+    server.join().unwrap();
+}
+
+#[test]
 fn tui_pty_keeps_reading_anchor_when_later_output_commits() {
     let _guard = local_e2e_guard();
     let workspace = TestWorkspace::new("tui-reading");

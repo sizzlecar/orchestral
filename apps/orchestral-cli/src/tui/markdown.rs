@@ -22,6 +22,20 @@ pub(super) fn push_markdown(
     streaming: bool,
     width: u16,
 ) {
+    push_markdown_with_history(lines, prefix, text, style, streaming, width);
+}
+
+/// Return the absolute line frontier before the last top-level Markdown block.
+/// The live tail (including tables whose column widths can still change) stays
+/// editable; preceding blocks can leave the viewport before OutputCommitted.
+pub(super) fn push_markdown_with_history(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    style: Style,
+    streaming: bool,
+    width: u16,
+) -> usize {
     let plain = super::text::plain(text);
     let source = super::math::normalize_delimiters(&plain);
     let mut writer = Writer {
@@ -40,7 +54,18 @@ pub(super) fn push_markdown(
         table_head: false,
         width,
     };
+    let mut depth = 0_usize;
+    let mut history_lines = 0;
     for (event, range) in Parser::new_ext(&source, options()).into_offset_iter() {
+        if depth == 0 && !matches!(event, Event::End(_)) {
+            writer.flush();
+            history_lines = writer.lines.len();
+        }
+        match &event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
         writer.event(event, &source[range]);
     }
     writer.flush();
@@ -64,7 +89,9 @@ pub(super) fn push_markdown(
             last.spans.push(Span::styled("▌", ACCENT));
         }
     }
+    let frontier = lines.len() + history_lines.min(writer.lines.len());
     lines.extend(writer.lines);
+    frontier
 }
 
 struct List {
@@ -485,6 +512,37 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn live_history_keeps_the_last_markdown_block_editable() {
+        for tail in [
+            "a still growing paragraph",
+            "| col | value |\n| --- | --- |\n| a | shorter |\n| b | much longer cell |",
+            "```rust\nlet a = 1;\nlet b = 2;\n",
+            "- first item\n- second item\n",
+            "$$\nx_1 + x_2",
+        ] {
+            let source = format!("Completed first paragraph.\n\n{tail}");
+            let mut rendered = Vec::new();
+            let frontier = push_markdown_with_history(
+                &mut rendered,
+                "• ",
+                &source,
+                Style::default(),
+                true,
+                48,
+            );
+            let history = rendered[..frontier]
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(history.trim(), "• Completed first paragraph.", "{tail}");
+            assert!(rendered[frontier..]
+                .iter()
+                .any(|line| line.to_string().contains('▌')));
+        }
     }
 
     #[test]

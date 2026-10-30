@@ -2999,18 +2999,47 @@ fn full_scrollback_contents(screen: &mut vt100::Screen) -> String {
     let max_offset = screen.scrollback();
     let mut out = String::new();
     let mut offset = max_offset;
+    let mut overlap = 0;
     loop {
         screen.set_scrollback(offset);
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&physical_screen_contents(screen));
+        out.push_str(
+            &screen
+                .rows(0, screen.size().1)
+                .skip(overlap)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         if offset == 0 {
             break;
         }
+        // The final window is clamped to offset zero and can overlap the
+        // preceding page. Count each physical row only once.
+        overlap = step.saturating_sub(offset);
         offset = offset.saturating_sub(step);
     }
     out
+}
+
+#[test]
+fn full_scrollback_snapshots_do_not_repeat_a_partial_final_page() {
+    for height in [2, 4, 6, 9] {
+        let mut parser = vt100::Parser::new(height, 30, 100);
+        for index in 0..25 {
+            parser.process(format!("row-{index:03}\r\n").as_bytes());
+        }
+        let contents = full_scrollback_contents(parser.screen_mut());
+        for index in 0..25 {
+            let expected = format!("row-{index:03}");
+            assert_eq!(
+                contents.matches(&expected).count(),
+                1,
+                "height={height}: {contents}"
+            );
+        }
+    }
 }
 
 #[test]
