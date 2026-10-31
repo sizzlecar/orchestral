@@ -262,6 +262,9 @@ pub struct AgentHost {
 }
 
 impl AgentHost {
+    pub(crate) fn origin(&self) -> &SessionOrigin {
+        &self.session_origin
+    }
     pub fn client(&self, session_id: AgentSessionId) -> AgentClient {
         AgentClient::new(self.controller.clone(), session_id)
             .with_resources(self.resources.clone())

@@ -128,6 +128,11 @@ pub(crate) async fn run_tui(
     let mut process_events = process_supervisor.subscribe();
     let mut process_events_open = true;
     let mut local_host = start_local_host(host, client.session_id()).await;
+    let mut model_reply: Option<
+        tokio::sync::oneshot::Sender<
+            Result<orchestral_core::agent_connector::AgentSessionExecutionProfile, String>,
+        >,
+    > = None;
     let mut cache = RenderCache::default();
     let mut needs_redraw = true;
     let mut quit = false;
@@ -153,6 +158,10 @@ pub(crate) async fn run_tui(
             host.schedules.next_deadline(client.session_id())
         } else {
             None
+        };
+        let (remote_inputs, remote_models) = match local_host.as_mut() {
+            Some(server) => (Some(&mut server.requests), Some(&mut server.model_requests)),
+            None => (None, None),
         };
         tokio::select! {
             event = input.next() => {
@@ -222,12 +231,15 @@ pub(crate) async fn run_tui(
                 file_index.refresh();
             }
             Some((generation, result)) = service_rx.recv() => {
-                let replace_local_host = matches!(&result, Ok(super::services::Response::Model { .. } | super::services::Response::Session { .. }));
+                let replace_local_host = matches!(&result, Ok(super::services::Response::Session { .. }));
                 if !service_tasks.accept(generation) { continue; }
                 state.host_busy = false;
                 state.ui_notice = None;
                 match result {
-                    Err(error) => state.ui_notice = Some(error),
+                    Err(error) => {
+                        if let Some(reply) = model_reply.take() { let _ = reply.send(Err(error.clone())); }
+                        state.ui_notice = Some(error);
+                    },
                     Ok(super::services::Response::Menu(menu)) => { update(&mut state, UiMsg::OpenMenu(menu)); }
                     Ok(super::services::Response::Notice(message)) => state.ui_notice = Some(message),
                     Ok(super::services::Response::Model { host: next, options: next_options, notice }) => {
@@ -243,6 +255,8 @@ pub(crate) async fn run_tui(
                         state.context_budget = host.metadata.context_budget;
                         state.context_input_tokens = None;
                         state.ui_notice = Some(notice);
+                        if let Some(server) = &local_host { server.models.publish(host); }
+                        if let Some(reply) = model_reply.take() { let _ = reply.send(Ok(host.execution_profile.clone())); }
                     }
                     Ok(super::services::Response::Session { host: next_host, options: next_options, client: next, history, run }) => {
                         if !Arc::ptr_eq(host, &next_host) {
@@ -301,9 +315,30 @@ pub(crate) async fn run_tui(
                 }
                 needs_redraw = true;
             }
-            Some(request) = async {
-                match local_host.as_mut() {
-                    Some(server) => server.requests.recv().await,
+            Some(request) = async move {
+                match remote_models {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if state.host_busy || active.is_some() || !state.phase.accepts_new_run() {
+                    let _ = request.reply.send(Err("请等待当前任务或设置操作结束后再切换模型。".into()));
+                    continue;
+                }
+                match request.change.selection(&host.metadata, &host.model).and_then(|selection| serde_json::to_string(&selection).map_err(anyhow::Error::from)) {
+                    Ok(value) => {
+                        let effect = UiEffect::MenuChoice { kind: super::menu::MenuKind::Models, value };
+                        if service_tasks.dispatch(&effect, host.clone(), options.clone(), &mut state) {
+                            model_reply = Some(request.reply);
+                        } else { let _ = request.reply.send(Err("无法切换模型，请刷新后重试。".into())); }
+                    },
+                    Err(error) => { let _ = request.reply.send(Err(error.to_string())); },
+                }
+                needs_redraw = true;
+            }
+            Some(request) = async move {
+                match remote_inputs {
+                    Some(receiver) => receiver.recv().await,
                     None => std::future::pending().await,
                 }
             } => {

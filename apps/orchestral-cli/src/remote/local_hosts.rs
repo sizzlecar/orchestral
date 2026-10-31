@@ -116,6 +116,8 @@ pub(crate) struct LocalHostServer {
     stop: CancellationToken,
     task: tokio::task::JoinHandle<()>,
     pub requests: mpsc::Receiver<LocalRunRequest>,
+    pub model_requests: mpsc::Receiver<super::model_controls::LocalModelRequest>,
+    pub models: Arc<super::model_controls::LocalModelControls>,
 }
 
 impl LocalHostServer {
@@ -136,6 +138,7 @@ impl LocalHostServer {
             .claim_pairing(ticket.secret(), "Local Host gateway")
             .await?;
         let (sender, requests) = mpsc::channel(32);
+        let (models, model_requests) = super::model_controls::LocalModelControls::new(host);
         let stop = CancellationToken::new();
         let now = chrono::Utc::now().timestamp_millis();
         let owner = Arc::new(LocalHostOwner {
@@ -166,6 +169,9 @@ impl LocalHostServer {
             artifact_blob_store: None,
             local_hosts: None,
             local_owner: Some(owner),
+            native_models: Some(Arc::new(super::model_controls::NativeModelControls::Local(
+                models.clone(),
+            ))),
         };
         let registration = Registration {
             version: 1,
@@ -192,6 +198,8 @@ impl LocalHostServer {
             stop,
             task,
             requests,
+            model_requests,
+            models,
         })
     }
 }

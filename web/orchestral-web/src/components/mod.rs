@@ -1,3 +1,4 @@
+mod model_controls;
 mod pending;
 mod session_control;
 mod settings;

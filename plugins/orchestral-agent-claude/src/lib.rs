@@ -8,6 +8,7 @@
 mod approvals;
 mod delivery;
 mod history;
+mod model_controls;
 mod observation;
 mod peer;
 mod provider;
@@ -130,6 +131,12 @@ impl ClaudeCodeConnector {
         })??;
         drop(gate);
         for detail in &mut sessions {
+            if detail.summary.input_action.is_none()
+                && detail.summary.state != AgentSessionState::BusyElsewhere
+            {
+                model_controls::load(self, &detail.summary.session_id)?
+                    .enrich(&mut detail.summary.execution_profile);
+            }
             if let Some(state) = self
                 .provider_state()
                 .session_state(&detail.summary.session_id)
@@ -213,7 +220,7 @@ impl AgentConnector for ClaudeCodeConnector {
                 input_schema: Some(serde_json::json!({"type":"object","properties":{"submission_id":{"type":"string"},"text":{"type":"string"}},"required":["submission_id","text"],"additionalProperties":false})),
                 input_channel: true,
                 execution: AgentSessionActionExecution::Immediate,
-            }],
+            }].into_iter().chain(model_controls::descriptors()).collect(),
         }
     }
 
@@ -300,6 +307,13 @@ impl AgentConnector for ClaudeCodeConnector {
         &self,
         request: InvokeAgentSessionActionRequest,
     ) -> Result<AgentSessionActionOutcome, AgentConnectorError> {
+        if matches!(
+            request.action_id.as_str(),
+            orchestral_core::agent_connector::SESSION_SET_MODEL_ACTION
+                | orchestral_core::agent_connector::SESSION_SET_REASONING_ACTION
+        ) {
+            return model_controls::apply(self, request).await;
+        }
         if request.action_id.as_str() != peer::INPUT_ACTION || request.run_id.is_some() {
             return Err(AgentConnectorError::unsupported(
                 "unsupported Claude session action",
@@ -680,6 +694,70 @@ mod tests {
         assert_eq!(descriptor.agent_family, "coding-agent");
         assert_eq!(descriptor.agent_product.as_deref(), Some("claude"));
         descriptor.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_settings_survive_connector_restart_and_become_explicit_sdk_arguments() {
+        use orchestral_core::agent_connector::{
+            SESSION_SET_MODEL_ACTION, SESSION_SET_REASONING_ACTION,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let connector = connector(root.path());
+        let session = connector
+            .create_session(CreateAgentSessionRequest {
+                cwd: Some(root.path().display().to_string()),
+                title: None,
+                options: Value::Null,
+                extensions: Default::default(),
+            })
+            .await
+            .unwrap();
+        for (action, field, value) in [
+            (SESSION_SET_MODEL_ACTION, "model", "fixture-claude-model"),
+            (SESSION_SET_REASONING_ACTION, "reasoning_effort", "xhigh"),
+        ] {
+            connector
+                .invoke_action(InvokeAgentSessionActionRequest {
+                    session_id: session.session_id.clone(),
+                    action_id: AgentSessionActionId::new(action),
+                    arguments: json!({field:value}),
+                    run_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        drop(connector);
+        let restarted = self::connector(root.path());
+        let detail = restarted.read_session(&session.session_id).await.unwrap();
+        assert_eq!(
+            detail.summary.execution_profile.model.as_deref(),
+            Some("fixture-claude-model")
+        );
+        assert_eq!(
+            detail.summary.execution_profile.reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+        let settings = model_controls::load(&restarted, &session.session_id).unwrap();
+        let mut args = Vec::new();
+        settings.append_args(&mut args);
+        assert_eq!(
+            args,
+            vec!["--model", "fixture-claude-model", "--effort", "xhigh"]
+        );
+        restarted
+            .invoke_action(InvokeAgentSessionActionRequest {
+                session_id: session.session_id.clone(),
+                action_id: AgentSessionActionId::new(SESSION_SET_REASONING_ACTION),
+                arguments: json!({"reasoning_effort":"default"}),
+                run_id: None,
+            })
+            .await
+            .unwrap();
+        let mut args = Vec::new();
+        model_controls::load(&restarted, &session.session_id)
+            .unwrap()
+            .append_args(&mut args);
+        assert_eq!(args, vec!["--model", "fixture-claude-model"]);
     }
 
     #[tokio::test]

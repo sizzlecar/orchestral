@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use orchestral_cli::remote::{PairingTicket, RemoteRegistry};
 
@@ -13,10 +13,7 @@ struct TestRoot {
 
 impl TestRoot {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = uuid::Uuid::new_v4();
         let path = std::env::temp_dir().join(format!(
             "orchestral-remote-host-e2e-{}-{nonce}",
             std::process::id()
@@ -109,6 +106,223 @@ struct HttpResponse {
     status: u16,
     headers: String,
     body: String,
+}
+
+#[tokio::test]
+async fn gateway_model_controls_are_session_scoped_and_recover_from_run_provenance() {
+    use serde_json::{json, Value};
+    let root = TestRoot::new();
+    let config = root.path.join("orchestral.yaml");
+    fs::write(
+        &config,
+        fs::read_to_string(repository_root().join("configs/orchestral.cli.yaml")).unwrap(),
+    )
+    .unwrap();
+    let state_file = root.path.join("remote-control.json");
+    let ticket = PairingTicket::issue(60_000).unwrap();
+    let registry = RemoteRegistry::open(&state_file, Some(ticket.clone())).unwrap();
+    let claim = registry
+        .claim_pairing(ticket.secret(), "Model settings phone")
+        .await
+        .unwrap();
+    let model_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", model_listener.local_addr().unwrap());
+    model_listener.set_nonblocking(true).unwrap();
+    let model_server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut calls = 0;
+        while calls < 4 {
+            assert!(Instant::now() < deadline, "waiting for fixture requests");
+            let (mut stream, _) = match model_listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            let (header_end, length) = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let text = String::from_utf8_lossy(&bytes[..end]);
+                    let length = text
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let body = if length == 0 {
+                json!({"data":[{"id":"fixture-model"},{"id":"alternate-model"}]})
+            } else {
+                let request: Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                if calls == 2 {
+                    assert_eq!(request["model"], "fixture-model");
+                    assert!(request.get("reasoning_effort").is_none());
+                } else {
+                    assert_eq!(request["model"], "alternate-model");
+                    assert_eq!(request["reasoning_effort"], "xhigh");
+                }
+                if calls == 3 {
+                    assert!(request["messages"].to_string().contains("answer-1"));
+                    assert!(!request["messages"].to_string().contains("answer-2"));
+                }
+                let response = if calls == 0 {
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"model-approval","function":{"name":"exec_command","arguments":json!({"cmd":"echo model-approval-ok","sandbox_permissions":"require_escalated","justification":"Run the requested local fixture","wait_mode":"completion","yield_time_ms":1}).to_string()}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":format!("answer-{calls}")},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4}})
+                };
+                calls += 1;
+                response
+            };
+            let encoded = if length == 0 {
+                serde_json::to_vec(&body).unwrap()
+            } else {
+                format!("data: {body}\n\ndata: [DONE]\n\n").into_bytes()
+            };
+            let content_type = if length == 0 {
+                "application/json"
+            } else {
+                "text/event-stream"
+            };
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",encoded.len()).unwrap();
+            stream.write_all(&encoded).unwrap();
+        }
+    });
+    let address = reserve_address();
+    let start_host = || {
+        ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_orchestral"))
+                .current_dir(&root.path)
+                .env("ORCHESTRAL_HOME", root.path.join("home"))
+                .env("OPENAI_API_KEY", "fixture-key")
+                .args([
+                    "serve",
+                    "--listen",
+                    &address.to_string(),
+                    "--state-file",
+                    state_file.to_str().unwrap(),
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--backend",
+                    "openai",
+                    "--model",
+                    "fixture-model",
+                    "--base-url",
+                    &endpoint,
+                    "--no-auth",
+                    "--no-mcp",
+                    "--no-skills",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut child = start_host();
+    wait_for_response(address, "GET", "/api/v1/health", &[], "", &mut child.0);
+    let authorization = format!("Bearer {}", claim.token);
+    let headers = [
+        ("Authorization", authorization.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    let call = |method: &str, path: &str, body: Value| {
+        let response = try_request(address, method, path, &headers, &body.to_string())
+            .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
+        assert!(
+            response.status < 300,
+            "HTTP {}: {}",
+            response.status,
+            response.body
+        );
+        serde_json::from_str::<Value>(&response.body).unwrap()
+    };
+    for id in ["session-a", "session-b"] {
+        call("POST", "/api/v1/sessions", json!({"session_id":id}));
+    }
+    let path = "/api/v1/sessions/session-a/model-settings";
+    call(
+        "POST",
+        path,
+        json!({"model":"alternate-model","expected_model":"fixture-model"}),
+    );
+    call(
+        "POST",
+        path,
+        json!({"reasoning_effort":"xhigh","expected_model":"alternate-model"}),
+    );
+    let original = call(
+        "GET",
+        "/api/v1/sessions/session-b/model-settings",
+        Value::Null,
+    );
+    assert_eq!(original["profile"]["model"], "fixture-model");
+    let wait_done = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let view = call("GET", &format!("/api/v1/runs/{id}"), Value::Null);
+            if view["state"]["state"] == "terminal" {
+                assert_eq!(view["state"]["terminal"]["type"], "delivered", "{view}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "{view}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    for (session, run) in [("session-a", "run-a"), ("session-b", "run-b")] {
+        call(
+            "POST",
+            &format!("/api/v1/sessions/{session}/runs"),
+            json!({"run_id":run,"input":format!("Input for {session}")}),
+        );
+        if session == "session-a" {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let request_id = loop {
+                let view = call("GET", &format!("/api/v1/runs/{run}"), Value::Null);
+                if let Some(id) = view["pending_requests"][0]["request_id"].as_str() {
+                    break id.to_owned();
+                }
+                assert!(Instant::now() < deadline, "approval did not open: {view}");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            call(
+                "POST",
+                &format!("/api/v1/runs/{run}/requests/{request_id}/approval"),
+                json!({"command_id":"approve-selected-model","decision":"allow_once"}),
+            );
+        }
+        wait_done(run);
+    }
+    drop(child);
+    let mut child = start_host();
+    wait_for_response(address, "GET", "/api/v1/health", &[], "", &mut child.0);
+    let recovered = call("GET", path, Value::Null);
+    assert_eq!(recovered["profile"]["model"], "alternate-model");
+    assert_eq!(recovered["profile"]["reasoning_effort"], "xhigh");
+    call(
+        "POST",
+        "/api/v1/sessions/session-a/runs",
+        json!({"run_id":"run-a2","input":"Continue from the recorded answer"}),
+    );
+    wait_done("run-a2");
+    drop(child);
+    model_server.join().unwrap();
 }
 
 fn wait_for_response(

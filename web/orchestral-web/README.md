@@ -22,6 +22,18 @@ Orch sessions initially load their latest 20 Runs, newest first, while displayin
 them chronologically. Earlier Runs are loaded on demand with the reading position
 preserved. Run event streams remain complete for correct protocol reduction.
 
+Each pane's **模型** button opens model and reasoning settings for that session.
+Orch lists the current service's models and configured profiles, and accepts a
+custom model ID. External Agents expose their own supported options through
+session actions. Applying a change preserves conversation history and affects
+subsequent requests; active tasks must finish first. Each pane remains independent.
+Codex resolves `default` from its native model catalog. Claude SDK preferences
+survive Host restarts; existing native Claude terminals keep their own settings
+and must be changed in that terminal. Orch selections survive page refreshes and
+are recovered from Run provenance after the next request; selections made before
+any request are held by the running Host. Existing Orchestral terminals must be
+restarted with the updated binary to expose these controls.
+
 When the page is hidden or leaves the foreground, browser session and Run
 streams pause. Host-owned execution continues. Returning to the page refreshes
 native history and resumes observation without clearing drafts or loaded history.
@@ -75,6 +87,7 @@ node scripts/pwa_local_host_smoke.cjs
 node scripts/pwa_dual_session_smoke.cjs
 node scripts/pwa_history_sync_smoke.cjs
 node scripts/pwa_power_smoke.cjs
+node scripts/pwa_model_controls_smoke.cjs
 node scripts/pwa_draft_smoke.cjs
 node scripts/pwa_mobile_layout_smoke.cjs
 PWA_SMOKE_ENGINE=webkit node scripts/pwa_mobile_layout_smoke.cjs
@@ -119,3 +132,8 @@ the real worker, simulates a release while the page stays open, and checks
 foreground update detection, the explicit refresh action, and preservation of
 drafts in multiple sessions. Device-specific suspend/resume still needs device
 testing.
+
+The model-controls smoke verifies per-session model and reasoning changes for
+both built-in Orch and declared external Agent actions, failure/retry, refreshed
+reasoning choices after model selection, and mobile overflow. It makes no paid
+model requests.

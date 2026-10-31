@@ -215,6 +215,7 @@ pub struct RemoteApiState {
     pub artifact_blob_store: Option<Arc<dyn BlobStore>>,
     pub(crate) local_hosts: Option<Arc<super::local_hosts::LocalHostDirectory>>,
     pub(crate) local_owner: Option<Arc<super::local_hosts::LocalHostOwner>>,
+    pub(crate) native_models: Option<Arc<super::model_controls::NativeModelControls>>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +358,10 @@ pub fn router(state: RemoteApiState) -> Router {
         .route("/devices/{device_id}", delete(revoke_device))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}", get(get_session))
+        .route(
+            "/sessions/{session_id}/model-settings",
+            get(get_model_settings).post(change_model_settings),
+        )
         .route("/sessions/{session_id}/runs", post(start_run))
         .route("/agent-connectors", get(list_agent_connectors))
         .route(
@@ -533,6 +538,65 @@ async fn get_session(
         .find(|session| session.id == session_id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("session_not_found", "session was not found"))
+}
+
+async fn get_model_settings(
+    State(state): State<RemoteApiState>,
+    Path(session): Path<String>,
+) -> Result<Json<super::model_controls::ModelSettingsView>, ApiError> {
+    if state
+        .local_owner
+        .as_ref()
+        .is_some_and(|owner| owner.session.id != session)
+    {
+        return Err(ApiError::not_found(
+            "session_not_found",
+            "session was not found",
+        ));
+    }
+    let controls = state.native_models.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "model_controls_unavailable",
+            "此主机版本尚未提供模型切换，请更新拥有此会话的终端。",
+        )
+    })?;
+    controls.view(&session).await.map(Json).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "model_settings_unavailable",
+            error.to_string(),
+        )
+    })
+}
+
+async fn change_model_settings(
+    State(state): State<RemoteApiState>,
+    Path(session): Path<String>,
+    Json(change): Json<super::model_controls::ModelChange>,
+) -> Result<Json<orchestral_core::agent_connector::AgentSessionExecutionProfile>, ApiError> {
+    if state
+        .local_owner
+        .as_ref()
+        .is_some_and(|owner| owner.session.id != session)
+    {
+        return Err(ApiError::not_found(
+            "session_not_found",
+            "session was not found",
+        ));
+    }
+    let controls = state.native_models.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "model_controls_unavailable",
+            "此主机版本尚未提供模型切换。",
+        )
+    })?;
+    controls
+        .change(&session, change)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::conflict("model_settings_rejected", error.to_string()))
 }
 
 async fn list_agent_connectors(
@@ -1094,6 +1158,11 @@ async fn invoke_agent_session_action(
     State(state): State<RemoteApiState>,
     Json(request): Json<InvokeExternalAgentSessionActionRequest>,
 ) -> Result<Json<AgentSessionActionOutcome>, ApiError> {
+    let coordinator = state.session_coordinators.get(
+        &AgentConnectorId::new(&request.connector_id),
+        &AgentSessionId::new(&request.session_id),
+    );
+    let _operation = coordinator.operation().lock().await;
     Ok(Json(
         state
             .agent_directory
@@ -1736,6 +1805,24 @@ async fn start_run(
     let session_id = AgentSessionId::new(session_id);
     state.agent.create_session(Some(session_id.clone())).await?;
     let run_id = RunId::new(request.run_id);
+    if state.agent.has_run(&run_id).await? {
+        let view = state.agent.inspect(&run_id).await?;
+        if view.execution.session_id != session_id
+            || state.agent.initial_input(&run_id).await? != vec![Content::text(&request.input)]
+        {
+            return Err(ApiError::conflict(
+                "run_id_conflict",
+                "Run identity was already used with different input or session.",
+            ));
+        }
+        return Ok((
+            StatusCode::CREATED,
+            Json(StartRunResponse {
+                view: RemoteRunView::new(&state, None, view, vec![Content::text(request.input)]),
+                run_id,
+            }),
+        ));
+    }
     let handle = if let Some(owner) = &state.local_owner {
         use super::local_hosts::LocalRunStartError;
         owner
@@ -1752,6 +1839,13 @@ async fn start_run(
                 ),
                 LocalRunStartError::Agent(error) => ApiError::from(error),
             })?
+    } else if let Some(controls) = &state.native_models {
+        let (handle, agent) = controls
+            .start(&session_id, run_id.clone(), request.input)
+            .await
+            .map_err(|error| ApiError::conflict("native_run_start_rejected", error.to_string()))?;
+        spawn_run_supervisor(state.clone(), agent, None, run_id.clone());
+        handle
     } else {
         let handle = state
             .agent
@@ -1903,7 +1997,14 @@ async fn supervise_run(
         }
 
         failures = 0;
-        apply_remembered_approvals(&state, &agent, &run_id, &view.pending_requests).await;
+        apply_remembered_approvals(
+            &state,
+            &agent,
+            connector_id.as_ref(),
+            &run_id,
+            &view.pending_requests,
+        )
+        .await;
 
         // Drain activity that arrived during inspection/approval awaits before
         // deciding to cancel. Durable gaps are recovered from the journal; a
@@ -2159,16 +2260,23 @@ pub(super) fn is_retryable_agent_error(error: &AgentSdkError) -> bool {
 async fn apply_remembered_approvals(
     state: &RemoteApiState,
     agent: &AgentApi,
+    connector_id: Option<&AgentConnectorId>,
     run_id: &RunId,
     requests: &[PendingRequest],
 ) {
+    let approvals = match (&state.native_models, connector_id) {
+        (Some(controls), None) => controls
+            .approvals_for_run(run_id)
+            .await
+            .unwrap_or_else(|_| state.approvals.clone()),
+        _ => state.approvals.clone(),
+    };
     for request in requests {
         if !matches!(request.payload, PendingRequestPayload::Approval { .. }) {
             continue;
         }
-        let Ok(Some(grant_ref)) = state
-            .approvals
-            .approve_if_remembered(&request.request_id, approval_expiry_ms())
+        let Ok(Some(grant_ref)) =
+            approvals.approve_if_remembered(&request.request_id, approval_expiry_ms())
         else {
             continue;
         };
@@ -2714,11 +2822,22 @@ async fn resolve_approval(
             "pending request is not an approval",
         ));
     };
+    let approvals = if connector_id.is_none() {
+        match &state.native_models {
+            Some(controls) => controls
+                .approvals_for_run(&run_id)
+                .await
+                .map_err(ApiError::from)?,
+            None => state.approvals.clone(),
+        }
+    } else {
+        state.approvals.clone()
+    };
     let (decision, grant_ref) = match request.decision {
         ApprovalChoice::Deny => (ApprovalDecision::Deny, None),
         ApprovalChoice::AllowOnce => (
             ApprovalDecision::Allow,
-            Some(state.approvals.approve(&request_id, approval_expiry_ms())?),
+            Some(approvals.approve(&request_id, approval_expiry_ms())?),
         ),
         ApprovalChoice::AllowSession => {
             if session_approval_scope.is_none() {
@@ -2729,11 +2848,7 @@ async fn resolve_approval(
             }
             (
                 ApprovalDecision::Allow,
-                Some(
-                    state
-                        .approvals
-                        .approve_for_session(&request_id, approval_expiry_ms())?,
-                ),
+                Some(approvals.approve_for_session(&request_id, approval_expiry_ms())?),
             )
         }
     };
@@ -2804,7 +2919,17 @@ async fn require_run(
                 .agent_api(&AgentConnectorId::new(connector_id))
                 .await?
         }
-        None => state.agent.clone(),
+        None => match &state.native_models {
+            Some(controls) => {
+                controls
+                    .api_for_run(&RunId::new(&run_id))
+                    .await
+                    .map_err(|error| {
+                        ApiError::conflict("model_configuration_unavailable", error.to_string())
+                    })?
+            }
+            None => state.agent.clone(),
+        },
     };
     let run_id = RunId::new(run_id);
     if !agent.has_run(&run_id).await? {
@@ -2981,6 +3106,23 @@ async fn session_views(state: &RemoteApiState) -> Result<Vec<SessionView>, Agent
         sessions
             .entry(owner.session.id.clone())
             .or_insert_with(|| owner.session.clone());
+    }
+    if let Some(controls) = &state.native_models {
+        for session in sessions.values_mut() {
+            if let Some(profile) = controls.profile(&session.id).await {
+                session.execution_profile = profile;
+            } else if let Some(run) = session.run_ids.last() {
+                let extensions = state.agent.run_extensions(&RunId::new(run)).await?;
+                if let Some(origin) =
+                    orchestral_core::session_history::SessionOrigin::from_extensions(&extensions)
+                        .map_err(|error| AgentSdkError::InvalidInput(error.to_string()))?
+                {
+                    session.execution_profile.model = Some(origin.model);
+                    session.execution_profile.reasoning_effort =
+                        origin.reasoning.map(|value| value.to_string());
+                }
+            }
+        }
     }
     if let Some(directory) = &state.local_hosts {
         for session in directory
@@ -4342,6 +4484,7 @@ mod tests {
                 session_coordinators: Arc::default(),
                 local_hosts: None,
                 local_owner: None,
+                native_models: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4395,6 +4538,7 @@ mod tests {
                 session_coordinators: Arc::default(),
                 local_hosts: None,
                 local_owner: None,
+                native_models: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4468,6 +4612,7 @@ mod tests {
                 session_coordinators: Arc::default(),
                 local_hosts: None,
                 local_owner: None,
+                native_models: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4501,6 +4646,7 @@ mod tests {
                 session_coordinators: Arc::default(),
                 local_hosts: None,
                 local_owner: None,
+                native_models: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -4543,6 +4689,7 @@ mod tests {
                 session_coordinators: Arc::default(),
                 local_hosts: None,
                 local_owner: None,
+                native_models: None,
                 artifact_resolver: None,
                 artifact_blob_store: None,
             }),
@@ -5561,6 +5708,7 @@ mod tests {
             session_coordinators: Arc::default(),
             local_hosts: None,
             local_owner: None,
+            native_models: None,
             artifact_resolver: None,
             artifact_blob_store: None,
         };

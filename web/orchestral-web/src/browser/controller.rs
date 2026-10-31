@@ -25,6 +25,8 @@ use crate::state::{
 };
 use crate::tasks::AppTaskScope;
 
+mod model_controls;
+
 const AGENT_HISTORY_PAGE_LIMIT: u32 = 100;
 const AGENT_SESSION_LIST_PAGE_LIMIT: u32 = 25;
 const AGENT_OBSERVER_ACTIVE_INTERVAL_MS: u32 = 1_500;
@@ -1029,6 +1031,7 @@ impl AppController {
             state.sessions.selected_id = Some(session_key.clone());
             state.ui.drawer_open = false;
             state.ui.session_actions_open = false;
+            state.ui.model_controls.close();
             state.ui.timeline_scrolled_away = false;
             state.open_builtin_history(&session_key);
         }
