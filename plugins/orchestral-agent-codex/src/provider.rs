@@ -530,6 +530,13 @@ impl CodexConnector {
             },
         };
         if let Some(turn_id) = active_turn_id {
+            if self.pending_model_selection(&session_id).is_some() {
+                self.remove_failed_start(&run);
+                return Err(AgentStartError::Rejected(AgentRejection::new(
+                    AgentRejectionCode::SessionConflict,
+                    "请等待当前原生任务结束；新的模型设置不能应用到正在运行的任务。",
+                )));
+            }
             // Persist the authoritative target before dispatch so a lost
             // response can be recovered against the same native turn without
             // issuing the steer twice.
@@ -583,18 +590,11 @@ impl CodexConnector {
             });
             return Ok(());
         }
-        let result = match connected
-            .rpc
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": session_id.as_str(),
-                    "clientUserMessageId": queued_client_message_id(&run.execution),
-                    "input": input
-                }),
-            )
-            .await
-        {
+        let mut turn_params = json!({"threadId": session_id.as_str(), "clientUserMessageId": queued_client_message_id(&run.execution), "input": input});
+        if let Some(settings) = self.pending_model_selection(&session_id) {
+            settings.parameters(&mut turn_params);
+        }
+        let result = match connected.rpc.request("turn/start", turn_params).await {
             Ok(result) => result,
             Err(
                 error @ (CodexTransportError::Timeout
@@ -621,6 +621,7 @@ impl CodexConnector {
             .to_owned();
         *lock(&run.route) = Some(NativeRunRoute::Direct);
         establish_turn(&run, &turn_id);
+        self.commit_pending_model_selection(&session_id);
         tokio::spawn(async move {
             monitor_native_run(connected.rpc.clone(), run, turn_id, notifications).await;
         });
@@ -633,6 +634,16 @@ impl CodexConnector {
         run: Arc<CodexRun>,
         input: Value,
     ) -> Result<(), AgentStartError> {
+        if self
+            .pending_model_selection(&run.execution.session_id)
+            .is_some()
+        {
+            self.remove_failed_start(&run);
+            return Err(AgentStartError::Rejected(AgentRejection::new(
+                AgentRejectionCode::SessionConflict,
+                "请等待原生任务结束后，再使用新的模型设置发送请求。",
+            )));
+        }
         let session_id = run.execution.session_id.clone();
         let client_message_id = queued_client_message_id(&run.execution);
         let input_digest =
@@ -1140,7 +1151,7 @@ async fn find_native_turn_with_items_view(
     }
 }
 
-fn unmaterialized_resume_without_rollout(error: &CodexTransportError) -> bool {
+pub(super) fn unmaterialized_resume_without_rollout(error: &CodexTransportError) -> bool {
     matches!(
         error,
         CodexTransportError::Rpc(message)
@@ -8536,73 +8547,102 @@ mod tests {
 
     #[tokio::test]
     async fn loaded_unmaterialized_thread_can_receive_its_first_turn_after_reconnect() {
-        let (client_io, server_io) = duplex(1024 * 1024);
-        let (client_read, client_write) = tokio::io::split(client_io);
-        let (server_read, mut server_write) = tokio::io::split(server_io);
-        let rpc = CodexRpcClient::from_io(
-            client_read,
-            client_write,
-            Duration::from_secs(1),
-            1024 * 1024,
-        );
-        let connector = CodexConnector::with_client(rpc, "codex/test");
-        let server = tokio::spawn(async move {
-            let mut lines = BufReader::new(server_read).lines();
-            let resume = next_request(&mut lines).await;
-            assert_eq!(resume["method"], "thread/resume");
-            server_write
-                .write_all(
-                    format!(
-                        "{}\n",
-                        json!({
-                            "id": resume["id"],
-                            "error": {
-                                "code": -32000,
-                                "message": "no rollout found for thread id thread-empty-loaded"
-                            }
-                        })
+        use orchestral_core::agent_connector::AgentConnector;
+        for with_settings in [false, true] {
+            let (client_io, server_io) = duplex(1024 * 1024);
+            let (client_read, client_write) = tokio::io::split(client_io);
+            let (server_read, mut server_write) = tokio::io::split(server_io);
+            let rpc = CodexRpcClient::from_io(
+                client_read,
+                client_write,
+                Duration::from_secs(1),
+                1024 * 1024,
+            );
+            let connector = CodexConnector::with_client(rpc, "codex/test");
+            let server = tokio::spawn(async move {
+                let mut lines = BufReader::new(server_read).lines();
+                if with_settings {
+                    for (field, value) in
+                        [("model", "selected-model"), ("reasoning_effort", "high")]
+                    {
+                        let read = next_request(&mut lines).await;
+                        assert_eq!(read["method"], "thread/read");
+                        server_write.write_all(format!("{}\n", json!({"id":read["id"],"result":{"thread":{"id":"thread-empty-loaded","cwd":"/repo","status":{"type":"idle"},"createdAt":1,"updatedAt":1,"preview":""}}})).as_bytes()).await.unwrap();
+                        let update = next_request(&mut lines).await;
+                        assert_eq!(update["method"], "thread/resume");
+                        if field == "model" {
+                            assert_eq!(update["params"]["model"], value);
+                        } else {
+                            assert_eq!(update["params"]["config"]["model_reasoning_effort"], value);
+                        }
+                        server_write.write_all(format!("{}\n", json!({"id":update["id"],"error":{"code":-32000,"message":"no rollout found for thread id thread-empty-loaded"}})).as_bytes()).await.unwrap();
+                        let loaded = next_request(&mut lines).await;
+                        assert_eq!(loaded["method"], "thread/loaded/list");
+                        server_write.write_all(format!("{}\n", json!({"id":loaded["id"],"result":{"data":["thread-empty-loaded"],"nextCursor":null}})).as_bytes()).await.unwrap();
+                    }
+                }
+                let resume = next_request(&mut lines).await;
+                assert_eq!(resume["method"], "thread/resume");
+                server_write
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "id": resume["id"],
+                                "error": {
+                                    "code": -32000,
+                                    "message": "no rollout found for thread id thread-empty-loaded"
+                                }
+                            })
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
+                    .await
+                    .unwrap();
 
-            let loaded = next_request(&mut lines).await;
-            assert_eq!(loaded["method"], "thread/loaded/list");
-            server_write
-                .write_all(
-                    format!(
-                        "{}\n",
-                        json!({
-                            "id": loaded["id"],
-                            "result": {"data": ["thread-empty-loaded"], "nextCursor": null}
-                        })
+                let loaded = next_request(&mut lines).await;
+                assert_eq!(loaded["method"], "thread/loaded/list");
+                server_write
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "id": loaded["id"],
+                                "result": {"data": ["thread-empty-loaded"], "nextCursor": null}
+                            })
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
+                    .await
+                    .unwrap();
 
-            let read = next_request(&mut lines).await;
-            assert_eq!(read["method"], "thread/turns/list");
-            server_write
-                .write_all(
-                    format!(
-                        "{}\n",
-                        json!({
-                            "id": read["id"],
-                            "result": {"data": [], "nextCursor": null, "backwardsCursor": null}
-                        })
+                let read = next_request(&mut lines).await;
+                assert_eq!(read["method"], "thread/turns/list");
+                server_write
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "id": read["id"],
+                                "result": {"data": [], "nextCursor": null, "backwardsCursor": null}
+                            })
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
+                    .await
+                    .unwrap();
 
-            let start = next_request(&mut lines).await;
-            assert_eq!(start["method"], "turn/start");
-            assert_eq!(start["params"]["threadId"], "thread-empty-loaded");
-            server_write
+                let start = next_request(&mut lines).await;
+                assert_eq!(start["method"], "turn/start");
+                assert_eq!(start["params"]["threadId"], "thread-empty-loaded");
+                if with_settings {
+                    assert_eq!(start["params"]["model"], "selected-model");
+                    assert_eq!(start["params"]["effort"], "high");
+                } else {
+                    assert!(start["params"].get("model").is_none());
+                    assert!(start["params"].get("effort").is_none());
+                }
+                server_write
                 .write_all(
                     format!(
                         "{}\n",
@@ -8615,44 +8655,79 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            server_write
-                .write_all(
-                    format!(
-                        "{}\n",
-                        json!({
-                            "method": "turn/completed",
-                            "params": {
-                                "threadId": "thread-empty-loaded",
-                                "turn": {"id": "turn-first", "status": "completed", "items": []}
-                            }
-                        })
+                server_write
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "method": "turn/completed",
+                                "params": {
+                                    "threadId": "thread-empty-loaded",
+                                    "turn": {"id": "turn-first", "status": "completed", "items": []}
+                                }
+                            })
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        });
+                    .await
+                    .unwrap();
+            });
 
-        let mut stream = connector
-            .start(start_request("thread-empty-loaded", "run-first"))
-            .await
-            .unwrap()
-            .stream;
-        loop {
-            let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            if with_settings {
+                for (action, field, value) in [
+                    (
+                        orchestral_core::agent_connector::SESSION_SET_MODEL_ACTION,
+                        "model",
+                        "selected-model",
+                    ),
+                    (
+                        orchestral_core::agent_connector::SESSION_SET_REASONING_ACTION,
+                        "reasoning_effort",
+                        "high",
+                    ),
+                ] {
+                    let outcome = connector
+                        .invoke_action(
+                            orchestral_core::agent_connector::InvokeAgentSessionActionRequest {
+                                session_id: AgentSessionId::new("thread-empty-loaded"),
+                                action_id:
+                                    orchestral_core::agent_connector::AgentSessionActionId::new(
+                                        action,
+                                    ),
+                                arguments: json!({field:value}),
+                                run_id: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let profile = outcome.session.unwrap().execution_profile;
+                    assert_eq!(profile.model.as_deref(), Some("selected-model"));
+                }
+            }
+            let mut stream = connector
+                .start(start_request("thread-empty-loaded", "run-first"))
                 .await
                 .unwrap()
-                .unwrap()
-                .unwrap();
-            if matches!(
-                item,
-                AgentProviderStreamItem::Event(event)
-                    if matches!(event.payload, AgentEvent::DeliveryCommitted { .. })
-            ) {
-                break;
+                .stream;
+            loop {
+                let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if matches!(
+                    item,
+                    AgentProviderStreamItem::Event(event)
+                        if matches!(event.payload, AgentEvent::DeliveryCommitted { .. })
+                ) {
+                    break;
+                }
             }
+            server.await.unwrap();
+            assert!(connector
+                .pending_model_selection(&AgentSessionId::new("thread-empty-loaded"))
+                .is_none());
         }
-        server.await.unwrap();
     }
 
     #[tokio::test]

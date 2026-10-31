@@ -1125,6 +1125,7 @@ pub struct ConnectionState {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UiState {
+    pub model_controls: crate::model_controls::ModelControlsState,
     pub drawer_open: bool,
     /// Active session source tab (`orchestral` or an Agent connector id).
     pub session_tab: Option<String>,

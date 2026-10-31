@@ -204,7 +204,10 @@ impl AgentProvider for ClaudeCodeConnector {
             .transcript_exists(&execution.session_id)
             .await
             .map_err(|error| reject(AgentRejectionCode::ProviderUnavailable, error.to_string()))?;
-        let args = process_args(&execution.session_id, resume);
+        let mut args = process_args(&execution.session_id, resume);
+        crate::model_controls::load(self, &execution.session_id)
+            .map_err(|error| reject(AgentRejectionCode::InvalidSpec, error.to_string()))?
+            .append_args(&mut args);
         let run = {
             let mut state = self.provider_state();
             if state

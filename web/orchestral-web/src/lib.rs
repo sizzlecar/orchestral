@@ -8,6 +8,7 @@
 pub(crate) mod catalog;
 pub mod markdown;
 pub mod model;
+pub mod model_controls;
 pub mod presentation;
 pub mod sse;
 pub mod state;

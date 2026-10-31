@@ -199,3 +199,106 @@ fn wait_registration(workspace: &TestWorkspace) -> Value {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn local_host_model_controls_update_the_terminal_and_next_wire_request() {
+    let _guard = local_e2e_guard();
+    let workspace = TestWorkspace::new("local-model-controls");
+    let (endpoint, server) = spawn_fixture_http_server(vec![
+        Box::new(|request| {
+            assert_eq!(request.body["model"], "fixture-model");
+            openai_text_response("ORIGINAL_MODEL_ANSWER")
+        }),
+        Box::new(|request| {
+            assert_eq!(request.body["model"], "next-fixture-model");
+            assert_eq!(request.body["reasoning_effort"], "xhigh");
+            assert!(model_request_text(&request.body).contains("ORIGINAL_MODEL_ANSWER"));
+            openai_tool_response(
+                "waiting",
+                "orchestral_request_input",
+                json!({"prompt":"NEW_MODEL_WAITING"}),
+            )
+        }),
+    ]);
+    workspace.configure_local_openai(&endpoint);
+    let mut tui = PtyHarness::spawn_with_size(
+        local_tui_command(&workspace, "model-settings-session", "Follow the user."),
+        120,
+        30,
+    );
+    tui.wait_for_screen(|s| s.contains("Ask Orchestral"), LOCAL_PROCESS_TIMEOUT);
+    let registration = wait_registration(&workspace);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let request = |method: reqwest::Method, path: &str, body: Value| {
+        runtime.block_on(async {
+            let response = client
+                .request(
+                    method,
+                    format!("http://{}{path}", registration["address"].as_str().unwrap()),
+                )
+                .bearer_auth(registration["token"].as_str().unwrap())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response.json::<Value>().await.unwrap())
+        })
+    };
+    tui.send_paste("First turn");
+    tui.wait_for_screen(
+        |s| s.contains("ORIGINAL_MODEL_ANSWER") && s.contains("replied"),
+        LOCAL_PROCESS_TIMEOUT,
+    );
+    let path = "/sessions/model-settings-session/model-settings";
+    let (status, view) = request(reqwest::Method::GET, path, Value::Null);
+    assert!(status.is_success(), "{view}");
+    assert_eq!(view["profile"]["model"], "fixture-model");
+    let (status, changed) = request(
+        reqwest::Method::POST,
+        path,
+        json!({"model":"next-fixture-model","expected_model":"fixture-model"}),
+    );
+    assert!(status.is_success(), "{changed}");
+    assert_eq!(changed["model"], "next-fixture-model");
+    let (status, changed) = request(
+        reqwest::Method::POST,
+        path,
+        json!({"reasoning_effort":"xhigh","expected_model":"next-fixture-model"}),
+    );
+    assert!(status.is_success(), "{changed}");
+    assert_eq!(changed["reasoning_effort"], "xhigh");
+    let (status, _) = request(
+        reqwest::Method::POST,
+        path,
+        json!({"reasoning_effort":"low","expected_model":"fixture-model"}),
+    );
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    let (_, sessions) = request(reqwest::Method::GET, "/sessions", Value::Null);
+    assert_eq!(
+        sessions[0]["execution_profile"]["model"],
+        "next-fixture-model"
+    );
+    assert_eq!(
+        sessions[0]["execution_profile"]["reasoning_effort"],
+        "xhigh"
+    );
+    tui.send_paste("Second turn");
+    tui.wait_for_screen(|s| s.contains("NEW_MODEL_WAITING"), LOCAL_PROCESS_TIMEOUT);
+    let (status, _) = request(
+        reqwest::Method::POST,
+        path,
+        json!({"model":"third-fixture-model","expected_model":"next-fixture-model"}),
+    );
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    tui.send(b"\x03");
+    tui.wait_for_screen(|s| s.contains("cancelled"), LOCAL_PROCESS_TIMEOUT);
+    tui.send(b"\x04");
+    assert!(tui.finish(LOCAL_PROCESS_TIMEOUT).status.success());
+    assert_eq!(server.join().unwrap().len(), 2);
+}

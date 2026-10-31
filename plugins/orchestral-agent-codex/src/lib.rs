@@ -4,6 +4,7 @@
 //! names and compatibility handling stay inside this concrete plugin.
 
 mod generated_artifact;
+mod model_controls;
 mod normalize;
 mod provider;
 mod transport;
@@ -28,8 +29,8 @@ use orchestral_core::agent_connector::{
     AgentSessionListQuery, AgentSessionPage, AgentSessionPermissions, AgentSessionReadQuery,
     AgentSessionSummary, AgentSessionTurnId, AgentSessionTurnStatus, CreateAgentSessionRequest,
     InvokeAgentSessionActionRequest, ResolveAgentSessionRequest, SESSION_COMPACT_ACTION,
-    SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION,
-    SESSION_SET_PERMISSIONS_ACTION,
+    SESSION_FORK_ACTION, SESSION_RENAME_ACTION, SESSION_REVIEW_ACTION, SESSION_SET_MODEL_ACTION,
+    SESSION_SET_PERMISSIONS_ACTION, SESSION_SET_REASONING_ACTION,
 };
 use orchestral_core::agent_protocol::wire::{
     AgentSessionId, PendingRequest, PendingRequestKind, ProviderBindingRef, RequestId,
@@ -118,6 +119,7 @@ pub struct CodexConnector {
         Arc<StdMutex<BTreeMap<String, BTreeMap<RequestId, SessionPendingRequest>>>>,
     session_ancestor_cache: Arc<AsyncMutex<BTreeMap<String, Vec<String>>>>,
     session_execution_profiles: Arc<StdMutex<BTreeMap<String, AgentSessionExecutionProfile>>>,
+    pending_model_settings: StdMutex<BTreeMap<String, model_controls::PendingSettings>>,
     session_list_cache: StdMutex<BTreeMap<SessionListCacheKey, SessionListCacheEntry>>,
     session_list_cache_path: Option<PathBuf>,
     session_list_gate: AsyncMutex<()>,
@@ -141,6 +143,7 @@ impl CodexConnector {
             session_pending_requests: Arc::new(StdMutex::new(BTreeMap::new())),
             session_ancestor_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
             session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
+            pending_model_settings: StdMutex::new(BTreeMap::new()),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
             session_list_gate: AsyncMutex::new(()),
@@ -325,6 +328,14 @@ impl CodexConnector {
             .cloned()
         {
             summary.execution_profile = profile;
+        }
+        if let Some(settings) = self
+            .pending_model_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(summary.session_id.as_str())
+        {
+            settings.enrich(&mut summary.execution_profile);
         }
         summary
     }
@@ -750,6 +761,7 @@ impl CodexConnector {
             session_pending_requests: Arc::new(StdMutex::new(BTreeMap::new())),
             session_ancestor_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
             session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
+            pending_model_settings: StdMutex::new(BTreeMap::new()),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
             session_list_gate: AsyncMutex::new(()),
@@ -783,6 +795,7 @@ impl CodexConnector {
             session_pending_requests: Arc::new(StdMutex::new(BTreeMap::new())),
             session_ancestor_cache: Arc::new(AsyncMutex::new(BTreeMap::new())),
             session_execution_profiles: Arc::new(StdMutex::new(BTreeMap::new())),
+            pending_model_settings: StdMutex::new(BTreeMap::new()),
             session_list_cache: StdMutex::new(BTreeMap::new()),
             session_list_cache_path: None,
             session_list_gate: AsyncMutex::new(()),
@@ -887,6 +900,8 @@ impl AgentConnector for CodexConnector {
                     input_channel: false,
                     execution: AgentSessionActionExecution::Immediate,
                 },
+                model_controls::descriptor(SESSION_SET_MODEL_ACTION, &self.creation_schema),
+                model_controls::descriptor(SESSION_SET_REASONING_ACTION, &self.creation_schema),
             ],
         }
     }
@@ -1284,6 +1299,9 @@ impl AgentConnector for CodexConnector {
             return Err(AgentConnectorError::invalid("session id must not be empty"));
         }
         let session = match request.action_id.as_str() {
+            SESSION_SET_MODEL_ACTION | SESSION_SET_REASONING_ACTION => {
+                Some(model_controls::apply(self, &request).await?)
+            }
             SESSION_FORK_ACTION => {
                 if !request.arguments.is_null() {
                     return Err(AgentConnectorError::invalid(
@@ -3309,6 +3327,85 @@ mod tests {
             .unwrap();
         assert_eq!(change.session_id, created.session_id);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_actions_update_native_settings_without_starting_a_turn_or_changing_permissions()
+    {
+        for (action, field, value) in [
+            (SESSION_SET_MODEL_ACTION, "model", "new-native-model"),
+            (
+                SESSION_SET_REASONING_ACTION,
+                "reasoning_effort",
+                "future-effort",
+            ),
+            (SESSION_SET_REASONING_ACTION, "reasoning_effort", "default"),
+        ] {
+            let (client_io, server_io) = duplex(128 * 1024);
+            let (client_read, client_write) = tokio::io::split(client_io);
+            let (server_read, mut server_write) = tokio::io::split(server_io);
+            let rpc = CodexRpcClient::from_io(
+                client_read,
+                client_write,
+                Duration::from_secs(1),
+                1024 * 1024,
+            );
+            let connector = CodexConnector::with_client(rpc, "codex-fixture");
+            connector.remember_execution_profile(
+                &AgentSessionId::new("model-thread"),
+                &json!({"model":"new-native-model"}),
+            );
+            let expected = if value == "default" {
+                "native-default"
+            } else {
+                value
+            };
+            let server = tokio::spawn(async move {
+                let mut requests = BufReader::new(server_read).lines();
+                let read = read_request(&mut requests).await;
+                assert_eq!(read["method"], "thread/read");
+                write_result(
+                    &mut server_write,
+                    &read,
+                    json!({"thread":thread("model-thread", Value::Null)}),
+                )
+                .await;
+                if value == "default" {
+                    let catalog = read_request(&mut requests).await;
+                    assert_eq!(catalog["method"], "model/list");
+                    write_result(&mut server_write, &catalog, json!({"data":[{"model":"new-native-model","defaultReasoningEffort":"native-default"}],"nextCursor":null})).await;
+                }
+                let update = read_request(&mut requests).await;
+                assert_eq!(update["method"], "thread/resume");
+                assert_eq!(update["params"]["threadId"], "model-thread");
+                assert!(update["params"].get("sandbox").is_none());
+                assert!(update["params"].get("approvalPolicy").is_none());
+                if action == SESSION_SET_MODEL_ACTION {
+                    assert_eq!(update["params"]["model"], value);
+                } else {
+                    assert_eq!(
+                        update["params"]["config"]["model_reasoning_effort"],
+                        json!(expected)
+                    );
+                }
+                write_result(&mut server_write, &update, json!({"thread":thread("model-thread",Value::Null),"model":"new-native-model","reasoningEffort":json!(expected)})).await;
+            });
+            let result = connector
+                .invoke_action(InvokeAgentSessionActionRequest {
+                    session_id: AgentSessionId::new("model-thread"),
+                    action_id: AgentSessionActionId::new(action),
+                    arguments: json!({field:value}),
+                    run_id: None,
+                })
+                .await
+                .unwrap();
+            let profile = result.session.unwrap().execution_profile;
+            assert_eq!(profile.model.as_deref(), Some("new-native-model"));
+            if field == "reasoning_effort" {
+                assert_eq!(profile.reasoning_effort.as_deref(), Some(expected));
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

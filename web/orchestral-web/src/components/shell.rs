@@ -5,6 +5,7 @@ use gloo_timers::future::TimeoutFuture;
 
 use crate::browser::controller::AppController;
 use crate::browser::platform;
+use crate::components::model_controls::ModelSettingsPanel;
 use crate::components::pending::PendingPanel;
 use crate::components::session_control::{NewSessionPanel, SessionActionsPanel};
 use crate::components::settings::SettingsPanel;
@@ -395,6 +396,11 @@ fn SessionPane(pane: &'static str) -> Element {
                             }
                         }
                         div { class: "conversation-header__controls",
+                            if selected.is_some() {
+                                button { class: "session-actions-button pane-model-button", r#type: "button", aria_label: "切换模型与推理强度",
+                                    onclick: move |_| { controller.spawn(async move { controller.open_model_controls().await }); }, "模型"
+                                }
+                            }
                             if let Some(run_id) = manual_run_id {
                                 button {
                                     class: "session-actions-button",
@@ -464,6 +470,7 @@ fn SessionPane(pane: &'static str) -> Element {
             }
             NewSessionPanel {}
             SessionActionsPanel {}
+            ModelSettingsPanel {}
             if let Some(notice) = state.ui.notice {
                 div { class: "toast-region", aria_live: "polite",
                     div { class: "toast toast--{notice.tone}",

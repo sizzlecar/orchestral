@@ -2610,6 +2610,19 @@ svg {
   gap: 9px;
 }
 
+.model-settings-current {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px 16px;
+  margin: 0;
+}
+.model-settings-current dd { margin: 0; overflow-wrap: anywhere; }
+.model-settings-current dt, .model-settings-notice { color: var(--muted); }
+.model-settings-notice { font-size: 13px; line-height: 1.6; }
+.model-settings-custom { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.model-settings-dialog .session-action-card { display: grid; gap: 12px; }
+.model-settings-dialog select, .model-settings-dialog input { min-width: 0; max-width: 100%; }
+
 .session-action-field {
   display: grid;
   gap: 5px;

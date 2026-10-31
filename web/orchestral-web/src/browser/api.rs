@@ -112,6 +112,32 @@ impl ApiClient {
         self.get("/sessions", credential).await
     }
 
+    pub async fn model_settings(
+        &self,
+        credential: &ApiCredential,
+        session_id: &str,
+    ) -> Result<crate::model_controls::ModelSettingsView, ApiError> {
+        self.get(
+            &format!("/sessions/{}/model-settings", encode(session_id)),
+            credential,
+        )
+        .await
+    }
+
+    pub async fn change_model_settings(
+        &self,
+        credential: &ApiCredential,
+        session_id: &str,
+        value: Value,
+    ) -> Result<crate::model::AgentSessionExecutionProfile, ApiError> {
+        self.post(
+            &format!("/sessions/{}/model-settings", encode(session_id)),
+            credential,
+            &value,
+        )
+        .await
+    }
+
     pub async fn session(
         &self,
         credential: &ApiCredential,

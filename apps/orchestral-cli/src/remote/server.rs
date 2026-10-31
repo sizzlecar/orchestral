@@ -17,9 +17,7 @@ use crate::agent::{build_agent_host, AgentRunOptions};
 use crate::agent_connectors::{build_agent_directory, AgentJournalAccess};
 use crate::mcp_config::user_config_root;
 
-use super::api::{
-    is_retryable_agent_error, spawn_remembered_approval_driver, spawn_run_supervisor,
-};
+use super::api::{is_retryable_agent_error, spawn_run_supervisor};
 use super::{
     router, router_with_artifact_origin, GatewayAuthenticator, JwtGatewayAuthenticator,
     JwtGatewayConfig, PairingTicket, RemoteApiState, RemoteRegistry,
@@ -111,7 +109,7 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         bail!("no paired mobile device exists; start with `orchestral serve --pair` to pair one");
     }
 
-    let host = build_agent_host(&options).await?;
+    let host = Arc::new(build_agent_host(&options).await?);
     let artifact_store = configured_artifact_store()
         .context("configure R2 Artifact store")?
         .map(Arc::new);
@@ -147,6 +145,10 @@ pub(crate) async fn serve(command: ServeCommand, options: AgentRunOptions) -> an
         session_coordinators: Arc::default(),
         local_hosts: Some(Arc::new(super::local_hosts::LocalHostDirectory::open()?)),
         local_owner: None,
+        native_models: Some(super::model_controls::NativeModelControls::gateway(
+            host.clone(),
+            options.clone(),
+        )),
         artifact_resolver,
         artifact_blob_store,
     };
@@ -243,7 +245,17 @@ async fn recover_registered_runs(state: &RemoteApiState) {
     };
 
     for run_id in run_ids {
-        match state.agent.can_control_run(&run_id).await {
+        let agent = match &state.native_models {
+            Some(controls) => match controls.api_for_run(&run_id).await {
+                Ok(agent) => agent,
+                Err(error) => {
+                    tracing::warn!(%run_id, %error, "could not reconstruct Run model configuration");
+                    continue;
+                }
+            },
+            None => state.agent.clone(),
+        };
+        match agent.can_control_run(&run_id).await {
             Ok(true) => {}
             Ok(false) => {
                 incompatible_runs = incompatible_runs.saturating_add(1);
@@ -258,7 +270,7 @@ async fn recover_registered_runs(state: &RemoteApiState) {
                 continue;
             }
         }
-        let view = match state.agent.inspect(&run_id).await {
+        let view = match agent.inspect(&run_id).await {
             Ok(view) => view,
             Err(error) => {
                 tracing::warn!(run_id = %run_id.as_str(), %error, "could not inspect registered remote Run during Host recovery");
@@ -270,7 +282,7 @@ async fn recover_registered_runs(state: &RemoteApiState) {
         }
 
         if view.state.status() == AgentRunStatus::Unknown {
-            if let Err(error) = state.agent.recover(&run_id).await {
+            if let Err(error) = agent.recover(&run_id).await {
                 if is_retryable_agent_error(&error) {
                     tracing::warn!(run_id = %run_id.as_str(), %error, "could not recover registered remote Run");
                 } else {
@@ -285,7 +297,7 @@ async fn recover_registered_runs(state: &RemoteApiState) {
             }
         }
 
-        spawn_remembered_approval_driver(state.clone(), run_id);
+        super::api::spawn_run_supervisor(state.clone(), agent, None, run_id);
         supervised_runs = supervised_runs.saturating_add(1);
     }
 

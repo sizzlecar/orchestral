@@ -57,6 +57,7 @@ async fn fixture() -> (RemoteApiState, String) {
             artifact_blob_store: None,
             local_hosts: None,
             local_owner: None,
+            native_models: None,
         },
         token,
     )

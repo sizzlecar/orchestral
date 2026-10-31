@@ -2,6 +2,7 @@ mod api;
 mod assets;
 mod auth;
 pub(crate) mod local_hosts;
+pub(crate) mod model_controls;
 mod server;
 mod session_coordinator;
 mod state;

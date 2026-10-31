@@ -182,6 +182,8 @@ orchestral resume --last
 
 需要浏览器访问时，运行 `orchestral serve --pair`。
 PWA 默认打开 Codex，展示最近两个会话，并可切换 Claude Code 和 Orch。
+每个会话右上角的“模型”可切换该会话后续请求的模型与推理强度；活动任务结束后可修改，历史保留，两个会话独立设置。
+选项由服务或 Agent 声明，也可手动输入服务支持的模型 ID。已有 Claude 终端请在原终端内修改。
 各窗格优先加载最近消息；手机上共用一个底部输入框，向选中的窗格发送消息，
 键盘弹出时展开该会话。
 PWA 可发现同一用户下正在运行的 Orchestral TUI，以及本机 Codex 和 Claude Code 会话。

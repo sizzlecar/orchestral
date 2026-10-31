@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::ModelOverrides;
 use orchestral_core::model_protocol::{
     ModelBackend, ModelDescriptor, ModelError, ModelRequest, ModelStream,
 };
