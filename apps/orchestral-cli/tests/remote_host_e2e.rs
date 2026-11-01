@@ -45,6 +45,65 @@ async fn released_binary_serves_embedded_pwa_and_authenticated_host_api() {
     let source = fs::read_to_string(repository_root().join("configs/orchestral.cli.yaml")).unwrap();
     fs::write(&config, source).unwrap();
 
+    // Seed a journal from a different immutable Provider contract, including
+    // legacy sessions without provenance. Discovery must not rehydrate either.
+    use orchestral_agent_journal_fs::FileAgentJournalStore;
+    use orchestral_agent_protocol_testkit::{
+        ProviderFixtureFactory, ProviderScenario, ScriptedStatelessFactory, TestProbes,
+    };
+    use orchestral_core::agent_protocol::spi::AgentJournalStore;
+    use orchestral_core::agent_protocol::wire::{
+        AgentRunEnvelope, AgentSessionId, ProviderBindingRef, RunId,
+    };
+    use orchestral_core::session_history::SessionOrigin;
+    use orchestral_runtime::AgentController;
+    use std::sync::Arc;
+    let journal =
+        Arc::new(FileAgentJournalStore::open(root.path.join(".orchestral/agent-journal")).unwrap());
+    let factory = ScriptedStatelessFactory::conformant().unwrap();
+    let scenario = ProviderScenario::standard(&factory.descriptor()).unwrap();
+    let controller = Arc::new(
+        AgentController::with_journal_store(
+            factory.create(scenario.clone(), TestProbes::default()),
+            ProviderBindingRef::new("previous-contract"),
+            journal.clone(),
+        )
+        .unwrap(),
+    );
+    for provenance in [false, true] {
+        let mut spec = scenario.start_request.run.spec.clone();
+        spec.session_id = AgentSessionId::new(if provenance {
+            "historical-with-origin"
+        } else {
+            "legacy-without-origin"
+        });
+        spec.run_id = RunId::new(format!("history-{}", uuid::Uuid::new_v4()));
+        if provenance {
+            let origin: SessionOrigin = serde_json::from_value(serde_json::json!({"workspace":root.path,"model":"historical-model","reasoning":"high"})).unwrap();
+            spec.extensions.extend(origin.extensions());
+        }
+        let execution = controller
+            .start(AgentRunEnvelope::seal(spec).unwrap())
+            .await
+            .unwrap();
+        controller
+            .wait_for_terminal(&execution.run_id)
+            .await
+            .unwrap();
+    }
+    drop(controller);
+    let before = journal
+        .catalog_runs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.run_id)
+        .collect::<Vec<_>>();
+    let mut snapshots = Vec::new();
+    for run in &before {
+        snapshots.push(journal.load_run(run).await.unwrap().unwrap());
+    }
+
     let state_file = root.path.join("remote-control.json");
     let ticket = PairingTicket::issue(60_000).unwrap();
     let secret = ticket.secret().to_owned();
@@ -87,6 +146,49 @@ async fn released_binary_serves_embedded_pwa_and_authenticated_host_api() {
     assert_eq!(shell.status, 200);
     assert!(shell.headers.contains("content-security-policy:"));
     assert!(shell.body.contains("manifest.webmanifest"));
+
+    let historical = request(
+        address,
+        "GET",
+        "/api/v1/sessions",
+        &[("Authorization", &format!("Bearer {}", claim.token))],
+        "",
+    );
+    assert_eq!(historical.status, 200, "{}", historical.body);
+    let sessions: Vec<serde_json::Value> = serde_json::from_str(&historical.body).unwrap();
+    assert!(sessions
+        .iter()
+        .any(|session| session["id"] == "legacy-without-origin"));
+    let historical = sessions
+        .iter()
+        .find(|session| session["id"] == "historical-with-origin")
+        .unwrap();
+    assert_eq!(historical["execution_profile"]["model"], "historical-model");
+    assert_eq!(historical["execution_profile"]["reasoning_effort"], "high");
+    for snapshot in snapshots {
+        assert_eq!(
+            journal
+                .load_run(snapshot.registration.run_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            snapshot,
+            "listing must not rewrite or attach old Runs"
+        );
+    }
+    let connectors = request(
+        address,
+        "GET",
+        "/api/v1/agent-connectors",
+        &[("Authorization", &format!("Bearer {}", claim.token))],
+        "",
+    );
+    assert_eq!(connectors.status, 200, "{}", connectors.body);
+    let connectors: Vec<serde_json::Value> = serde_json::from_str(&connectors.body).unwrap();
+    assert!(connectors
+        .iter()
+        .any(|connector| connector["agent_product"] == "codex"
+            && connector["capabilities"]["create"] == true));
 
     let sessions = request(
         address,

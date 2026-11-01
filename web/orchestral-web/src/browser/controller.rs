@@ -699,146 +699,147 @@ impl AppController {
             )
         };
         self.state.write().sessions.status = LoadStatus::Loading;
-        match self.api.sessions(&token).await {
-            Ok(mut sessions) => {
-                let connectors = match self.api.agent_connectors(&token).await {
-                    Ok(connectors) => {
-                        self.state.write().connectors = ConnectorsState {
-                            status: LoadStatus::Ready,
-                            items: connectors.clone(),
-                            error: None,
-                        };
-                        connectors
+        self.state.write().connectors.status = LoadStatus::Loading;
+        // Sources fail independently: a built-in journal error cannot disable
+        // external Agent discovery, capabilities, or session creation.
+        let (builtin, discovered_connectors) =
+            futures_util::join!(self.api.sessions(&token), self.api.agent_connectors(&token));
+        let (mut sessions, builtin_error) = match builtin {
+            Ok(sessions) => (sessions, None),
+            Err(error) if error.status == 401 => {
+                self.clear_auth(Some(error.message)).await;
+                return;
+            }
+            Err(error) => (
+                cached_sessions
+                    .iter()
+                    .filter(|session| session.connector_id.is_none())
+                    .cloned()
+                    .collect(),
+                Some(format!("Orch 会话读取失败：{}", error.message)),
+            ),
+        };
+        let connectors = match discovered_connectors {
+            Ok(connectors) => {
+                self.state.write().connectors = ConnectorsState {
+                    status: LoadStatus::Ready,
+                    items: connectors.clone(),
+                    error: None,
+                };
+                connectors
+            }
+            Err(error) if error.status == 401 => {
+                self.clear_auth(Some(error.message)).await;
+                return;
+            }
+            Err(error) => {
+                let mut state = self.state.write();
+                state.connectors.status = LoadStatus::Error;
+                state.connectors.error = Some(error.message);
+                state.connectors.items.clone()
+            }
+        };
+        let mut connector_pages = BTreeMap::new();
+        for connector in connectors {
+            if connector.capabilities.list {
+                match self
+                    .api
+                    .agent_sessions(
+                        &token,
+                        &connector.connector_id,
+                        None,
+                        AGENT_SESSION_LIST_PAGE_LIMIT,
+                    )
+                    .await
+                {
+                    Ok(page) => {
+                        let next_cursor = page.next_cursor;
+                        sessions.extend(
+                            page.sessions
+                                .into_iter()
+                                .map(|session| session.into_session()),
+                        );
+                        connector_pages.insert(
+                            connector.connector_id,
+                            AgentSessionListState {
+                                next_cursor,
+                                loading_more: false,
+                                error: None,
+                            },
+                        );
                     }
                     Err(error) if error.status == 401 => {
                         self.clear_auth(Some(error.message)).await;
                         return;
                     }
                     Err(error) => {
-                        self.state.write().connectors = ConnectorsState {
-                            status: LoadStatus::Error,
-                            items: Vec::new(),
-                            error: Some(error.message),
-                        };
-                        Vec::new()
+                        sessions.extend(
+                            cached_sessions
+                                .iter()
+                                .filter(|session| {
+                                    session.connector_id.as_deref()
+                                        == Some(connector.connector_id.as_str())
+                                })
+                                .cloned(),
+                        );
+                        connector_pages.insert(
+                            connector.connector_id,
+                            AgentSessionListState {
+                                next_cursor: None,
+                                loading_more: false,
+                                error: Some(error.message),
+                            },
+                        );
                     }
-                };
-                let mut connector_pages = BTreeMap::new();
-                for connector in connectors {
-                    if connector.capabilities.list {
-                        match self
-                            .api
-                            .agent_sessions(
-                                &token,
-                                &connector.connector_id,
-                                None,
-                                AGENT_SESSION_LIST_PAGE_LIMIT,
-                            )
-                            .await
-                        {
-                            Ok(page) => {
-                                let next_cursor = page.next_cursor;
-                                sessions.extend(
-                                    page.sessions
-                                        .into_iter()
-                                        .map(|session| session.into_session()),
-                                );
-                                connector_pages.insert(
-                                    connector.connector_id,
-                                    AgentSessionListState {
-                                        next_cursor,
-                                        loading_more: false,
-                                        error: None,
-                                    },
-                                );
-                            }
-                            Err(error) if error.status == 401 => {
-                                self.clear_auth(Some(error.message)).await;
-                                return;
-                            }
-                            Err(error) => {
-                                sessions.extend(
-                                    cached_sessions
-                                        .iter()
-                                        .filter(|session| {
-                                            session.connector_id.as_deref()
-                                                == Some(connector.connector_id.as_str())
-                                        })
-                                        .cloned(),
-                                );
-                                connector_pages.insert(
-                                    connector.connector_id,
-                                    AgentSessionListState {
-                                        next_cursor: None,
-                                        loading_more: false,
-                                        error: Some(error.message),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-                let (latest_sessions, current_selected_id) = {
-                    let state = self.state.read();
-                    (
-                        state.sessions.items.clone(),
-                        state.sessions.selected_id.clone(),
-                    )
-                };
-                let selection_changed_during_refresh = current_selected_id != previous_selected_id;
-                sessions = merge_sessions(&latest_sessions, sessions);
-                if let Some(selected) = current_selected_id.as_deref().and_then(|selected_id| {
-                    latest_sessions
-                        .iter()
-                        .find(|session| session.key() == selected_id)
-                }) {
-                    let selected_key = selected.key();
-                    if !sessions.iter().any(|session| session.key() == selected_key)
-                        && selected_session_may_be_on_later_page(selected, &connector_pages)
-                    {
-                        sessions.push(selected.clone());
-                    }
-                }
-                sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
-                let selected_id = retained_selection(current_selected_id.as_deref(), &sessions);
-                {
-                    let mut state = self.state.write();
-                    let stream_cursors = std::mem::take(&mut state.sessions.stream_cursors);
-                    let recent_changes = std::mem::take(&mut state.sessions.recent_changes);
-                    let builtin_history = std::mem::take(&mut state.sessions.builtin_history);
-                    state.sessions = SessionsState {
-                        status: LoadStatus::Ready,
-                        items: sessions,
-                        selected_id: selected_id.clone(),
-                        connector_pages,
-                        stream_cursors,
-                        recent_changes,
-                        builtin_history,
-                        error: None,
-                    };
-                }
-                if load_selection && !selection_changed_during_refresh {
-                    if let Some(selected_id) = selected_id.clone() {
-                        self.load_session(selected_id).await;
-                    }
-                }
-                if selected_id.is_none() && current_selected_id.is_some() {
-                    self.stop_stream_and_set_idle();
                 }
             }
-            Err(error) if error.status == 401 => self.clear_auth(Some(error.message)).await,
-            Err(error) => {
-                let mut state = self.state.write();
-                state.sessions.status = LoadStatus::Error;
-                state.sessions.error = Some(error.message.clone());
-                state.connection.error = Some(error.message);
-                state.connection.stream = if platform::is_online() {
-                    "error"
-                } else {
-                    "offline"
-                }
-                .to_owned();
+        }
+        let (latest_sessions, current_selected_id) = {
+            let state = self.state.read();
+            (
+                state.sessions.items.clone(),
+                state.sessions.selected_id.clone(),
+            )
+        };
+        let selection_changed_during_refresh = current_selected_id != previous_selected_id;
+        sessions = merge_sessions(&latest_sessions, sessions);
+        if let Some(selected) = current_selected_id.as_deref().and_then(|selected_id| {
+            latest_sessions
+                .iter()
+                .find(|session| session.key() == selected_id)
+        }) {
+            let selected_key = selected.key();
+            if !sessions.iter().any(|session| session.key() == selected_key)
+                && selected_session_may_be_on_later_page(selected, &connector_pages)
+            {
+                sessions.push(selected.clone());
             }
+        }
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_ms));
+        let selected_id = retained_selection(current_selected_id.as_deref(), &sessions);
+        {
+            let mut state = self.state.write();
+            let stream_cursors = std::mem::take(&mut state.sessions.stream_cursors);
+            let recent_changes = std::mem::take(&mut state.sessions.recent_changes);
+            let builtin_history = std::mem::take(&mut state.sessions.builtin_history);
+            state.sessions = SessionsState {
+                status: LoadStatus::Ready,
+                items: sessions,
+                selected_id: selected_id.clone(),
+                connector_pages,
+                stream_cursors,
+                recent_changes,
+                builtin_history,
+                error: builtin_error,
+            };
+        }
+        if load_selection && !selection_changed_during_refresh {
+            if let Some(selected_id) = selected_id.clone() {
+                self.load_session(selected_id).await;
+            }
+        }
+        if selected_id.is_none() && current_selected_id.is_some() {
+            self.stop_stream_and_set_idle();
         }
     }
 

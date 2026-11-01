@@ -476,17 +476,33 @@ async fn a_descriptor_upgrade_identifies_an_old_run_without_rehydrating_it() {
         .insert("image/png".to_owned());
     let upgraded_descriptor = AgentDescriptorEnvelope::seal(upgraded_descriptor)
         .expect("upgraded descriptor remains valid");
+    let probes = TestProbes::default();
     let upgraded_provider = Arc::new(DescriptorOverrideProvider {
-        inner: factory.create(scenario, TestProbes::default()),
+        inner: factory.create(scenario.clone(), probes.clone()),
         descriptor: upgraded_descriptor,
     });
     let upgraded = AgentController::with_journal_store(
         upgraded_provider,
         ProviderBindingRef::new("durable-binding"),
-        journal,
+        journal.clone(),
     )
     .expect("upgraded controller binds provider");
 
+    let before = journal.load_run(&execution.run_id).await.unwrap().unwrap();
+    assert_eq!(
+        upgraded.run_extensions(&execution.run_id).await.unwrap(),
+        scenario.start_request.run.spec.extensions
+    );
+    assert_eq!(
+        upgraded.initial_input(&execution.run_id).await.unwrap(),
+        scenario.start_request.run.spec.input
+    );
+    assert_eq!(
+        journal.load_run(&execution.run_id).await.unwrap().unwrap(),
+        before,
+        "metadata reads must not append continuity loss or otherwise mutate history"
+    );
+    assert_eq!(probes.native_start_count(), 0);
     assert!(!upgraded
         .can_control_run(&execution.run_id)
         .await

@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 
 use crate::browser::controller::AppController;
 use crate::model::{AgentConnectorView, AgentSessionActionExecutionView, AgentSessionActionView};
+use crate::state::LoadStatus;
 
 const HOST_CWD_SHORTCUTS: [(&str, &str); 4] = [
     ("ferrum-infer-rs", "~/rust_ws/ferrum-infer-rs"),
@@ -27,14 +28,16 @@ pub fn NewSessionPanel() -> Element {
         .selected_session()
         .and_then(|session| session.cwd.clone())
         .unwrap_or_default();
+    let connectors_status = state.connectors.status;
     let create_connectors = state
         .connectors
         .items
         .into_iter()
         .filter(|connector| connector.capabilities.create && source.matches_connector(connector))
         .collect::<Vec<_>>();
-    let unavailable =
+    let no_creation =
         create_connectors.is_empty() && source != crate::workspace::WorkspaceSource::Orchestral;
+    let unavailable = no_creation && connectors_status == LoadStatus::Ready;
 
     rsx! {
         div {
@@ -85,6 +88,15 @@ pub fn NewSessionPanel() -> Element {
                 }
                 if unavailable {
                     p { class: "settings-error", "当前主机尚未提供 {source.label()} 会话创建功能。" }
+                }
+                if no_creation && matches!(connectors_status, LoadStatus::Idle | LoadStatus::Loading) {
+                    p { role: "status", "正在读取 Agent 能力…" }
+                }
+                if source != crate::workspace::WorkspaceSource::Orchestral && connectors_status != LoadStatus::Ready {
+                    button { class: "dialog-button", r#type: "button", disabled: connectors_status == LoadStatus::Loading,
+                        onclick: move |_| { controller.spawn(async move { controller.refresh_sessions(false).await; }); },
+                        "重试加载 Agent 能力"
+                    }
                 }
                 if let Some(error) = state.connectors.error {
                     p { class: "settings-error", "外部 Agent 暂不可用：{error}" }
