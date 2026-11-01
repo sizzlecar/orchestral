@@ -312,19 +312,35 @@ impl AgentController {
     /// surfaces can use it to reconstruct a transcript without duplicating the
     /// input in a transport-specific registry.
     pub async fn initial_input(&self, run_id: &RunId) -> Result<Vec<Content>, AgentControlError> {
-        let slot = self.run_slot(run_id).await?;
-        let input = slot.entry.lock().await.request.run.spec.input.clone();
-        Ok(input)
+        Ok(self.registered_request(run_id).await?.run.spec.input)
     }
 
     /// Returns digest-bound metadata from the immutable Run specification.
+    ///
+    /// Discovery reads the validated registration without rehydrating execution,
+    /// contacting the Provider, or requiring its current descriptor to match.
+    /// Old contracts remain historical facts; control still checks the binding.
     pub async fn run_extensions(
         &self,
         run_id: &RunId,
     ) -> Result<orchestral_core::agent_protocol::wire::Extensions, AgentControlError> {
-        let slot = self.run_slot(run_id).await?;
-        let extensions = slot.entry.lock().await.request.run.spec.extensions.clone();
-        Ok(extensions)
+        Ok(self.registered_request(run_id).await?.run.spec.extensions)
+    }
+
+    async fn registered_request(
+        &self,
+        run_id: &RunId,
+    ) -> Result<AgentStartRequest, AgentControlError> {
+        if let Some(slot) = self.runs.read().await.get(run_id).cloned() {
+            return Ok(slot.entry.lock().await.request.clone());
+        }
+        let stored = self
+            .journal_store
+            .load_run(run_id)
+            .await?
+            .ok_or_else(|| AgentControlError::RunNotFound(run_id.clone()))?;
+        stored.validate_shape()?;
+        Ok(stored.registration.request)
     }
 
     /// Lists durable Runs directly from the Host journal. Transport-specific

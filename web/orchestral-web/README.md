@@ -88,6 +88,7 @@ node scripts/pwa_dual_session_smoke.cjs
 node scripts/pwa_history_sync_smoke.cjs
 node scripts/pwa_power_smoke.cjs
 node scripts/pwa_model_controls_smoke.cjs
+node scripts/pwa_discovery_failure_smoke.cjs
 node scripts/pwa_draft_smoke.cjs
 node scripts/pwa_mobile_layout_smoke.cjs
 PWA_SMOKE_ENGINE=webkit node scripts/pwa_mobile_layout_smoke.cjs
@@ -137,3 +138,8 @@ The model-controls smoke verifies per-session model and reasoning changes for
 both built-in Orch and declared external Agent actions, failure/retry, refreshed
 reasoning choices after model selection, and mobile overflow. It makes no paid
 model requests.
+
+The discovery-failure smoke keeps built-in session listing unavailable while
+external discovery and session creation recover independently. Failed capability
+reads show an error and retry, preserve previously confirmed capabilities, and
+are never presented as unsupported session creation.
